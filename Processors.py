@@ -173,7 +173,7 @@ class PoreToSphereProcessor(BaseProcessor):
 
     def _find_adjacency(self, labels_volume):
         """
-        Scans the volume to find voxels of different labels that are touching.
+        Scans the volume to find voxels with different labels that are touching.
         Returns a set of tuples (label_a, label_b).
         """
         adjacency = set()
