@@ -69,7 +69,7 @@ class AppController:
             print(f"Dimensions: {self.current_data.dimensions}")
             print("1. Volume Rendering")
             print("2. Orthogonal Slices")
-            print("3. Isosurface (Bone/Surface)")
+            print("3. Isosurface")
             print("4. Partition Pores (Raw Shape)")
             print("5. Convert Pores to Spheres")
             print("r. Reset to Original")
@@ -137,7 +137,7 @@ class AppController:
 if __name__ == "__main__":
     # Usage example
     # You can specify a path here, or leave it empty to use dummy data
-    dicom_path = 'D:\zhu shuyang_25_tart_114913'  # "C:/MedicalData/Patient01"
+    dicom_path = 'D:\zhu shuyang_25_tart_114913'
 
     app = AppController()
     app.run(dicom_path)
