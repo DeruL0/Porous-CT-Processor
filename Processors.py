@@ -1,6 +1,7 @@
 import numpy as np
 import scipy.ndimage as ndimage
-from scipy.spatial import cKDTree
+from skimage.segmentation import watershed
+from skimage.feature import peak_local_max
 from Core import BaseProcessor, VolumeData
 
 
@@ -10,7 +11,7 @@ from Core import BaseProcessor, VolumeData
 
 class PoreExtractionProcessor(BaseProcessor):
     """
-    Extract inside pores
+    Extract inside pores using morphological operations.
     """
 
     def process(self, data: VolumeData, threshold: int = -300) -> VolumeData:
@@ -44,47 +45,85 @@ class PoreExtractionProcessor(BaseProcessor):
 
 class PoreToSphereProcessor(BaseProcessor):
     """
-    Detects pores and converts each individual pore into an equivalent volume sphere.
-    Also connects nearby spheres with cylinders to visualize the pore network (Ball-and-Stick model).
+    Detects pores and constructs a Pore Network Model (PNM) using Watershed Segmentation.
+
+    Algorithm:
+    1. Identify pore space.
+    2. Compute Euclidean Distance Map (EDM) on the pore space.
+    3. Find local maxima in the EDM to identify pore centers (Seeds).
+    4. Apply Watershed segmentation to split large connected pores into sub-pores.
+    5. Determine connectivity by checking adjacency between segmented regions.
+    6. Visualize as Ball-and-Stick model.
     """
 
     def process(self, data: VolumeData, threshold: int = -300) -> VolumeData:
-        print(f"[Processor] Detecting pores for sphere & network generation (Threshold > {threshold} HU)...")
+        print(f"[Processor] Starting Pore Network Extraction (Threshold > {threshold} HU)...")
 
-        # 1. Detect Pores
+        # 1. Detect Pores (Binary Mask)
         foreground_mask = data.raw_data > threshold
         filled_mask = ndimage.binary_fill_holes(foreground_mask)
         pores_mask = filled_mask ^ foreground_mask
 
-        # 2. Label connected components
-        print("[Processor] Labeling connected components...")
-        labeled_array, num_features = ndimage.label(pores_mask, structure=np.ones((3, 3, 3)))
-        print(f"[Processor] Found {num_features} individual pores.")
-
-        # 3. Create output volume
-        sphere_volume = np.zeros_like(data.raw_data)
-
-        if num_features == 0:
+        if np.sum(pores_mask) == 0:
             return VolumeData(
-                raw_data=sphere_volume,
+                raw_data=np.zeros_like(data.raw_data),
                 spacing=data.spacing,
                 origin=data.origin,
                 metadata={"Type": "Processed - Network", "PoreCount": 0}
             )
 
-        # 4. Extract Spheres (Nodes)
-        print("[Processor] Calculating equivalent spheres...")
-        slices = ndimage.find_objects(labeled_array)
-        spheres = []  # List to store {'center': (z,y,x), 'radius': r}
+        # 2. Distance Transform
+        # Calculate the distance from every pore voxel to the nearest solid/background voxel
+        # The 'peaks' of this map represent the centers of wide open spaces (pores)
+        print("[Processor] Computing Euclidean Distance Map...")
+        distance_map = ndimage.distance_transform_edt(pores_mask)
 
-        for i in range(num_features):
+        # 3. Find Pore Centers (Seeds)
+        # We look for local peaks in the distance map.
+        # min_distance controls the minimum separation between two distinct pores.
+        # If too small -> oversegmentation (too many small pores).
+        # If too large -> undersegmentation (missed throats).
+        print("[Processor] Finding local maxima (seeds)...")
+        min_peak_distance = 6
+        local_maxi = peak_local_max(distance_map, labels=pores_mask, min_distance=min_peak_distance)
+
+        # Create a marker array for watershed
+        markers = np.zeros_like(distance_map, dtype=int)
+        # peak_local_max returns coordinates (N, 3), we mark them on the grid
+        markers[tuple(local_maxi.T)] = np.arange(len(local_maxi)) + 1
+
+        print(f"[Processor] Found {len(local_maxi)} potential pore centers.")
+
+        # 4. Watershed Segmentation
+        # "Floods" the topography (inverted distance map) starting from the markers.
+        # This splits the continuous pore space into distinct regions (catchment basins).
+        # The boundaries where basins meet are the 'throats'.
+        print("[Processor] Executing Watershed segmentation to split large pores...")
+        segmented_pores = watershed(-distance_map, markers, mask=pores_mask)
+
+        num_pores = np.max(segmented_pores)
+        print(f"[Processor] Segmentation complete. Identified {num_pores} unique pore regions.")
+
+        # 5. Extract Spheres (Nodes)
+        print("[Processor] Calculating pore properties...")
+        sphere_volume = np.zeros_like(data.raw_data)
+
+        slices = ndimage.find_objects(segmented_pores)
+        spheres = {}  # Dict to store id -> {center, radius}
+
+        for i in range(num_pores):
             label_idx = i + 1
             slice_obj = slices[i]
+            if slice_obj is None: continue
 
-            local_mask = (labeled_array[slice_obj] == label_idx)
+            # Local extraction of the specific pore region
+            local_mask = (segmented_pores[slice_obj] == label_idx)
             voxel_count = np.sum(local_mask)
+
+            # Calculate equivalent radius of a sphere with the same volume
             radius = (3 * voxel_count / (4 * np.pi)) ** (1 / 3)
 
+            # Calculate Centroid
             local_centroid = ndimage.center_of_mass(local_mask)
             global_z = slice_obj[0].start + local_centroid[0]
             global_y = slice_obj[1].start + local_centroid[1]
@@ -92,34 +131,91 @@ class PoreToSphereProcessor(BaseProcessor):
 
             center = np.array([global_z, global_y, global_x])
 
-            # Draw sphere
+            # Store info
+            spheres[label_idx] = {'center': center, 'radius': radius}
+
+            # Draw Sphere (Node) into visualization volume
             self._draw_sphere(sphere_volume, center, radius)
 
-            # Store for networking
-            spheres.append({'center': center, 'radius': radius})
+        # 6. Detect Connectivity (Adjacency)
+        # If two different labeled regions touch each other, they are connected.
+        print("[Processor] Analyzing region adjacency to build network connections...")
+        connections = self._find_adjacency(segmented_pores)
+        print(f"[Processor] Found {len(connections)} connections (throats).")
 
-        # 5. Generate Network (Sticks/Cylinders)
-        print("[Processor] Generating pore network connections (Cylinders)...")
-        #self._connect_pores_with_cylinders(sphere_volume, spheres)
+        # 7. Draw Cylinders (Edges)
+        print("[Processor] Drawing network connections...")
+        for (id_a, id_b) in connections:
+            if id_a in spheres and id_b in spheres:
+                p1 = spheres[id_a]['center']
+                p2 = spheres[id_b]['center']
+                r1 = spheres[id_a]['radius']
+                r2 = spheres[id_b]['radius']
 
-        print("[Processor] Pore Network Model generation complete.")
+                # Cylinder radius - heuristic:
+                # It should represent the throat. We estimate it as a fraction of the smaller pore.
+                cyl_radius = min(r1, r2) * 0.25
+                cyl_radius = max(1.0, cyl_radius)  # Ensure visibility (at least 1 voxel)
+
+                self._draw_cylinder(sphere_volume, p1, p2, cyl_radius)
 
         return VolumeData(
             raw_data=sphere_volume,
             spacing=data.spacing,
             origin=data.origin,
             metadata={
-                "Type": "Processed - Network",
+                "Type": "Processed - Network (Watershed)",
                 "Source": data.metadata.get("Description", "Unknown"),
-                "PoreCount": num_features
+                "PoreCount": num_pores,
+                "ConnectionCount": len(connections)
             }
         )
+
+    def _find_adjacency(self, labels_volume):
+        """
+        Scans the volume to find voxels of different labels that are touching.
+        Returns a set of tuples (label_a, label_b).
+        """
+        adjacency = set()
+
+        # We check connectivity in 3 directions (z, y, x) using efficient array shifting
+        # This compares neighbor voxels across the whole volume at once.
+
+        # Directions to check: (axis, slice_current, slice_next)
+        shifts = [
+            (0, np.s_[:-1, :, :], np.s_[1:, :, :]),  # Z axis neighbors
+            (1, np.s_[:, :-1, :], np.s_[:, 1:, :]),  # Y axis neighbors
+            (2, np.s_[:, :, :-1], np.s_[:, :, 1:])  # X axis neighbors
+        ]
+
+        for axis, s_curr, s_next in shifts:
+            # Get values for adjacent voxels
+            val_curr = labels_volume[s_curr]
+            val_next = labels_volume[s_next]
+
+            # Find boundaries:
+            # 1. Both voxels must be pores (val > 0)
+            # 2. They must belong to DIFFERENT labels (val_curr != val_next)
+            mask = (val_curr > 0) & (val_next > 0) & (val_curr != val_next)
+
+            if np.any(mask):
+                # Extract the pairs of labels at these boundary locations
+                pairs = np.stack((val_curr[mask], val_next[mask]), axis=-1)
+
+                # Sort pairs to ensure (1, 2) is treated same as (2, 1)
+                # Using np.unique is efficient to remove duplicates
+                unique_pairs = np.unique(pairs, axis=0)
+
+                for p in unique_pairs:
+                    p_sorted = tuple(sorted(p))
+                    adjacency.add(p_sorted)
+
+        return adjacency
 
     def _draw_sphere(self, volume, center, radius):
         """Draws a solid sphere."""
         cz, cy, cx = center
 
-        # Bounding box
         z_min = int(max(0, cz - radius - 1))
         z_max = int(min(volume.shape[0], cz + radius + 2))
         y_min = int(max(0, cy - radius - 1))
@@ -133,56 +229,10 @@ class PoreToSphereProcessor(BaseProcessor):
         mask = dist_sq <= radius ** 2
         volume[z_min:z_max, y_min:y_max, x_min:x_max][mask] = 1000
 
-    def _connect_pores_with_cylinders(self, volume, spheres, k_neighbors=3):
-        """
-        Connects nearby spheres with cylinders using K-Nearest Neighbors logic.
-        """
-        if len(spheres) < 2: return
-
-        centers = [s['center'] for s in spheres]
-        # Use KDTree for efficient nearest neighbor search
-        tree = cKDTree(centers)
-
-        # Query k+1 neighbors (because the first one is the point itself)
-        k = min(len(spheres), k_neighbors + 1)
-        distances, indices = tree.query(centers, k=k)
-
-        drawn_pairs = set()
-
-        for i, neighbors in enumerate(indices):
-            p1 = centers[i]
-            r1 = spheres[i]['radius']
-
-            for j, neighbor_idx in enumerate(neighbors):
-                if i == neighbor_idx: continue  # Skip self
-                if neighbor_idx >= len(spheres): continue
-
-                # Check if pair already processed
-                pair_key = tuple(sorted((i, neighbor_idx)))
-                if pair_key in drawn_pairs: continue
-                drawn_pairs.add(pair_key)
-
-                p2 = centers[neighbor_idx]
-                r2 = spheres[neighbor_idx]['radius']
-                dist = distances[i][j]
-
-                # Distance Threshold Heuristic:
-                # Only connect if they are reasonably close relative to their sizes.
-                # e.g., if distance < 5 * (sum of radii), assume connected
-                if dist > (r1 + r2) * 5.0 + 10:
-                    continue
-
-                # Cylinder radius is proportional to the smaller pore
-                cyl_radius = min(r1, r2) * 0.3
-                if cyl_radius < 1.0: cyl_radius = 1.0
-
-                self._draw_cylinder(volume, p1, p2, cyl_radius)
-
     def _draw_cylinder(self, volume, p1, p2, radius):
         """
         Draws a cylinder between point p1 and p2 with given radius.
         """
-        # Calculate bounding box for the cylinder to limit iteration
         p_min = np.minimum(p1, p2) - radius - 1
         p_max = np.maximum(p1, p2) + radius + 2
 
@@ -196,37 +246,25 @@ class PoreToSphereProcessor(BaseProcessor):
         if z_min >= z_max or y_min >= y_max or x_min >= x_max:
             return
 
-        # Vector from p1 to p2
         vec = p2 - p1
         vec_len_sq = np.dot(vec, vec)
 
         if vec_len_sq == 0: return
 
-        # Grid coordinate generation
         z, y, x = np.ogrid[z_min:z_max, y_min:y_max, x_min:x_max]
 
-        # Vector from p1 to current point
-        # Note: We need to stack/broadcast carefully manually or use logic below
-        # For efficiency in Python without large loops, we do component-wise calc:
-
-        # This calculates the projection t of point X onto line segment P1-P2
-        # t = dot(X - P1, P2 - P1) / |P2 - P1|^2
-
+        # Vector projection logic to find distance to the line segment
         diff_z = z - p1[0]
         diff_y = y - p1[1]
         diff_x = x - p1[2]
 
         t = (diff_z * vec[0] + diff_y * vec[1] + diff_x * vec[2]) / vec_len_sq
-
-        # Clamp t to segment [0, 1]
         t = np.clip(t, 0.0, 1.0)
 
-        # Closest point on segment
         closest_z = p1[0] + t * vec[0]
         closest_y = p1[1] + t * vec[1]
         closest_x = p1[2] + t * vec[2]
 
-        # Distance from point to closest point on segment
         dist_sq = (z - closest_z) ** 2 + (y - closest_y) ** 2 + (x - closest_x) ** 2
 
         mask = dist_sq <= radius ** 2
