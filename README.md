@@ -6,6 +6,7 @@ An analysis suite for **Porous CT**, built with PyQt5 and PyVista.
 ## Overview
 
 This application provides a comprehensive suite for analyzing porous materials (such as sedimentary rocks, ceramics, foams, and foods) using Micro-CT data.
+
 -   **Interactive 3D visualization** using PyVista.
     
 -   **Pore Network Modeling (PNM)**: Extract pore bodies and throats from raw scans.
@@ -19,11 +20,11 @@ This application provides a comprehensive suite for analyzing porous materials (
 
 ### Visualization Modes
 
-1.  **Volume Rendering** - Full 3D volumetric visualization of the material matrix.
+1.  **Volume Rendering** - Full 3D volumetric visualization of the material matrix with adjustable opacity transfer functions.
     
 2.  **Orthogonal Slices** - Inspect internal structure via X, Y, Z planes.
     
-3.  **Isosurface** - Extract and display the solid-void interface (surface mesh).
+3.  **Isosurface** - Extract and display the solid-void interface (surface mesh). Includes coloring and lighting options.
     
 
 ### Structural Analysis
@@ -81,14 +82,9 @@ python App.py
 
 ### GUI Controls
 
-#### Control Panel
+The interface features a **Dynamic Control Panel** that automatically adjusts based on your current viewing mode (Volume, Slices, or Isosurface).
 
-**Sample Information**
-
--   Displays sample ID, scan type, grid dimensions, and voxel spacing.
-    
-
-**Analysis Modes**
+#### Analysis Modes
 
 -   📊 **Volume Rendering** - View density distribution.
     
@@ -99,14 +95,31 @@ python App.py
 -   🗑️ **Clear View** / 🎥 **Reset Camera** - View controls.
     
 
-**Rendering Parameters**
+#### Rendering Parameters (Context-Aware)
+
+**Global / Volume Mode:**
+
+-   **Colormap** - Analysis-friendly palettes (Viridis, Plasma, Bone, Jet, Magma).
+    
+-   **Opacity Preset** - Adjust transparency (Sigmoid, Linear, Geometric) to see inside the volume.
+    
+
+**Isosurface Mode:**
 
 -   **Iso-Threshold** - Adjust intensity cutoff to separate solid from void.
     
--   **Colormap** - Analysis-friendly palettes (Viridis, Plasma, Bone, Jet).
+-   **Coloring Mode**:
+    
+    -   _Solid Color_: Clean, uniform color (Ivory, Red, Gold, etc.).
+        
+    -   _Depth (Z-Axis)_: Colors the mesh based on height/depth.
+        
+    -   _Radial (Center Dist)_: Colors based on distance from the center (useful for visualizing core vs. shell).
+        
+-   **Light Source Angle** - Rotatable directional light (0-360°) to enhance surface details and depth perception.
     
 
-**Structure Processing**
+#### Structure Processing
 
 -   📁 **Load Sample Scan** - Load Micro-CT data.
     
@@ -125,9 +138,9 @@ python App.py
     
 3.  **Segment**: Click "🔬 Extract Void Space" to isolate pores.
     
-4.  **Model**: Click "⚪ Pore Network Model" to generate the Ball-and-Stick network.
+4.  **Visualize Pores**: Switch to "🏔️ Isosurface". Change "Coloring Mode" to "Radial" to see the depth of the pore structure from the center outwards. Adjust the "Light Angle" to catch shadows in the crevices.
     
-5.  **Visualize**: Use "🏔️ Isosurface" to see the extracted network structure clearly (Nodes and Throats).
+5.  **Model**: Click "⚪ Pore Network Model" to generate the Ball-and-Stick network.
     
 
 ## Algorithm Details

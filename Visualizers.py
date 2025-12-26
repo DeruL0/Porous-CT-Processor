@@ -34,7 +34,7 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         self.active_view_mode = None
 
         # Window setup
-        self.setWindowTitle("Porous Media Analysis Suite (Micro-CT)")
+        self.setWindowTitle("Porous CT Analysis Suite")
         self.setGeometry(100, 100, 1400, 900)
 
         # Initialize UI
