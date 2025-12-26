@@ -1,5 +1,5 @@
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QLabel,
-                             QGroupBox, QSlider, QComboBox, QFrame)
+                             QGroupBox, QSlider, QComboBox, QFrame, QHBoxLayout)
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QFont
 
@@ -37,120 +37,21 @@ class InfoPanel(QGroupBox):
 
         self.setLayout(layout)
 
-    def update_info(self, type_str, dim, spacing, meta_dict):
+    def update_info(self, type_str, dim, spacing, metadata):
+        """Update labels with new data"""
         self.lbl_type.setText(f"Type: {type_str}")
         self.lbl_dim.setText(f"Grid: {dim}")
         self.lbl_spacing.setText(f"Voxel Size: ({spacing[0]:.2f}, {spacing[1]:.2f}, {spacing[2]:.2f}) mm")
 
-        meta_str = "\n".join([f"{k}: {v}" for k, v in meta_dict.items() if k != 'Type'][:3])
+        meta_str = "\n".join([f"{k}: {v}" for k, v in metadata.items() if k != 'Type'][:3])
         self.lbl_meta.setText(f"Sample Data:\n{meta_str}" if meta_str else "Sample Data: None")
-
-
-class AnalysisModePanel(QGroupBox):
-    """Panel for switching between different 3D views"""
-
-    # Signals to notify the visualizer to change view
-    mode_changed = pyqtSignal(str)  # "volume", "slices", "iso", "clear", "reset"
-
-    def __init__(self, title="Analysis Modes"):
-        super().__init__(title)
-        self._init_ui()
-
-    def _init_ui(self):
-        layout = QVBoxLayout()
-
-        btn_vol = QPushButton("📊 Volume Rendering")
-        btn_vol.clicked.connect(lambda: self.mode_changed.emit("volume"))
-
-        btn_slice = QPushButton("🔳 Orthogonal Slices")
-        btn_slice.clicked.connect(lambda: self.mode_changed.emit("slices"))
-
-        btn_iso = QPushButton("🏔️ Isosurface (Solid/Pore)")
-        btn_iso.clicked.connect(lambda: self.mode_changed.emit("iso"))
-
-        btn_clear = QPushButton("🗑️ Clear View")
-        btn_clear.clicked.connect(lambda: self.mode_changed.emit("clear"))
-
-        btn_reset = QPushButton("🎥 Reset Camera")
-        btn_reset.clicked.connect(lambda: self.mode_changed.emit("reset"))
-
-        for btn in [btn_vol, btn_slice, btn_iso]:
-            btn.setMinimumHeight(40)
-            layout.addWidget(btn)
-
-        layout.addWidget(Separator())
-
-        for btn in [btn_clear, btn_reset]:
-            btn.setMinimumHeight(35)
-            layout.addWidget(btn)
-
-        self.setLayout(layout)
-
-
-class RenderingParamsPanel(QGroupBox):
-    """Panel for adjusting rendering parameters (threshold, colormap)"""
-
-    threshold_changed = pyqtSignal(int)
-    colormap_changed = pyqtSignal(str)
-    opacity_changed = pyqtSignal(str)
-
-    def __init__(self, title="Rendering Parameters"):
-        super().__init__(title)
-        self._init_ui()
-
-    def _init_ui(self):
-        layout = QVBoxLayout()
-
-        # Threshold
-        layout.addWidget(QLabel("Iso-Threshold (Intensity):"))
-        self.slider = QSlider(Qt.Horizontal)
-        self.slider.setRange(-1000, 2000)
-        self.slider.setValue(300)
-        self.slider.setTickInterval(200)
-        self.slider.valueChanged.connect(self._on_slider_change)
-        layout.addWidget(self.slider)
-
-        self.lbl_val = QLabel("Value: 300 Intensity")
-        self.lbl_val.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.lbl_val)
-
-        # Colormap
-        layout.addWidget(QLabel("Colormap:"))
-        self.combo_cmap = QComboBox()
-        self.combo_cmap.addItems(['bone', 'viridis', 'plasma', 'gray', 'coolwarm', 'jet'])
-        self.combo_cmap.currentTextChanged.connect(self.colormap_changed.emit)
-        layout.addWidget(self.combo_cmap)
-
-        # Opacity
-        layout.addWidget(QLabel("Opacity Preset:"))
-        self.combo_op = QComboBox()
-        self.combo_op.addItems(['sigmoid', 'sigmoid_10', 'linear', 'linear_r', 'geom', 'geom_r'])
-        self.combo_op.currentTextChanged.connect(self.opacity_changed.emit)
-        layout.addWidget(self.combo_op)
-
-        self.setLayout(layout)
-
-    def _on_slider_change(self, val):
-        self.lbl_val.setText(f"Value: {val} Intensity")
-        self.threshold_changed.emit(val)
-
-    def get_current_threshold(self):
-        return self.slider.value()
-
-    def get_current_colormap(self):
-        return self.combo_cmap.currentText()
-
-    def get_current_opacity(self):
-        return self.combo_op.currentText()
 
 
 class StructureProcessingPanel(QGroupBox):
     """
-    Panel specific to the Application Logic (Controller).
-    Decoupled from the Visualizer logic.
+    Panel for Workflow Actions (Load, Process, Model).
     """
-
-    # Signals for Controller actions
+    # Signals to communicate with Controller
     load_clicked = pyqtSignal()
     fast_load_clicked = pyqtSignal()
     dummy_clicked = pyqtSignal()
@@ -194,10 +95,225 @@ class StructureProcessingPanel(QGroupBox):
 
         layout.addWidget(Separator())
 
-        # Reset
         btn_reset = QPushButton("↩️ Reset to Raw Data")
-        btn_reset.setMinimumHeight(35)
         btn_reset.clicked.connect(self.reset_clicked.emit)
+        btn_reset.setMinimumHeight(35)
         layout.addWidget(btn_reset)
 
         self.setLayout(layout)
+
+
+class VisualizationModePanel(QGroupBox):
+    """
+    Panel for selecting the Visualization Mode (Volume, Slices, Iso).
+    Moved from Visualizers.py.
+    """
+    volume_clicked = pyqtSignal()
+    slices_clicked = pyqtSignal()
+    iso_clicked = pyqtSignal()
+    clear_clicked = pyqtSignal()
+    reset_camera_clicked = pyqtSignal()
+
+    def __init__(self, title="Analysis Modes"):
+        super().__init__(title)
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout()
+
+        self.btn_volume = QPushButton("📊 Volume Rendering")
+        self.btn_volume.setMinimumHeight(40)
+        self.btn_volume.clicked.connect(self.volume_clicked.emit)
+        layout.addWidget(self.btn_volume)
+
+        self.btn_slices = QPushButton("🔳 Orthogonal Slices")
+        self.btn_slices.setMinimumHeight(40)
+        self.btn_slices.clicked.connect(self.slices_clicked.emit)
+        layout.addWidget(self.btn_slices)
+
+        self.btn_isosurface = QPushButton("🏔️ Isosurface (Solid/Pore)")
+        self.btn_isosurface.setMinimumHeight(40)
+        self.btn_isosurface.clicked.connect(self.iso_clicked.emit)
+        layout.addWidget(self.btn_isosurface)
+
+        layout.addWidget(Separator())
+
+        self.btn_clear = QPushButton("🗑️ Clear View")
+        self.btn_clear.setMinimumHeight(35)
+        self.btn_clear.clicked.connect(self.clear_clicked.emit)
+        layout.addWidget(self.btn_clear)
+
+        self.btn_reset_camera = QPushButton("🎥 Reset Camera")
+        self.btn_reset_camera.setMinimumHeight(35)
+        self.btn_reset_camera.clicked.connect(self.reset_camera_clicked.emit)
+        layout.addWidget(self.btn_reset_camera)
+
+        self.setLayout(layout)
+
+
+class RenderingParametersPanel(QGroupBox):
+    """
+    Panel for controlling fine-grained rendering parameters.
+    Handles visibility logic for widgets based on the current mode.
+    Moved from Visualizers.py.
+    """
+    # Signals carrying values
+    threshold_changed = pyqtSignal(int)
+    coloring_mode_changed = pyqtSignal(str)
+    colormap_changed = pyqtSignal(str)
+    solid_color_changed = pyqtSignal(str)
+    light_angle_changed = pyqtSignal(int)
+    render_style_changed = pyqtSignal(str)
+    opacity_changed = pyqtSignal(str)
+
+    def __init__(self, title="Rendering Parameters"):
+        super().__init__(title)
+        self.active_mode = None
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout()
+
+        # 1. Threshold (Iso only)
+        self.lbl_threshold = QLabel("Iso-Threshold (Intensity):")
+        layout.addWidget(self.lbl_threshold)
+
+        self.threshold_slider = QSlider(Qt.Horizontal)
+        self.threshold_slider.setMinimum(-1000)
+        self.threshold_slider.setMaximum(2000)
+        self.threshold_slider.setValue(300)
+        self.threshold_slider.setTickPosition(QSlider.TicksBelow)
+        self.threshold_slider.setTickInterval(200)
+        self.threshold_slider.valueChanged.connect(self._on_threshold_change)
+        layout.addWidget(self.threshold_slider)
+
+        self.threshold_value_label = QLabel("Value: 300 Intensity")
+        self.threshold_value_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.threshold_value_label)
+
+        # 2. Coloring Mode Selector (Iso only)
+        self.lbl_coloring_mode = QLabel("Isosurface Coloring Mode:")
+        layout.addWidget(self.lbl_coloring_mode)
+
+        self.coloring_mode_combo = QComboBox()
+        self.coloring_mode_combo.addItems([
+            'Solid Color',
+            'Depth (Z-Axis)',
+            'Radial (Center Dist)'
+        ])
+        self.coloring_mode_combo.setToolTip("Select how the isosurface is colored.")
+        self.coloring_mode_combo.setCurrentIndex(0)
+        self.coloring_mode_combo.currentTextChanged.connect(self.coloring_mode_changed.emit)
+        # Also trigger visibility update internally when mode changes
+        self.coloring_mode_combo.currentTextChanged.connect(self._update_visibility)
+        layout.addWidget(self.coloring_mode_combo)
+
+        # 3. Colormap selector (Volume, Slices, or Iso-Scalar)
+        self.lbl_colormap = QLabel("Colormap:")
+        layout.addWidget(self.lbl_colormap)
+
+        self.colormap_combo = QComboBox()
+        self.colormap_combo.addItems(['bone', 'viridis', 'plasma', 'gray', 'coolwarm', 'jet', 'magma'])
+        self.colormap_combo.currentTextChanged.connect(self.colormap_changed.emit)
+        layout.addWidget(self.colormap_combo)
+
+        # 4. Solid Color Selector (Iso-Solid only)
+        self.lbl_solid_color = QLabel("Solid Color:")
+        layout.addWidget(self.lbl_solid_color)
+
+        self.solid_color_combo = QComboBox()
+        self.solid_color_combo.addItems(['ivory', 'red', 'gold', 'lightgray', 'mediumseagreen', 'dodgerblue', 'wheat'])
+        self.solid_color_combo.currentTextChanged.connect(self.solid_color_changed.emit)
+        layout.addWidget(self.solid_color_combo)
+
+        # 5. Light Azimuth (Position) Slider (Iso only)
+        self.lbl_light_angle = QLabel("Light Source Angle (0-360°):")
+        layout.addWidget(self.lbl_light_angle)
+
+        self.light_azimuth_slider = QSlider(Qt.Horizontal)
+        self.light_azimuth_slider.setRange(0, 360)
+        self.light_azimuth_slider.setValue(45)
+        self.light_azimuth_slider.setTickInterval(45)
+        self.light_azimuth_slider.valueChanged.connect(self.light_angle_changed.emit)
+        layout.addWidget(self.light_azimuth_slider)
+
+        # 6. Render Style Selector
+        self.lbl_render_style = QLabel("Render Style (显示风格):")
+        layout.addWidget(self.lbl_render_style)
+
+        self.render_style_combo = QComboBox()
+        self.render_style_combo.addItems(['Surface', 'Wireframe', 'Wireframe + Surface'])
+        self.render_style_combo.setCurrentIndex(0)
+        self.render_style_combo.currentTextChanged.connect(self.render_style_changed.emit)
+        layout.addWidget(self.render_style_combo)
+
+        # 7. Opacity preset selector (Volume only)
+        self.lbl_opacity = QLabel("Opacity Preset:")
+        layout.addWidget(self.lbl_opacity)
+
+        self.opacity_combo = QComboBox()
+        self.opacity_combo.addItems(['sigmoid', 'sigmoid_10', 'linear', 'linear_r', 'geom', 'geom_r'])
+        self.opacity_combo.currentTextChanged.connect(self.opacity_changed.emit)
+        layout.addWidget(self.opacity_combo)
+
+        self.setLayout(layout)
+
+        # Initial state
+        self._update_visibility()
+
+    def set_mode(self, mode):
+        """Set the current visualization mode ('volume', 'slices', 'iso', None)"""
+        self.active_mode = mode
+        self._update_visibility()
+
+    def get_current_values(self):
+        """Helper to get all current values at once"""
+        return {
+            'threshold': self.threshold_slider.value(),
+            'coloring_mode': self.coloring_mode_combo.currentText(),
+            'colormap': self.colormap_combo.currentText(),
+            'solid_color': self.solid_color_combo.currentText(),
+            'light_angle': self.light_azimuth_slider.value(),
+            'render_style': self.render_style_combo.currentText(),
+            'opacity': self.opacity_combo.currentText()
+        }
+
+    def _on_threshold_change(self, value):
+        self.threshold_value_label.setText(f"Value: {value} Intensity")
+        self.threshold_changed.emit(value)
+
+    def _update_visibility(self):
+        """Internal logic to show/hide widgets based on mode"""
+        mode = self.active_mode
+
+        # Helper to toggle visibility
+        def set_visible(widgets, visible):
+            for w in widgets:
+                w.setVisible(visible)
+
+        show_threshold = (mode == 'iso')
+        show_coloring_mode = (mode == 'iso')
+        show_light_angle = (mode == 'iso')
+        show_render_style = (mode == 'iso')
+        show_opacity = (mode == 'volume')
+
+        show_colormap = False
+        show_solid_color = False
+
+        if mode == 'volume':
+            show_colormap = True
+        elif mode == 'slices':
+            show_colormap = True
+        elif mode == 'iso':
+            if self.coloring_mode_combo.currentText() == 'Solid Color':
+                show_solid_color = True
+            else:
+                show_colormap = True
+
+        set_visible([self.lbl_threshold, self.threshold_slider, self.threshold_value_label], show_threshold)
+        set_visible([self.lbl_coloring_mode, self.coloring_mode_combo], show_coloring_mode)
+        set_visible([self.lbl_light_angle, self.light_azimuth_slider], show_light_angle)
+        set_visible([self.lbl_render_style, self.render_style_combo], show_render_style)
+        set_visible([self.lbl_opacity, self.opacity_combo], show_opacity)
+        set_visible([self.lbl_colormap, self.colormap_combo], show_colormap)
+        set_visible([self.lbl_solid_color, self.solid_color_combo], show_solid_color)
