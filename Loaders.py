@@ -3,6 +3,7 @@ import numpy as np
 import pydicom
 from glob import glob
 from typing import List, Tuple
+from scipy.ndimage import gaussian_filter
 from Core import BaseLoader, VolumeData
 
 
@@ -25,7 +26,6 @@ class DicomSeriesLoader(BaseLoader):
         volume, spacing, origin = self._build_volume(slices)
 
         # Extract basic sample metadata
-        # Mapped from standard DICOM tags to Industrial CT context
         metadata = {
             "SampleID": getattr(slices[0], "PatientID", "Unknown Sample"),
             "ScanType": getattr(slices[0], "Modality", "CT"),
@@ -197,28 +197,52 @@ class DummyLoader(BaseLoader):
     """Synthetic porous media generator for testing"""
 
     def load(self, size: int = 128) -> VolumeData:
-        print(f"[Loader] Generating synthetic porous structure (Size: {size})...")
-        x, y, z = np.mgrid[:size, :size, :size]
-        center = size // 2
-        radius = size // 3
-        distance = (x - center) ** 2 + (y - center) ** 2 + (z - center) ** 2
+        print(f"[Loader] Generating synthetic internal porous structure (Size: {size})...")
+
+        # 1. Generate random noise (Gaussian Random Field)
+        np.random.seed(None)
+        noise = np.random.rand(size, size, size)
+
+        # 2. Apply Gaussian Blur to create organic, connected "blobs"
+        sigma = 4.0
+        print(f"[Loader] Applying Gaussian filter (sigma={sigma})...")
+        blob_field = gaussian_filter(noise, sigma=sigma)
+
+        # 3. Threshold to define Solid vs Void
+        # Higher threshold = more void space
+        threshold = np.mean(blob_field)
 
         volume = np.zeros((size, size, size), dtype=np.float32)
 
-        # Solid matrix (shell)
-        mask_shell = (distance < radius ** 2) & (distance > (radius / 2) ** 2)
-        volume[mask_shell] = 1000  # High intensity for solid
+        # Solid matrix (High Intensity)
+        mask_solid = blob_field > threshold
+        volume[mask_solid] = 1000
 
-        # Void/Pore (core)
-        mask_core = distance <= (radius / 2) ** 2
-        volume[mask_core] = -1000 # Low intensity for void
+        # Void/Pore space (Low Intensity)
+        mask_void = blob_field <= threshold
+        volume[mask_void] = -1000
 
-        # Add noise to simulate real CT scan noise
+        # 4. Enforce Solid Boundary (Shell)
+        # This ensures the pores are "Internal" and not touching the image border everywhere
+        print("[Loader] Enforcing solid boundary shell...")
+        border = 5
+        volume[:border, :, :] = 1000
+        volume[-border:, :, :] = 1000
+        volume[:, :border, :] = 1000
+        volume[:, -border:, :] = 1000
+        volume[:, :, :border] = 1000
+        volume[:, :, -border:] = 1000
+
+        # 5. Add realistic scanner noise
         volume += np.random.normal(0, 50, (size, size, size))
 
         return VolumeData(
             raw_data=volume,
             spacing=(1.0, 1.0, 1.0),
             origin=(0.0, 0.0, 0.0),
-            metadata={"Type": "Synthetic", "Description": "Hollow Sphere Phantom"}
+            metadata={
+                "Type": "Synthetic",
+                "Description": "Solid Block with Internal Random Pores",
+                "GenerationMethod": "Gaussian Random Field + Solid Shell"
+            }
         )
