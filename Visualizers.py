@@ -19,7 +19,7 @@ class VisualizerMeta(type(QMainWindow), type(BaseVisualizer)):
 class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
     """
     PyQt5-based GUI Visualizer with embedded PyVista 3D viewer.
-    Replaces command-line interface with an interactive graphical interface.
+    Designed for Porous Media and Industrial CT Analysis.
     """
 
     def __init__(self):
@@ -29,7 +29,7 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         self.current_actors = []  # Track current visualization actors
 
         # Window setup
-        self.setWindowTitle("Medical Imaging Visualization Suite")
+        self.setWindowTitle("Porous CT Analysis Suite")
         self.setGeometry(100, 100, 1400, 900)
 
         # Initialize UI
@@ -51,14 +51,14 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         self.plotter = BackgroundPlotter(
             window_size=(1000, 900),
             show=False,
-            title="3D Visualization"
+            title="3D Structure Viewer"
         )
         main_layout.addWidget(self.plotter.app_window, stretch=3)
 
         # Status bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.update_status("Ready. Please load data to begin.")
+        self.update_status("Ready. Please load a sample scan to begin.")
 
     def _create_control_panel(self):
         """Create the left control panel with all controls"""
@@ -99,13 +99,13 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
 
     def _create_data_info_group(self):
         """Create data information display group"""
-        group = QGroupBox("Data Information")
+        group = QGroupBox("Sample Information")
         layout = QVBoxLayout()
 
         self.data_type_label = QLabel("Type: No data loaded")
-        self.data_dim_label = QLabel("Dimensions: N/A")
-        self.data_spacing_label = QLabel("Spacing: N/A")
-        self.data_meta_label = QLabel("Metadata: N/A")
+        self.data_dim_label = QLabel("Grid: N/A")
+        self.data_spacing_label = QLabel("Voxel Size: N/A")
+        self.data_meta_label = QLabel("Sample Data: N/A")
 
         for label in [self.data_type_label, self.data_dim_label,
                       self.data_spacing_label, self.data_meta_label]:
@@ -117,23 +117,23 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
 
     def _create_visualization_group(self):
         """Create visualization mode selection group"""
-        group = QGroupBox("Visualization Modes")
+        group = QGroupBox("Analysis Modes")
         layout = QVBoxLayout()
 
         # Volume Rendering Button
-        self.btn_volume = QPushButton("🧊 Volume Rendering")
+        self.btn_volume = QPushButton("📊 Volume Rendering")
         self.btn_volume.setMinimumHeight(40)
         self.btn_volume.clicked.connect(self.render_volume)
         layout.addWidget(self.btn_volume)
 
         # Slice View Button
-        self.btn_slices = QPushButton("🔪 Orthogonal Slices")
+        self.btn_slices = QPushButton("🔳 Orthogonal Slices")
         self.btn_slices.setMinimumHeight(40)
         self.btn_slices.clicked.connect(self.render_slices)
         layout.addWidget(self.btn_slices)
 
         # Isosurface Button
-        self.btn_isosurface = QPushButton("🌐 Isosurface")
+        self.btn_isosurface = QPushButton("🏔️ Isosurface (Solid/Pore)")
         self.btn_isosurface.setMinimumHeight(40)
         self.btn_isosurface.clicked.connect(self.render_isosurface_auto)
         layout.addWidget(self.btn_isosurface)
@@ -162,7 +162,7 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         layout = QVBoxLayout()
 
         # Threshold slider for isosurface
-        threshold_label = QLabel("Isosurface Threshold:")
+        threshold_label = QLabel("Iso-Threshold (Intensity):")
         layout.addWidget(threshold_label)
 
         self.threshold_slider = QSlider(Qt.Horizontal)
@@ -174,7 +174,7 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         self.threshold_slider.valueChanged.connect(self._on_threshold_changed)
         layout.addWidget(self.threshold_slider)
 
-        self.threshold_value_label = QLabel("Value: 300 HU")
+        self.threshold_value_label = QLabel("Value: 300 Intensity")
         self.threshold_value_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.threshold_value_label)
 
@@ -200,7 +200,7 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         self.data = data
         self._create_grid()
         self._update_data_info()
-        self.update_status("Data loaded successfully. Choose a visualization mode.")
+        self.update_status("Scan loaded successfully. Choose a visualization mode.")
 
         # Automatically show volume rendering
         self.render_volume()
@@ -222,18 +222,18 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         if not self.data:
             return
 
-        data_type = self.data.metadata.get('Type', 'Original')
+        data_type = self.data.metadata.get('Type', 'Original Scan')
         self.data_type_label.setText(f"Type: {data_type}")
-        self.data_dim_label.setText(f"Dimensions: {self.data.dimensions}")
+        self.data_dim_label.setText(f"Grid: {self.data.dimensions}")
         self.data_spacing_label.setText(
-            f"Spacing: ({self.data.spacing[0]:.2f}, "
+            f"Voxel Size: ({self.data.spacing[0]:.2f}, "
             f"{self.data.spacing[1]:.2f}, {self.data.spacing[2]:.2f}) mm"
         )
 
         # Format metadata
         meta_str = "\n".join([f"{k}: {v}" for k, v in self.data.metadata.items()
                               if k != 'Type'][:3])
-        self.data_meta_label.setText(f"Metadata:\n{meta_str}" if meta_str else "Metadata: None")
+        self.data_meta_label.setText(f"Sample Data:\n{meta_str}" if meta_str else "Sample Data: None")
 
     def clear_view(self):
         """Clear all actors from the viewer"""
@@ -261,7 +261,7 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
     def render_volume(self):
         """Render volume visualization"""
         if not self.grid:
-            QMessageBox.warning(self, "No Data", "Please load data first.")
+            QMessageBox.warning(self, "No Data", "Please load a sample first.")
             return
 
         self.update_status("Rendering volume...")
@@ -284,7 +284,7 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
     def render_slices(self):
         """Render orthogonal slices"""
         if not self.grid:
-            QMessageBox.warning(self, "No Data", "Please load data first.")
+            QMessageBox.warning(self, "No Data", "Please load a sample first.")
             return
 
         self.update_status("Rendering orthogonal slices...")
@@ -306,7 +306,7 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
     def render_isosurface(self, threshold=300, color=None, opacity=1.0):
         """Render isosurface at given threshold"""
         if not self.grid:
-            QMessageBox.warning(self, "No Data", "Please load data first.")
+            QMessageBox.warning(self, "No Data", "Please load a sample first.")
             return
 
         self.update_status(f"Extracting isosurface at threshold {threshold}...")
@@ -333,15 +333,15 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
             if color is None:
                 data_type = self.data.metadata.get("Type", "")
                 if "Pore" in data_type or "Spheres" in data_type or "Network" in data_type:
-                    color = "red"
+                    color = "red"  # Pores/Network usually red
                 else:
-                    color = "ivory"
+                    color = "ivory" # Solid matrix usually bone/white
 
             self.plotter.add_mesh(contours, color=color, opacity=opacity, smooth_shading=True)
             self.plotter.add_axes()
             self.plotter.reset_camera()
 
-            self.update_status(f"Isosurface rendered at threshold {threshold} HU with color {color}.")
+            self.update_status(f"Isosurface rendered at threshold {threshold} Intensity with color {color}.")
         except Exception as e:
             QMessageBox.critical(self, "Rendering Error", f"Failed to render isosurface: {str(e)}")
             self.update_status("Isosurface rendering failed.")
@@ -350,7 +350,7 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
 
     def _on_threshold_changed(self, value):
         """Update threshold value label"""
-        self.threshold_value_label.setText(f"Value: {value} HU")
+        self.threshold_value_label.setText(f"Value: {value} Intensity")
 
     def _on_colormap_changed(self, colormap):
         """Handle colormap change - could trigger re-render if desired"""

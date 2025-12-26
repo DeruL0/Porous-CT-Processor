@@ -11,10 +11,10 @@ from Core import BaseLoader, VolumeData
 # ==========================================
 
 class DicomSeriesLoader(BaseLoader):
-    """Concrete DICOM series loader"""
+    """Concrete DICOM series loader for Industrial CT/Micro-CT scans"""
 
     def load(self, folder_path: str) -> VolumeData:
-        print(f"[Loader] Scanning folder: {folder_path} ...")
+        print(f"[Loader] Scanning sample folder: {folder_path} ...")
 
         if not os.path.exists(folder_path):
             raise FileNotFoundError(f"Path does not exist: {folder_path}")
@@ -24,14 +24,16 @@ class DicomSeriesLoader(BaseLoader):
 
         volume, spacing, origin = self._build_volume(slices)
 
-        # Extract some basic metadata
+        # Extract basic sample metadata
+        # Mapped from standard DICOM tags to Industrial CT context
         metadata = {
-            "PatientID": getattr(slices[0], "PatientID", "Unknown"),
-            "Modality": getattr(slices[0], "Modality", "Unknown"),
-            "SliceCount": len(slices)
+            "SampleID": getattr(slices[0], "PatientID", "Unknown Sample"),
+            "ScanType": getattr(slices[0], "Modality", "CT"),
+            "SliceCount": len(slices),
+            "Description": getattr(slices[0], "StudyDescription", "No Description")
         }
 
-        print(f"[Loader] Loading complete: {volume.shape}, Spacing: {spacing}")
+        print(f"[Loader] Loading complete: {volume.shape}, Voxel Spacing: {spacing}")
         return VolumeData(raw_data=volume, spacing=spacing, origin=origin, metadata=metadata)
 
     def _find_dicom_files(self, folder_path: str) -> List[str]:
@@ -47,7 +49,7 @@ class DicomSeriesLoader(BaseLoader):
                     except:
                         continue
         if not files:
-            raise FileNotFoundError("No valid DICOM files found")
+            raise FileNotFoundError("No valid DICOM/CT files found")
         return files
 
     def _read_and_sort_slices(self, files: List[str]) -> List[pydicom.dataset.FileDataset]:
@@ -60,6 +62,7 @@ class DicomSeriesLoader(BaseLoader):
             except Exception as e:
                 print(f"Warning: Skipping file {f} - {e}")
 
+        # Sort by Z position to reconstruct the 3D volume correctly
         slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
         return slices
 
@@ -87,8 +90,8 @@ class DicomSeriesLoader(BaseLoader):
 
 class FastDicomLoader(DicomSeriesLoader):
     """
-    Fast loader that downsamples data (lowers resolution) to improve performance.
-    Useful for quick previews or large datasets.
+    Fast loader that downsamples data (lowers resolution).
+    Essential for previewing large Micro-CT datasets.
     """
 
     def __init__(self, step: int = 2):
@@ -139,8 +142,8 @@ class FastDicomLoader(DicomSeriesLoader):
         volume, spacing, origin = self._build_volume_downsampled(slices)
 
         metadata = {
-            "PatientID": getattr(slices[0], "PatientID", "Unknown"),
-            "Modality": getattr(slices[0], "Modality", "Unknown"),
+            "SampleID": getattr(slices[0], "PatientID", "Unknown Sample"),
+            "ScanType": getattr(slices[0], "Modality", "CT"),
             "SliceCount": len(slices),
             "Type": "Fast/Downsampled"
         }
@@ -191,10 +194,10 @@ class FastDicomLoader(DicomSeriesLoader):
 
 
 class DummyLoader(BaseLoader):
-    """Dummy data generator for testing"""
+    """Synthetic porous media generator for testing"""
 
     def load(self, size: int = 128) -> VolumeData:
-        print(f"[Loader] Generating synthetic data (Size: {size})...")
+        print(f"[Loader] Generating synthetic porous structure (Size: {size})...")
         x, y, z = np.mgrid[:size, :size, :size]
         center = size // 2
         radius = size // 3
@@ -202,17 +205,20 @@ class DummyLoader(BaseLoader):
 
         volume = np.zeros((size, size, size), dtype=np.float32)
 
+        # Solid matrix (shell)
         mask_shell = (distance < radius ** 2) & (distance > (radius / 2) ** 2)
-        volume[mask_shell] = 1000
+        volume[mask_shell] = 1000  # High intensity for solid
 
+        # Void/Pore (core)
         mask_core = distance <= (radius / 2) ** 2
-        volume[mask_core] = -1000
+        volume[mask_core] = -1000 # Low intensity for void
 
+        # Add noise to simulate real CT scan noise
         volume += np.random.normal(0, 50, (size, size, size))
 
         return VolumeData(
             raw_data=volume,
             spacing=(1.0, 1.0, 1.0),
             origin=(0.0, 0.0, 0.0),
-            metadata={"Type": "Synthetic", "Description": "Hollow Sphere"}
+            metadata={"Type": "Synthetic", "Description": "Hollow Sphere Phantom"}
         )

@@ -11,32 +11,50 @@ from Core import BaseProcessor, VolumeData
 
 class PoreExtractionProcessor(BaseProcessor):
     """
-    Extract inside pores using morphological operations.
+    Extract void space (pores) from the solid matrix using morphological operations.
     """
 
     def process(self, data: VolumeData, threshold: int = -300) -> VolumeData:
-        print(f"[Processor] Starting pore detection (Foreground Threshold > {threshold} HU)...")
+        print(f"[Processor] Starting pore detection (Threshold < {threshold} Intensity)...")
 
-        foreground_mask = data.raw_data > threshold
+        # In Porous CT, pores are usually low intensity (air) and solid is high intensity.
+        # We look for the "background" relative to the solid material.
+        # Note: Logic assumes user passes a threshold where values BELOW or ABOVE define the pore.
+        # Standard CT: Air ~ -1000, Bone/Rock ~ 1000.
+        # Here we assume the user sets a threshold to separate solid from pore.
+
+        # NOTE: Depending on input, we might need to invert logic.
+        # Here we assume data.raw_data > threshold is SOLID.
+        # Therefore, data.raw_data <= threshold is PORE.
+
+        # To maintain compatibility with the original logic (which extracted "foreground"),
+        # we will treat the selected region as the target "Pore" region.
+        # Let's assume the user selects the range they want to visualize.
+
+        target_mask = data.raw_data > threshold
 
         print("[Processor] Performing morphological operations (may take a few seconds)...")
-        filled_mask = ndimage.binary_fill_holes(foreground_mask)
+        # Fill holes inside the selected region to get full volume
+        filled_mask = ndimage.binary_fill_holes(target_mask)
 
-        # XOR operation to find the difference (the pores)
-        pores_mask = filled_mask ^ foreground_mask
+        # XOR to find internal voids if we segmented the solid
+        # OR if we segmented the pores directly, this logic might need adjustment.
+        # For this tool, we assume: "Extract Pores" means identifying the void space.
+
+        pores_mask = filled_mask ^ target_mask
 
         pore_voxels = np.sum(pores_mask)
         print(f"[Processor] Detection complete. Found {pore_voxels} pore voxels.")
 
         processed_volume = np.zeros_like(data.raw_data)
-        processed_volume[pores_mask] = 1000
+        processed_volume[pores_mask] = 1000  # Assign high value for visualization of the pore itself
 
         return VolumeData(
             raw_data=processed_volume,
             spacing=data.spacing,
             origin=data.origin,
             metadata={
-                "Type": "Processed - Pores",
+                "Type": "Processed - Void Space",
                 "Source": data.metadata.get("Description", "Unknown"),
                 "PoreVoxels": int(pore_voxels)
             }
@@ -46,18 +64,19 @@ class PoreExtractionProcessor(BaseProcessor):
 class PoreToSphereProcessor(BaseProcessor):
     """
     Detects pores and constructs a Pore Network Model (PNM) using Watershed Segmentation.
+    Used for characterizing porous media (rocks, foams, bones, filters).
 
     Algorithm:
     1. Identify pore space.
     2. Compute Euclidean Distance Map (EDM) on the pore space.
-    3. Find local maxima in the EDM to identify pore centers (Seeds).
+    3. Find local maxima in the EDM to identify pore bodies (Seeds).
     4. Apply Watershed segmentation to split large connected pores into sub-pores.
-    5. Determine connectivity by checking adjacency between segmented regions.
+    5. Determine connectivity (throats) by checking adjacency between segmented regions.
     6. Visualize as Ball-and-Stick model.
     """
 
     def process(self, data: VolumeData, threshold: int = -300) -> VolumeData:
-        print(f"[Processor] Starting Pore Network Extraction (Threshold > {threshold} HU)...")
+        print(f"[Processor] Starting Pore Network Extraction (Threshold > {threshold})...")
 
         # 1. Detect Pores (Binary Mask)
         foreground_mask = data.raw_data > threshold
@@ -73,16 +92,13 @@ class PoreToSphereProcessor(BaseProcessor):
             )
 
         # 2. Distance Transform
-        # Calculate the distance from every pore voxel to the nearest solid/background voxel
-        # The 'peaks' of this map represent the centers of wide open spaces (pores)
+        # Calculate the distance from every pore voxel to the nearest solid/matrix voxel
+        # The 'peaks' of this map represent the centers of wide open pore bodies
         print("[Processor] Computing Euclidean Distance Map...")
         distance_map = ndimage.distance_transform_edt(pores_mask)
 
         # 3. Find Pore Centers (Seeds)
         # We look for local peaks in the distance map.
-        # min_distance controls the minimum separation between two distinct pores.
-        # If too small -> oversegmentation (too many small pores).
-        # If too large -> undersegmentation (missed throats).
         print("[Processor] Finding local maxima (seeds)...")
         min_peak_distance = 6
         local_maxi = peak_local_max(distance_map, labels=pores_mask, min_distance=min_peak_distance)
@@ -92,11 +108,11 @@ class PoreToSphereProcessor(BaseProcessor):
         # peak_local_max returns coordinates (N, 3), we mark them on the grid
         markers[tuple(local_maxi.T)] = np.arange(len(local_maxi)) + 1
 
-        print(f"[Processor] Found {len(local_maxi)} potential pore centers.")
+        print(f"[Processor] Found {len(local_maxi)} potential pore bodies.")
 
         # 4. Watershed Segmentation
         # "Floods" the topography (inverted distance map) starting from the markers.
-        # This splits the continuous pore space into distinct regions (catchment basins).
+        # This splits the continuous pore space into distinct regions.
         # The boundaries where basins meet are the 'throats'.
         print("[Processor] Executing Watershed segmentation to split large pores...")
         segmented_pores = watershed(-distance_map, markers, mask=pores_mask)
@@ -138,7 +154,7 @@ class PoreToSphereProcessor(BaseProcessor):
             self._draw_sphere(sphere_volume, center, radius)
 
         # 6. Detect Connectivity (Adjacency)
-        # If two different labeled regions touch each other, they are connected.
+        # If two different labeled regions touch each other, they are connected via a throat.
         print("[Processor] Analyzing region adjacency to build network connections...")
         connections = self._find_adjacency(segmented_pores)
         print(f"[Processor] Found {len(connections)} connections (throats).")
@@ -164,7 +180,7 @@ class PoreToSphereProcessor(BaseProcessor):
             spacing=data.spacing,
             origin=data.origin,
             metadata={
-                "Type": "Processed - Network (Watershed)",
+                "Type": "Processed - Network (PNM)",
                 "Source": data.metadata.get("Description", "Unknown"),
                 "PoreCount": num_pores,
                 "ConnectionCount": len(connections)
@@ -178,9 +194,6 @@ class PoreToSphereProcessor(BaseProcessor):
         """
         adjacency = set()
 
-        # We check connectivity in 3 directions (z, y, x) using efficient array shifting
-        # This compares neighbor voxels across the whole volume at once.
-
         # Directions to check: (axis, slice_current, slice_next)
         shifts = [
             (0, np.s_[:-1, :, :], np.s_[1:, :, :]),  # Z axis neighbors
@@ -189,21 +202,13 @@ class PoreToSphereProcessor(BaseProcessor):
         ]
 
         for axis, s_curr, s_next in shifts:
-            # Get values for adjacent voxels
             val_curr = labels_volume[s_curr]
             val_next = labels_volume[s_next]
 
-            # Find boundaries:
-            # 1. Both voxels must be pores (val > 0)
-            # 2. They must belong to DIFFERENT labels (val_curr != val_next)
             mask = (val_curr > 0) & (val_next > 0) & (val_curr != val_next)
 
             if np.any(mask):
-                # Extract the pairs of labels at these boundary locations
                 pairs = np.stack((val_curr[mask], val_next[mask]), axis=-1)
-
-                # Sort pairs to ensure (1, 2) is treated same as (2, 1)
-                # Using np.unique is efficient to remove duplicates
                 unique_pairs = np.unique(pairs, axis=0)
 
                 for p in unique_pairs:
@@ -230,9 +235,7 @@ class PoreToSphereProcessor(BaseProcessor):
         volume[z_min:z_max, y_min:y_max, x_min:x_max][mask] = 1000
 
     def _draw_cylinder(self, volume, p1, p2, radius):
-        """
-        Draws a cylinder between point p1 and p2 with given radius.
-        """
+        """Draws a cylinder between point p1 and p2."""
         p_min = np.minimum(p1, p2) - radius - 1
         p_max = np.maximum(p1, p2) + radius + 2
 
@@ -253,7 +256,6 @@ class PoreToSphereProcessor(BaseProcessor):
 
         z, y, x = np.ogrid[z_min:z_max, y_min:y_max, x_min:x_max]
 
-        # Vector projection logic to find distance to the line segment
         diff_z = z - p1[0]
         diff_y = y - p1[1]
         diff_x = x - p1[2]

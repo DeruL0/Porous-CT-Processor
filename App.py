@@ -13,7 +13,7 @@ from Visualizers import GuiVisualizer
 
 class AppController:
     """
-    Application controller with GUI integration.
+    Application controller for Porous Media Analysis.
     Coordinates loader, processor, and GUI visualizer.
     """
 
@@ -35,11 +35,11 @@ class AppController:
         # Create a processing group in the control panel
         from PyQt5.QtWidgets import QGroupBox, QPushButton, QVBoxLayout
 
-        group = QGroupBox("Data Processing")
+        group = QGroupBox("Structure Processing")
         layout = QVBoxLayout()
 
         # Load Data Button
-        btn_load = QPushButton("📁 Load DICOM Series")
+        btn_load = QPushButton("📁 Load Sample Scan")
         btn_load.setMinimumHeight(40)
         btn_load.clicked.connect(self._load_dicom_dialog)
         layout.addWidget(btn_load)
@@ -51,7 +51,7 @@ class AppController:
         layout.addWidget(btn_fast_load)
 
         # Load Dummy Data Button
-        btn_dummy = QPushButton("🧪 Load Dummy Data")
+        btn_dummy = QPushButton("🧪 Load Synthetic Sample")
         btn_dummy.setMinimumHeight(40)
         btn_dummy.clicked.connect(self._load_dummy_data)
         layout.addWidget(btn_dummy)
@@ -60,19 +60,19 @@ class AppController:
         layout.addWidget(self.visualizer._create_separator())
 
         # Extract Pores Button
-        btn_pores = QPushButton("🔬 Extract Pores (Raw)")
+        btn_pores = QPushButton("🔬 Extract Pore Space")
         btn_pores.setMinimumHeight(40)
         btn_pores.clicked.connect(self._process_pores)
         layout.addWidget(btn_pores)
 
         # Convert to Spheres Button
-        btn_spheres = QPushButton("⚪ Pore Network (Spheres)")
+        btn_spheres = QPushButton("⚪ Pore Network Model (PNM)")
         btn_spheres.setMinimumHeight(40)
         btn_spheres.clicked.connect(self._process_spheres)
         layout.addWidget(btn_spheres)
 
         # Reset to Original Button
-        btn_reset = QPushButton("↩️ Reset to Original")
+        btn_reset = QPushButton("↩️ Reset to Raw Data")
         btn_reset.setMinimumHeight(35)
         btn_reset.clicked.connect(self._reset_to_original)
         layout.addWidget(btn_reset)
@@ -84,10 +84,10 @@ class AppController:
         control_panel.layout().insertWidget(2, group)
 
     def _load_dicom_dialog(self):
-        """Open dialog to select DICOM directory and load data"""
+        """Open dialog to select DICOM/CT directory and load data"""
         folder_path = QFileDialog.getExistingDirectory(
             self.visualizer,
-            "Select DICOM Series Folder",
+            "Select Scan Series Folder",
             "",
             QFileDialog.ShowDirsOnly
         )
@@ -99,7 +99,7 @@ class AppController:
         """Open dialog to select DICOM directory and load with fast mode"""
         folder_path = QFileDialog.getExistingDirectory(
             self.visualizer,
-            "Select DICOM Series Folder (Fast Load)",
+            "Select Scan Series Folder (Fast Load)",
             "",
             QFileDialog.ShowDirsOnly
         )
@@ -110,27 +110,27 @@ class AppController:
     def _load_dummy_data(self):
         """Load dummy/synthetic data for testing"""
         try:
-            self.visualizer.update_status("Generating synthetic data...")
+            self.visualizer.update_status("Generating synthetic porous sample...")
             self.loader = DummyLoader()
             self.original_data = self.loader.load(128)
             self.current_data = self.original_data
             self.visualizer.set_data(self.current_data)
             QMessageBox.information(
                 self.visualizer,
-                "Data Loaded",
-                "Synthetic dummy data loaded successfully!"
+                "Sample Loaded",
+                "Synthetic porous sample loaded successfully!"
             )
         except Exception as e:
             QMessageBox.critical(
                 self.visualizer,
                 "Loading Error",
-                f"Failed to load dummy data: {str(e)}"
+                f"Failed to load synthetic data: {str(e)}"
             )
 
     def _load_data(self, folder_path: str, fast: bool = False):
-        """Load DICOM data from folder"""
+        """Load DICOM/CT data from folder"""
         try:
-            self.visualizer.update_status("Loading DICOM data...")
+            self.visualizer.update_status("Loading Scan data...")
 
             if fast:
                 self.loader = FastDicomLoader(step=2)
@@ -145,14 +145,14 @@ class AppController:
 
             QMessageBox.information(
                 self.visualizer,
-                "Data Loaded",
-                f"DICOM series loaded successfully!\nMode: {mode_text}\nSlices: {self.original_data.metadata.get('SliceCount', 'Unknown')}"
+                "Scan Loaded",
+                f"Series loaded successfully!\nMode: {mode_text}\nSlices: {self.original_data.metadata.get('SliceCount', 'Unknown')}"
             )
         except Exception as e:
             QMessageBox.critical(
                 self.visualizer,
                 "Loading Error",
-                f"Failed to load DICOM data: {str(e)}"
+                f"Failed to load data: {str(e)}"
             )
             import traceback
             traceback.print_exc()
@@ -163,12 +163,12 @@ class AppController:
             QMessageBox.warning(
                 self.visualizer,
                 "No Data",
-                "Please load data first before processing."
+                "Please load a sample first before processing."
             )
             return
 
         try:
-            self.visualizer.update_status("Extracting pores...")
+            self.visualizer.update_status("Extracting void space...")
 
             # Determine threshold based on data type
             is_synthetic = self.original_data.metadata.get("Type") == "Synthetic"
@@ -181,8 +181,8 @@ class AppController:
             pore_voxels = self.current_data.metadata.get('PoreVoxels', 'Unknown')
             QMessageBox.information(
                 self.visualizer,
-                "Processing Complete",
-                f"Pore extraction complete!\nPore Voxels: {pore_voxels}\n\nUse 'Isosurface' visualization to view results."
+                "Extraction Complete",
+                f"Void space analysis complete!\nPore Voxels: {pore_voxels}\n\nUse 'Isosurface' visualization to view the pore structure."
             )
         except Exception as e:
             QMessageBox.critical(
@@ -192,17 +192,17 @@ class AppController:
             )
 
     def _process_spheres(self):
-        """Execute pore-to-sphere network conversion"""
+        """Execute pore-to-sphere network conversion (PNM)"""
         if self.original_data is None:
             QMessageBox.warning(
                 self.visualizer,
                 "No Data",
-                "Please load data first before processing."
+                "Please load a sample first before processing."
             )
             return
 
         try:
-            self.visualizer.update_status("Converting pores to sphere network...")
+            self.visualizer.update_status("Generating Pore Network Model (PNM)...")
 
             # Determine threshold based on data type
             is_synthetic = self.original_data.metadata.get("Type") == "Synthetic"
@@ -217,8 +217,8 @@ class AppController:
 
             QMessageBox.information(
                 self.visualizer,
-                "Processing Complete",
-                f"Pore network extraction complete!\n\nPores: {pore_count}\nConnections: {connection_count}\n\nUse 'Isosurface' visualization to view the sphere network."
+                "Model Generated",
+                f"Pore Network Model generated!\n\nPores (Nodes): {pore_count}\nThroats (Links): {connection_count}\n\nUse 'Isosurface' visualization to view the network topology."
             )
         except Exception as e:
             QMessageBox.critical(
@@ -233,17 +233,17 @@ class AppController:
             QMessageBox.warning(
                 self.visualizer,
                 "No Data",
-                "No original data available to reset to."
+                "No raw data available to reset to."
             )
             return
 
         self.current_data = self.original_data
         self.visualizer.set_data(self.current_data)
-        self.visualizer.update_status("Reset to original data.")
+        self.visualizer.update_status("Reset to raw scan data.")
         QMessageBox.information(
             self.visualizer,
             "Reset",
-            "Data has been reset to original."
+            "View reset to raw scan data."
         )
 
     def run(self, source_path: Optional[str] = None):
@@ -273,8 +273,7 @@ class AppController:
 if __name__ == "__main__":
     # Usage example
     # You can specify a path here, or leave it None to load data via GUI
-    dicom_path = None  # Set to your DICOM folder path or None
-    # Example: dicom_path = r'D:\zhu shuyang_25_tart_114913'
+    dicom_path = None  # Set to your DICOM/CT folder path or None
 
     app = AppController()
     app.run(dicom_path)

@@ -12,11 +12,12 @@ class VolumeData:
     """
     Unified Data Transfer Object (DTO).
     Converts data from DICOM, NIfTI, or generation algorithms into this format.
+    Used for Industrial/Micro-CT data representation.
     """
     raw_data: np.ndarray            # 3D Matrix (Z, Y, X)
-    spacing: Tuple[float, float, float]  # Pixel spacing (z_spacing, y_spacing, x_spacing)
+    spacing: Tuple[float, float, float]  # Voxel spacing (z_spacing, y_spacing, x_spacing)
     origin: Tuple[float, float, float]   # Origin coordinates
-    metadata: dict = field(default_factory=dict) # Extra metadata (e.g., PatientID, Modality)
+    metadata: dict = field(default_factory=dict) # Extra metadata (e.g., SampleID, ScanType)
 
     @property
     def dimensions(self) -> Tuple[int, int, int]:
@@ -26,21 +27,21 @@ class BaseLoader(ABC):
     """Abstract base class for data loaders"""
     @abstractmethod
     def load(self, source: str) -> VolumeData:
-        """Load data and return a VolumeData object"""
+        """Load scan data and return a VolumeData object"""
         pass
 
 class BaseProcessor(ABC):
-    """Abstract base class for image processors"""
+    """Abstract base class for image processors (Segmentation, filtering, etc.)"""
     @abstractmethod
     def process(self, data: VolumeData, **kwargs) -> VolumeData:
-        """Input data, execute algorithm, and return new processed data"""
+        """Input volume data, execute algorithm, and return new processed data"""
         pass
 
 class BaseVisualizer(ABC):
     """Abstract base class for visualizers"""
     @abstractmethod
     def set_data(self, data: VolumeData):
-        """Inject data"""
+        """Inject volume data"""
         pass
 
     @abstractmethod
