@@ -7,6 +7,8 @@ from PyQt5.QtWidgets import QApplication, QFileDialog, QMessageBox
 from Core import BaseLoader, VolumeData
 from Loaders import DicomSeriesLoader, DummyLoader, FastDicomLoader
 from Processors import PoreExtractionProcessor, PoreToSphereProcessor
+from DataManager import ScientificDataManager
+from Exporters import VTKExporter  # Import the new Exporter
 
 # Import View and UI Components
 from Visualizers import GuiVisualizer
@@ -16,10 +18,6 @@ from GUI import StructureProcessingPanel
 class AppController:
     """
     Application Controller (The 'C' in MVC).
-    Coordinates:
-    1. Processing Logic (Loaders, Processors)
-    2. The View (GuiVisualizer)
-    3. User Actions (StructureProcessingPanel)
     """
 
     def __init__(self):
@@ -29,21 +27,18 @@ class AppController:
         self.visualizer = GuiVisualizer()
 
         # 2. Initialize Logic
+        self.data_manager = ScientificDataManager()
+
         self.loader: Optional[BaseLoader] = None
         self.processor = PoreExtractionProcessor()
         self.sphere_processor = PoreToSphereProcessor()
 
-        self.original_data: Optional[VolumeData] = None
-        self.current_data: Optional[VolumeData] = None
-
-        # 3. Setup Processing UI and Connect Signals
+        # 3. Setup Processing UI
         self._setup_workflow_ui()
 
     def _setup_workflow_ui(self):
-        """Create the processing panel and connect it to controller methods"""
         self.panel = StructureProcessingPanel()
 
-        # Connect Signals from UI -> Controller Methods
         self.panel.load_clicked.connect(self._load_dicom_dialog)
         self.panel.fast_load_clicked.connect(self._fast_load_dicom_dialog)
         self.panel.dummy_clicked.connect(self._load_dummy_data)
@@ -51,9 +46,8 @@ class AppController:
         self.panel.extract_pores_clicked.connect(self._process_pores)
         self.panel.pnm_clicked.connect(self._process_spheres)
         self.panel.reset_clicked.connect(self._reset_to_original)
+        self.panel.export_clicked.connect(self._export_vtk_dialog)
 
-        # Inject this panel into the Visualizer
-        # We insert it at index 2 (After Title and Separator, Before Info)
         self.visualizer.add_custom_panel(self.panel, index=2)
 
     # ==========================================
@@ -72,8 +66,10 @@ class AppController:
         try:
             self.visualizer.update_status("Generating synthetic sample...")
             self.loader = DummyLoader()
-            self.original_data = self.loader.load(128)
-            self._update_view_data(self.original_data)
+            data = self.loader.load(128)
+
+            self.data_manager.load_raw_data(data)
+            self.visualizer.set_data(data)
             self._show_msg("Sample Loaded", "Synthetic sample ready.")
         except Exception as e:
             self._show_err("Loading Error", e)
@@ -83,63 +79,111 @@ class AppController:
             self.visualizer.update_status("Loading scan data...")
             self.loader = FastDicomLoader(step=2) if fast else DicomSeriesLoader()
 
-            self.original_data = self.loader.load(folder_path)
-            self._update_view_data(self.original_data)
+            data = self.loader.load(folder_path)
 
+            self.data_manager.load_raw_data(data)
+            self.visualizer.set_data(data)
             self._show_msg("Scan Loaded",
                            f"Loaded successfully.\nMode: {'Fast' if fast else 'Standard'}")
         except Exception as e:
             self._show_err("Loading Error", e)
 
     def _process_pores(self):
-        if not self._check_data(): return
+        if not self.data_manager.has_raw():
+            QMessageBox.warning(self.visualizer, "No Data", "Please load a sample first.")
+            return
+
         try:
             self.visualizer.update_status("Extracting void space...")
+            raw = self.data_manager.raw_ct_data
 
-            # Auto-detect threshold context
-            is_synthetic = self.original_data.metadata.get("Type") == "Synthetic"
+            is_synthetic = raw.metadata.get("Type") == "Synthetic"
             thresh = 500 if is_synthetic else -300
 
-            self.current_data = self.processor.process(self.original_data, threshold=thresh)
-            self.visualizer.set_data(self.current_data)
+            segmented = self.processor.process(raw, threshold=thresh)
 
-            voxels = self.current_data.metadata.get('PoreVoxels', 0)
-            self._show_msg("Extraction Complete", f"Void voxels: {voxels}\nVisualize using Isosurface.")
+            self.data_manager.set_segmented_data(segmented)
+            self.visualizer.set_data(segmented)
+
+            meta = segmented.metadata
+            msg = (
+                f"Quantitative Analysis Results:\n\n"
+                f"• Porosity: {meta.get('Porosity', 'N/A')}\n"
+                f"• Pore Count: {meta.get('PoreCount', 0)}\n"
+            )
+            self._show_msg("Extraction Complete", msg)
         except Exception as e:
             self._show_err("Processing Error", e)
 
     def _process_spheres(self):
-        if not self._check_data(): return
-        try:
-            self.visualizer.update_status("Generating Pore Network Model...")
+        if not self.data_manager.has_raw():
+            QMessageBox.warning(self.visualizer, "No Data", "Please load a sample first.")
+            return
 
-            is_synthetic = self.original_data.metadata.get("Type") == "Synthetic"
+        try:
+            self.visualizer.update_status("Generating Pore Network Model (Mesh)...")
+            raw = self.data_manager.raw_ct_data
+
+            is_synthetic = raw.metadata.get("Type") == "Synthetic"
             thresh = 500 if is_synthetic else -300
 
-            self.current_data = self.sphere_processor.process(self.original_data, threshold=thresh)
-            self.visualizer.set_data(self.current_data)
+            pnm_data = self.sphere_processor.process(raw, threshold=thresh)
 
-            counts = self.current_data.metadata
-            self._show_msg("Model Generated",
-                           f"Nodes: {counts.get('PoreCount')}\nThroats: {counts.get('ConnectionCount')}")
+            self.data_manager.set_pnm_data(pnm_data)
+            self.visualizer.set_data(pnm_data)
+
+            counts = pnm_data.metadata
+            msg = (
+                f"Model Generated Successfully (Optimized Mesh)\n\n"
+                f"• Nodes (Pores): {counts.get('PoreCount')}\n"
+                f"• Throats (Connections): {counts.get('ConnectionCount')}\n"
+            )
+            self._show_msg("Model Generated", msg)
         except Exception as e:
             self._show_err("PNM Error", e)
 
     def _reset_to_original(self):
-        if not self._check_data(): return
-        self._update_view_data(self.original_data)
+        if not self.data_manager.has_raw(): return
+        self.visualizer.set_data(self.data_manager.raw_ct_data)
         self.visualizer.update_status("Reset to raw data.")
 
-    # Helpers
-    def _update_view_data(self, data):
-        self.current_data = data
-        self.visualizer.set_data(self.current_data)
+    def _export_vtk_dialog(self):
+        """
+        Delegates the export task to VTKExporter.
+        """
+        data_to_save = self.visualizer.data
+        if not data_to_save:
+            QMessageBox.warning(self.visualizer, "Export Error", "No data loaded to export.")
+            return
 
-    def _check_data(self):
-        if self.original_data is None:
-            QMessageBox.warning(self.visualizer, "No Data", "Please load a sample first.")
-            return False
-        return True
+        # 1. Determine default filename and filter
+        default_name = "output.vtk"
+        file_filter = "VTK Files (*.vtk *.vtp *.vti)"
+
+        if data_to_save.has_mesh:
+            default_name = "pnm_model.vtp"  # PolyData preferred format
+        elif data_to_save.raw_data is not None:
+            default_name = "volume_data.vti"  # ImageData preferred format
+
+        # 2. Open Dialog
+        path, _ = QFileDialog.getSaveFileName(
+            self.visualizer, "Export to VTK", default_name, file_filter
+        )
+
+        if not path:
+            return
+
+        # 3. Call Exporter
+        try:
+            self.visualizer.update_status(f"Exporting to {path}...")
+            VTKExporter.export(data_to_save, path)
+
+            self.visualizer.update_status("Export successful.")
+            self._show_msg("Export Successful", f"File saved to:\n{path}\n\n(Includes 'IsPore' attribute if PNM)")
+
+        except Exception as e:
+            self._show_err("Export Failed", e)
+            self.visualizer.update_status("Export failed.")
 
     def _show_msg(self, title, msg):
         QMessageBox.information(self.visualizer, title, msg)
