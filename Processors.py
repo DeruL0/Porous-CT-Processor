@@ -1,273 +1,239 @@
 import numpy as np
 import scipy.ndimage as ndimage
+import pyvista as pv
 from skimage.segmentation import watershed
 from skimage.feature import peak_local_max
+from typing import Tuple, Dict, Set
 from Core import BaseProcessor, VolumeData
 
 
 # ==========================================
-# Image Processor
+# Image Processors
 # ==========================================
 
 class PoreExtractionProcessor(BaseProcessor):
     """
-    Extract void space (pores) from the solid matrix using morphological operations.
+    Segments the void space (pores) from the solid matrix.
+    Returns a Voxel-based VolumeData object representing "Air".
     """
 
     def process(self, data: VolumeData, threshold: int = -300) -> VolumeData:
-        print(f"[Processor] Starting pore detection (Threshold < {threshold} Intensity)...")
+        if data.raw_data is None:
+            raise ValueError("Input data must contain raw voxel data.")
 
-        # In Porous CT, pores are usually low intensity (air) and solid is high intensity.
-        # We look for the "background" relative to the solid material.
-        # Note: Logic assumes user passes a threshold where values BELOW or ABOVE define the pore.
-        # Standard CT: Air ~ -1000, Bone/Rock ~ 1000.
-        # Here we assume the user sets a threshold to separate solid from pore.
+        print(f"[Processor] Starting pore detection (Threshold < {threshold})...")
 
-        # NOTE: Depending on input, we might need to invert logic.
-        # Here we assume data.raw_data > threshold is SOLID.
-        # Therefore, data.raw_data <= threshold is PORE.
+        # 1. Binarization (Air vs Solid)
+        solid_mask = data.raw_data > threshold
 
-        # To maintain compatibility with the original logic (which extracted "foreground"),
-        # we will treat the selected region as the target "Pore" region.
-        # Let's assume the user selects the range they want to visualize.
+        print("[Processor] Filling holes...")
+        filled_volume = ndimage.binary_fill_holes(solid_mask)
+        pores_mask = filled_volume ^ solid_mask
 
-        target_mask = data.raw_data > threshold
-
-        print("[Processor] Performing morphological operations (may take a few seconds)...")
-        # Fill holes inside the selected region to get full volume
-        filled_mask = ndimage.binary_fill_holes(target_mask)
-
-        # XOR to find internal voids if we segmented the solid
-        # OR if we segmented the pores directly, this logic might need adjustment.
-        # For this tool, we assume: "Extract Pores" means identifying the void space.
-
-        pores_mask = filled_mask ^ target_mask
-
+        # Quantitative Analysis
         pore_voxels = np.sum(pores_mask)
-        print(f"[Processor] Detection complete. Found {pore_voxels} pore voxels.")
+        total_voxels = data.raw_data.size
+        porosity_pct = (pore_voxels / total_voxels) * 100.0
 
+        # Label connected components
+        labeled_array, num_features = ndimage.label(pores_mask, structure=np.ones((3, 3, 3)))
+
+        print(f"[Processor] Found {num_features} pores.")
+
+        # Create Output Volume (Voxel Grid)
         processed_volume = np.zeros_like(data.raw_data)
-        processed_volume[pores_mask] = 1000  # Assign high value for visualization of the pore itself
+        processed_volume[pores_mask] = 1000  # Highlight Pores
 
         return VolumeData(
             raw_data=processed_volume,
             spacing=data.spacing,
             origin=data.origin,
             metadata={
-                "Type": "Processed - Void Space",
-                "Source": data.metadata.get("Description", "Unknown"),
-                "PoreVoxels": int(pore_voxels)
+                "Type": "Processed - Void Volume",
+                "Porosity": f"{porosity_pct:.2f}%",
+                "PoreCount": int(num_features)
             }
         )
 
 
 class PoreToSphereProcessor(BaseProcessor):
     """
-    Detects pores and constructs a Pore Network Model (PNM) using Watershed Segmentation.
-    Used for characterizing porous media (rocks, foams, bones, filters).
+    Optimized Pore Network Modeling (PNM).
 
-    Algorithm:
-    1. Identify pore space.
-    2. Compute Euclidean Distance Map (EDM) on the pore space.
-    3. Find local maxima in the EDM to identify pore bodies (Seeds).
-    4. Apply Watershed segmentation to split large connected pores into sub-pores.
-    5. Determine connectivity (throats) by checking adjacency between segmented regions.
-    6. Visualize as Ball-and-Stick model.
+    Improvements:
+    1. Direct Mesh Generation: Creates pyvista.PolyData directly (no slow rasterization).
+    2. Data Classification: Adds 'IsPore' boolean field to distinguish Pores (1) from Throats (0).
     """
 
-    def process(self, data: VolumeData, threshold: int = -300) -> VolumeData:
-        print(f"[Processor] Starting Pore Network Extraction (Threshold > {threshold})...")
+    MIN_PEAK_DISTANCE = 6
 
-        # 1. Detect Pores (Binary Mask)
-        foreground_mask = data.raw_data > threshold
-        filled_mask = ndimage.binary_fill_holes(foreground_mask)
-        pores_mask = filled_mask ^ foreground_mask
+    def process(self, data: VolumeData, threshold: int = -300) -> VolumeData:
+        if data.raw_data is None:
+            raise ValueError("Input data must contain raw voxel data.")
+
+        print(f"[PNM] Starting Mesh Extraction (Threshold > {threshold})...")
+
+        # --- Step 1: Segmentation (Same as Extraction) ---
+        solid_mask = data.raw_data > threshold
+        filled_mask = ndimage.binary_fill_holes(solid_mask)
+        pores_mask = filled_mask ^ solid_mask
 
         if np.sum(pores_mask) == 0:
-            return VolumeData(
-                raw_data=np.zeros_like(data.raw_data),
-                spacing=data.spacing,
-                origin=data.origin,
-                metadata={"Type": "Processed - Network", "PoreCount": 0}
-            )
+            return self._create_empty_result(data)
 
-        # 2. Distance Transform
-        # Calculate the distance from every pore voxel to the nearest solid/matrix voxel
-        # The 'peaks' of this map represent the centers of wide open pore bodies
-        print("[Processor] Computing Euclidean Distance Map...")
+        # --- Step 2: Watershed Analysis ---
+        print("[PNM] Computing Distance Map & Watershed...")
         distance_map = ndimage.distance_transform_edt(pores_mask)
 
-        # 3. Find Pore Centers (Seeds)
-        # We look for local peaks in the distance map.
-        print("[Processor] Finding local maxima (seeds)...")
-        min_peak_distance = 6
-        local_maxi = peak_local_max(distance_map, labels=pores_mask, min_distance=min_peak_distance)
+        local_maxi = peak_local_max(
+            distance_map,
+            labels=pores_mask,
+            min_distance=self.MIN_PEAK_DISTANCE
+        )
 
-        # Create a marker array for watershed
         markers = np.zeros_like(distance_map, dtype=int)
-        # peak_local_max returns coordinates (N, 3), we mark them on the grid
         markers[tuple(local_maxi.T)] = np.arange(len(local_maxi)) + 1
 
-        print(f"[Processor] Found {len(local_maxi)} potential pore bodies.")
+        segmented_regions = watershed(-distance_map, markers, mask=pores_mask)
+        num_pores = np.max(segmented_regions)
 
-        # 4. Watershed Segmentation
-        # "Floods" the topography (inverted distance map) starting from the markers.
-        # This splits the continuous pore space into distinct regions.
-        # The boundaries where basins meet are the 'throats'.
-        print("[Processor] Executing Watershed segmentation to split large pores...")
-        segmented_pores = watershed(-distance_map, markers, mask=pores_mask)
+        # --- Step 3: Mesh Generation (Optimization) ---
+        print("[PNM] Generating optimized mesh structures...")
 
-        num_pores = np.max(segmented_pores)
-        print(f"[Processor] Segmentation complete. Identified {num_pores} unique pore regions.")
+        # A. Nodes (Pores) -> Spheres
+        pore_centers, pore_radii, pore_ids = self._extract_pore_data(segmented_regions, num_pores, data.spacing,
+                                                                     data.origin)
 
-        # 5. Extract Spheres (Nodes)
-        print("[Processor] Calculating pore properties...")
-        sphere_volume = np.zeros_like(data.raw_data)
+        # Create PyVista PolyData for Pores
+        if len(pore_centers) > 0:
+            pore_cloud = pv.PolyData(pore_centers)
+            pore_cloud["radius"] = pore_radii
+            # IsPore = 1 (True)
+            pore_cloud["IsPore"] = np.ones(len(pore_centers), dtype=int)
+            pore_cloud["ID"] = pore_ids
 
-        slices = ndimage.find_objects(segmented_pores)
-        spheres = {}  # Dict to store id -> {center, radius}
+            # Efficient Glyphing: Scale a unit sphere by the radius array
+            sphere_glyph = pv.Sphere(theta_resolution=10, phi_resolution=10)
+            pores_mesh = pore_cloud.glyph(scale="radius", geom=sphere_glyph)
+        else:
+            pores_mesh = pv.PolyData()
+
+        # B. Edges (Throats) -> Tubes
+        connections = self._find_adjacency(segmented_regions)
+        throats_mesh = self._create_throat_mesh(connections, pore_centers, pore_radii, pore_ids)
+
+        # --- Step 4: Combine ---
+        print("[PNM] Merging geometry...")
+        # Combine Pores and Throats into one mesh
+        combined_mesh = pores_mesh.merge(throats_mesh)
+
+        return VolumeData(
+            raw_data=None,  # No Voxel data in this result, purely Mesh
+            mesh=combined_mesh,
+            spacing=data.spacing,
+            origin=data.origin,
+            metadata={
+                "Type": "Processed - PNM Mesh",
+                "PoreCount": int(num_pores),
+                "ConnectionCount": len(connections),
+                "MeshPoints": combined_mesh.n_points
+            }
+        )
+
+    def _extract_pore_data(self, regions, num_pores, spacing, origin):
+        """Extracts centroids and radii for mesh generation."""
+        slices = ndimage.find_objects(regions)
+        centers = []
+        radii = []
+        ids = []
+
+        sx, sy, sz = spacing
+        ox, oy, oz = origin
 
         for i in range(num_pores):
             label_idx = i + 1
             slice_obj = slices[i]
             if slice_obj is None: continue
 
-            # Local extraction of the specific pore region
-            local_mask = (segmented_pores[slice_obj] == label_idx)
+            local_mask = (regions[slice_obj] == label_idx)
             voxel_count = np.sum(local_mask)
 
-            # Calculate equivalent radius of a sphere with the same volume
-            radius = (3 * voxel_count / (4 * np.pi)) ** (1 / 3)
+            # Equivalent radius
+            r_vox = (3 * voxel_count / (4 * np.pi)) ** (1 / 3)
+            # Take average spacing for radius scaling
+            avg_spacing = (sx + sy + sz) / 3.0
+            radii.append(r_vox * avg_spacing)
 
-            # Calculate Centroid
-            local_centroid = ndimage.center_of_mass(local_mask)
-            global_z = slice_obj[0].start + local_centroid[0]
-            global_y = slice_obj[1].start + local_centroid[1]
-            global_x = slice_obj[2].start + local_centroid[2]
+            # Centroid (Physical Coordinates)
+            local_cent = ndimage.center_of_mass(local_mask)
 
-            center = np.array([global_z, global_y, global_x])
+            cz = (slice_obj[0].start + local_cent[0]) * sz + oz
+            cy = (slice_obj[1].start + local_cent[1]) * sy + oy
+            cx = (slice_obj[2].start + local_cent[2]) * sx + ox
 
-            # Store info
-            spheres[label_idx] = {'center': center, 'radius': radius}
+            # PyVista uses (X, Y, Z) order, Numpy uses (Z, Y, X)
+            centers.append([cx, cy, cz])
+            ids.append(label_idx)
 
-            # Draw Sphere (Node) into visualization volume
-            self._draw_sphere(sphere_volume, center, radius)
+        return np.array(centers), np.array(radii), np.array(ids)
 
-        # 6. Detect Connectivity (Adjacency)
-        # If two different labeled regions touch each other, they are connected via a throat.
-        print("[Processor] Analyzing region adjacency to build network connections...")
-        connections = self._find_adjacency(segmented_pores)
-        print(f"[Processor] Found {len(connections)} connections (throats).")
-
-        # 7. Draw Cylinders (Edges)
-        print("[Processor] Drawing network connections...")
-        for (id_a, id_b) in connections:
-            if id_a in spheres and id_b in spheres:
-                p1 = spheres[id_a]['center']
-                p2 = spheres[id_b]['center']
-                r1 = spheres[id_a]['radius']
-                r2 = spheres[id_b]['radius']
-
-                # Cylinder radius - heuristic:
-                # It should represent the throat. We estimate it as a fraction of the smaller pore.
-                cyl_radius = min(r1, r2) * 0.25
-                cyl_radius = max(1.0, cyl_radius)  # Ensure visibility (at least 1 voxel)
-
-                self._draw_cylinder(sphere_volume, p1, p2, cyl_radius)
-
-        return VolumeData(
-            raw_data=sphere_volume,
-            spacing=data.spacing,
-            origin=data.origin,
-            metadata={
-                "Type": "Processed - Network (PNM)",
-                "Source": data.metadata.get("Description", "Unknown"),
-                "PoreCount": num_pores,
-                "ConnectionCount": len(connections)
-            }
-        )
-
-    def _find_adjacency(self, labels_volume):
-        """
-        Scans the volume to find voxels with different labels that are touching.
-        Returns a set of tuples (label_a, label_b).
-        """
+    def _find_adjacency(self, labels_volume) -> Set[Tuple[int, int]]:
+        """Identifies connected pores."""
         adjacency = set()
-
-        # Directions to check: (axis, slice_current, slice_next)
         shifts = [
-            (0, np.s_[:-1, :, :], np.s_[1:, :, :]),  # Z axis neighbors
-            (1, np.s_[:, :-1, :], np.s_[:, 1:, :]),  # Y axis neighbors
-            (2, np.s_[:, :, :-1], np.s_[:, :, 1:])  # X axis neighbors
+            (np.s_[:-1, :, :], np.s_[1:, :, :]),
+            (np.s_[:, :-1, :], np.s_[:, 1:, :]),
+            (np.s_[:, :, :-1], np.s_[:, :, 1:])
         ]
 
-        for axis, s_curr, s_next in shifts:
+        for s_curr, s_next in shifts:
             val_curr = labels_volume[s_curr]
             val_next = labels_volume[s_next]
-
             mask = (val_curr > 0) & (val_next > 0) & (val_curr != val_next)
 
             if np.any(mask):
                 pairs = np.stack((val_curr[mask], val_next[mask]), axis=-1)
-                unique_pairs = np.unique(pairs, axis=0)
-
+                unique_pairs = np.unique(np.sort(pairs, axis=1), axis=0)
                 for p in unique_pairs:
-                    p_sorted = tuple(sorted(p))
-                    adjacency.add(p_sorted)
-
+                    adjacency.add(tuple(p))
         return adjacency
 
-    def _draw_sphere(self, volume, center, radius):
-        """Draws a solid sphere."""
-        cz, cy, cx = center
+    def _create_throat_mesh(self, connections, centers, radii, ids_list):
+        """Creates tubes connecting the pores."""
+        if not connections:
+            return pv.PolyData()
 
-        z_min = int(max(0, cz - radius - 1))
-        z_max = int(min(volume.shape[0], cz + radius + 2))
-        y_min = int(max(0, cy - radius - 1))
-        y_max = int(min(volume.shape[1], cy + radius + 2))
-        x_min = int(max(0, cx - radius - 1))
-        x_max = int(min(volume.shape[2], cx + radius + 2))
+        # Map ID to Index in 'centers' array
+        id_map = {uid: idx for idx, uid in enumerate(ids_list)}
 
-        z, y, x = np.ogrid[z_min:z_max, y_min:y_max, x_min:x_max]
-        dist_sq = (z - cz) ** 2 + (y - cy) ** 2 + (x - cx) ** 2
+        lines = []
 
-        mask = dist_sq <= radius ** 2
-        volume[z_min:z_max, y_min:y_max, x_min:x_max][mask] = 1000
+        for id_a, id_b in connections:
+            if id_a in id_map and id_b in id_map:
+                idx_a = id_map[id_a]
+                idx_b = id_map[id_b]
 
-    def _draw_cylinder(self, volume, p1, p2, radius):
-        """Draws a cylinder between point p1 and p2."""
-        p_min = np.minimum(p1, p2) - radius - 1
-        p_max = np.maximum(p1, p2) + radius + 2
+                p1 = centers[idx_a]
+                p2 = centers[idx_b]
 
-        z_min = int(max(0, p_min[0]))
-        z_max = int(min(volume.shape[0], p_max[0]))
-        y_min = int(max(0, p_min[1]))
-        y_max = int(min(volume.shape[1], p_max[1]))
-        x_min = int(max(0, p_min[2]))
-        x_max = int(min(volume.shape[2], p_max[2]))
+                # Estimate throat radius (smaller than pores)
+                r_throat = min(radii[idx_a], radii[idx_b]) * 0.3
 
-        if z_min >= z_max or y_min >= y_max or x_min >= x_max:
-            return
+                # Create a single tube
+                line = pv.Line(p1, p2)
+                tube = line.tube(radius=r_throat)
+                lines.append(tube)
 
-        vec = p2 - p1
-        vec_len_sq = np.dot(vec, vec)
+        if not lines:
+            return pv.PolyData()
 
-        if vec_len_sq == 0: return
+        # Merge all tubes
+        throats = lines[0].merge(lines[1:]) if len(lines) > 1 else lines[0]
 
-        z, y, x = np.ogrid[z_min:z_max, y_min:y_max, x_min:x_max]
+        # IsPore = 0 (False) -> This is a Throat
+        throats["IsPore"] = np.zeros(throats.n_points, dtype=int)
 
-        diff_z = z - p1[0]
-        diff_y = y - p1[1]
-        diff_x = x - p1[2]
+        return throats
 
-        t = (diff_z * vec[0] + diff_y * vec[1] + diff_x * vec[2]) / vec_len_sq
-        t = np.clip(t, 0.0, 1.0)
-
-        closest_z = p1[0] + t * vec[0]
-        closest_y = p1[1] + t * vec[1]
-        closest_x = p1[2] + t * vec[2]
-
-        dist_sq = (z - closest_z) ** 2 + (y - closest_y) ** 2 + (x - closest_x) ** 2
-
-        mask = dist_sq <= radius ** 2
-        volume[z_min:z_max, y_min:y_max, x_min:x_max][mask] = 1000
+    def _create_empty_result(self, data: VolumeData) -> VolumeData:
+        return VolumeData(metadata={"Type": "Empty", "PoreCount": 0})
