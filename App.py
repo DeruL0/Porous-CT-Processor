@@ -70,6 +70,9 @@ class AppController:
         self.loader: Optional[BaseLoader] = None
         self.processor: BaseProcessor = PoreExtractionProcessor()
         self.sphere_processor: BaseProcessor = PoreToSphereProcessor()
+        
+        # Connect Visualizer to DataManager for centralized data flow
+        self.visualizer.set_data_manager(self.data_manager)
 
         # 3. Setup Processing UI
         self._setup_workflow_ui()
@@ -175,12 +178,13 @@ class AppController:
         self.worker.start()
 
     def _process_pores(self):
-        if not self.data_manager.has_raw():
+        # Use DataManager's active_data (respects ROI extraction)
+        current_data = self.data_manager.active_data
+        if current_data is None or current_data.raw_data is None:
             QMessageBox.warning(self.visualizer, "No Data", "Please load a sample first.")
             return
 
-        raw = self.data_manager.raw_ct_data
-        is_synthetic = raw.metadata.get("Type") == "Synthetic"
+        is_synthetic = "Synthetic" in current_data.metadata.get("Type", "") or "ROI" in current_data.metadata.get("Type", "")
         thresh = 500 if is_synthetic else -300
 
         def on_complete(segmented):
@@ -194,15 +198,16 @@ class AppController:
             )
             self._show_msg("Extraction Complete", msg)
 
-        self._run_processor_async(self.processor, raw, thresh, on_complete)
+        self._run_processor_async(self.processor, current_data, thresh, on_complete)
 
     def _process_spheres(self):
-        if not self.data_manager.has_raw():
+        # Use DataManager's active_data (respects ROI extraction)
+        current_data = self.data_manager.active_data
+        if current_data is None or current_data.raw_data is None:
             QMessageBox.warning(self.visualizer, "No Data", "Please load a sample first.")
             return
 
-        raw = self.data_manager.raw_ct_data
-        is_synthetic = raw.metadata.get("Type") == "Synthetic"
+        is_synthetic = "Synthetic" in current_data.metadata.get("Type", "") or "ROI" in current_data.metadata.get("Type", "")
         thresh = 500 if is_synthetic else -300
 
         def on_complete(pnm_data):
@@ -221,7 +226,7 @@ class AppController:
             )
             self._show_msg("Model Generated", msg)
 
-        self._run_processor_async(self.sphere_processor, raw, thresh, on_complete)
+        self._run_processor_async(self.sphere_processor, current_data, thresh, on_complete)
 
     def _reset_to_original(self):
         if not self.data_manager.has_raw(): return

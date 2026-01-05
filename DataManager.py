@@ -10,6 +10,7 @@ class ScientificDataManager:
     1. Raw CT Data (Original Scan)
     2. Segmented Volume (Distinguishing Air/Void from Solid)
     3. Pore Network Model (PNM) Mesh (Distinguishing Pores vs Throats)
+    4. ROI Data (Region of Interest extracted sub-volume)
     """
 
     def __init__(self):
@@ -20,9 +21,20 @@ class ScientificDataManager:
         self.segmented_volume: Optional[VolumeData] = None
 
         # 3. 构建PNW后能够区分孔洞，空气，吼道 (Optimized Mesh)
-        # Note: 'Air' context is preserved in segmented_volume,
-        # while PNM Mesh explicitly distinguishes Pores (Nodes) and Throats (Edges).
         self.pnm_model: Optional[VolumeData] = None
+        
+        # 4. ROI提取后的子体积
+        self.roi_data: Optional[VolumeData] = None
+
+    @property
+    def active_data(self) -> Optional[VolumeData]:
+        """
+        Returns the most relevant data for processing.
+        Priority: ROI > Raw (we process on extracted region if available)
+        """
+        if self.roi_data is not None:
+            return self.roi_data
+        return self.raw_ct_data
 
     def load_raw_data(self, data: VolumeData):
         """Sets the raw input data."""
@@ -30,6 +42,7 @@ class ScientificDataManager:
         # Reset downstream data when new raw data is loaded
         self.segmented_volume = None
         self.pnm_model = None
+        self.roi_data = None  # Clear ROI when loading new data
 
     def set_segmented_data(self, data: VolumeData):
         """Stores the intermediate segmented void space."""
@@ -39,6 +52,19 @@ class ScientificDataManager:
         """Stores the generated Pore Network Model mesh."""
         self.pnm_model = data
 
+    def set_roi_data(self, data: VolumeData):
+        """Stores ROI-extracted sub-volume for focused analysis."""
+        self.roi_data = data
+        # Clear downstream when ROI changes
+        self.segmented_volume = None
+        self.pnm_model = None
+
+    def clear_roi(self):
+        """Clears ROI data, reverting to full raw volume."""
+        self.roi_data = None
+        self.segmented_volume = None
+        self.pnm_model = None
+
     def get_current_state_info(self) -> str:
         """Returns a status string describing what data is available."""
         status = []
@@ -46,6 +72,9 @@ class ScientificDataManager:
             status.append("✔ Raw CT Data")
         else:
             status.append("✘ Raw CT Data")
+            
+        if self.roi_data:
+            status.append("✔ ROI Extracted")
 
         if self.segmented_volume:
             status.append("✔ Segmented Void Volume")
@@ -61,6 +90,9 @@ class ScientificDataManager:
 
     def has_raw(self) -> bool:
         return self.raw_ct_data is not None
+    
+    def has_active_data(self) -> bool:
+        return self.active_data is not None
 
     def has_segmented(self) -> bool:
         return self.segmented_volume is not None

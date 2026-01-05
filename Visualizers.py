@@ -11,7 +11,7 @@ from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont
 
 from Core import BaseVisualizer, VolumeData
-from GUI import VisualizationModePanel, RenderingParametersPanel, InfoPanel, ClipPlanePanel
+from GUI import VisualizationModePanel, RenderingParametersPanel, InfoPanel, ClipPlanePanel, ROIPanel
 
 
 # Resolve Metaclass conflict between PyQt5 and ABC
@@ -40,6 +40,9 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         # Cache for volume grid to optimize updates
         self._cached_vol_grid: Optional[pv.PolyData] = None
         self._cached_vol_grid_source: Optional[int] = None
+        
+        # DataManager reference for centralized data flow
+        self._data_manager = None
 
         # Track actors to allow property updates without rebuilding
         self.volume_actor = None
@@ -138,6 +141,13 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         self.clip_panel.clip_changed.connect(lambda: self.clip_update_timer.start())
         
         layout.addWidget(self.clip_panel)
+        
+        # ROI Selection Panel
+        self.roi_panel = ROIPanel()
+        self.roi_panel.roi_toggled.connect(self._on_roi_toggled)
+        self.roi_panel.apply_roi.connect(self._on_apply_roi)
+        self.roi_panel.reset_roi.connect(self._on_reset_roi)
+        layout.addWidget(self.roi_panel)
         
         layout.addStretch()
         
@@ -263,6 +273,10 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
 
     def update_status(self, message: str):
         self.status_bar.showMessage(message)
+    
+    def set_data_manager(self, data_manager):
+        """Set reference to DataManager for centralized data flow."""
+        self._data_manager = data_manager
 
     # ==========================================
     # Rendering Logic
@@ -597,6 +611,135 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
             print(f"[Clip] Error: {e}")
             self._on_clip_toggled(False)
 
+    # ==========================================
+    # ROI Selection Methods
+    # ==========================================
+    
+    def _on_roi_toggled(self, enabled: bool):
+        """Handle ROI mode toggle - show/hide box widget."""
+        if enabled:
+            if self.grid is None:
+                self.roi_panel.enable_checkbox.setChecked(False)
+                return
+            
+            # Add interactive box widget
+            bounds = self.grid.bounds
+            self.plotter.add_box_widget(
+                callback=self._on_roi_bounds_changed,
+                bounds=bounds,
+                factor=1.0,
+                rotation_enabled=False,
+                color='cyan',
+                use_planes=False
+            )
+            self.update_status("ROI mode: Drag the box to select region")
+        else:
+            # Remove box widget
+            self.plotter.clear_box_widgets()
+            self.roi_panel.update_bounds(None)
+            self.update_status("ROI mode disabled")
+    
+    def _on_roi_bounds_changed(self, bounds):
+        """Callback when user moves the ROI box widget."""
+        # bounds is a PolyData box, extract actual bounds
+        if hasattr(bounds, 'bounds'):
+            actual_bounds = bounds.bounds
+        else:
+            actual_bounds = bounds
+        self.roi_panel.update_bounds(actual_bounds)
+    
+    def _on_apply_roi(self):
+        """Extract sub-volume from ROI bounds and update data."""
+        roi_bounds = self.roi_panel.get_bounds()
+        if roi_bounds is None or self.data is None:
+            return
+        
+        try:
+            # Extract sub-volume from the grid
+            extracted = self._extract_roi_subvolume(roi_bounds)
+            if extracted is not None:
+                # Store in DataManager for centralized access
+                if self._data_manager is not None:
+                    self._data_manager.set_roi_data(extracted)
+                
+                # Update visualization with extracted data
+                self.set_data(extracted)
+                self.update_status(f"ROI applied: {extracted.raw_data.shape}")
+                
+                # Disable ROI mode after applying
+                self.roi_panel.enable_checkbox.setChecked(False)
+                self.plotter.clear_box_widgets()
+        except Exception as e:
+            print(f"[ROI] Error applying: {e}")
+            self.update_status("ROI extraction failed")
+    
+    def _on_reset_roi(self):
+        """Reset ROI - clear box widget and reset to original data."""
+        self.plotter.clear_box_widgets()
+        
+        # Clear ROI in DataManager and restore to raw data
+        if self._data_manager is not None:
+            self._data_manager.clear_roi()
+            if self._data_manager.raw_ct_data is not None:
+                self.set_data(self._data_manager.raw_ct_data)
+        
+        self.update_status("ROI reset")
+    
+    def _extract_roi_subvolume(self, bounds) -> Optional[VolumeData]:
+        """Extract a sub-volume based on ROI bounds."""
+        if self.data is None or self.data.raw_data is None:
+            return None
+        
+        # Convert physical bounds to voxel indices
+        raw = self.data.raw_data
+        spacing = self.data.spacing
+        origin = self.data.origin
+        
+        # AXIS MAPPING FIX:
+        # PyVista ImageData was created with: grid.dimensions = shape (which is Z, Y, X in numpy)
+        # So PyVista's X axis corresponds to numpy axis 0 (Z dimension)
+        # PyVista's Y axis corresponds to numpy axis 1 (Y dimension)
+        # PyVista's Z axis corresponds to numpy axis 2 (X dimension)
+        #
+        # bounds from PyVista = (xmin, xmax, ymin, ymax, zmin, zmax)
+        # We need to map: PyVista X -> numpy axis 0, PyVista Y -> numpy axis 1, PyVista Z -> numpy axis 2
+        
+        # Get numpy indices for each PyVista axis
+        # PyVista X (bounds 0,1) -> numpy axis 0
+        i_start = max(0, int((bounds[0] - origin[0]) / spacing[0]))
+        i_end = min(raw.shape[0], int((bounds[1] - origin[0]) / spacing[0]))
+        
+        # PyVista Y (bounds 2,3) -> numpy axis 1
+        j_start = max(0, int((bounds[2] - origin[1]) / spacing[1]))
+        j_end = min(raw.shape[1], int((bounds[3] - origin[1]) / spacing[1]))
+        
+        # PyVista Z (bounds 4,5) -> numpy axis 2
+        k_start = max(0, int((bounds[4] - origin[2]) / spacing[2]))
+        k_end = min(raw.shape[2], int((bounds[5] - origin[2]) / spacing[2]))
+        
+        # Extract sub-array using corrected axis order
+        sub_data = raw[i_start:i_end, j_start:j_end, k_start:k_end]
+        
+        if sub_data.size == 0:
+            return None
+        
+        # Create new VolumeData with extracted region
+        new_origin = (
+            origin[0] + i_start * spacing[0],
+            origin[1] + j_start * spacing[1],
+            origin[2] + k_start * spacing[2]
+        )
+        
+        new_metadata = dict(self.data.metadata)
+        new_metadata['Type'] = f"ROI Extract ({sub_data.shape})"
+        new_metadata['ROI_Bounds'] = bounds
+        
+        return VolumeData(
+            raw_data=sub_data,
+            spacing=spacing,
+            origin=new_origin,
+            metadata=new_metadata
+        )
 
     def render_slices(self, reset_view=True):
         if not self.grid: return
