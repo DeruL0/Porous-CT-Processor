@@ -22,7 +22,7 @@ class PoreExtractionProcessor(BaseProcessor):
         if data.raw_data is None:
             raise ValueError("Input data must contain raw voxel data.")
 
-        def report(p, msg):
+        def report(p: int, msg: str):
             print(f"[Processor] {msg}")
             if callback: callback(p, msg)
 
@@ -162,9 +162,27 @@ class PoreToSphereProcessor(BaseProcessor):
         # B. Edges (Throats) -> Tubes
         report(90, "Connecting pores...")
         connections = self._find_adjacency(segmented_regions)
-        throats_mesh = self._create_throat_mesh(connections, pore_centers, pore_radii, pore_ids)
+        throats_mesh, throat_radii = self._create_throat_mesh(connections, pore_centers, pore_radii, pore_ids)
 
-        # --- Step 4: Combine ---
+        # --- Step 4: Enhanced Analysis ---
+        report(93, "Calculating advanced metrics...")
+        
+        # Pore size distribution (histogram bins)
+        size_distribution = self._calculate_size_distribution(pore_radii)
+        
+        # Connectivity analysis
+        largest_pore_ratio = self._calculate_connectivity(segmented_regions, num_pores)
+        
+        # Throat statistics
+        throat_stats = {}
+        if len(throat_radii) > 0:
+            throat_stats = {
+                'min': float(np.min(throat_radii)),
+                'max': float(np.max(throat_radii)),
+                'mean': float(np.mean(throat_radii))
+            }
+
+        # --- Step 5: Combine ---
         report(95, "Merging geometry...")
         combined_mesh = pores_mesh.merge(throats_mesh)
 
@@ -179,7 +197,12 @@ class PoreToSphereProcessor(BaseProcessor):
                 "Type": "Processed - PNM Mesh",
                 "PoreCount": int(num_pores),
                 "ConnectionCount": len(connections),
-                "MeshPoints": combined_mesh.n_points
+                "MeshPoints": combined_mesh.n_points,
+                # Enhanced metrics
+                "PoreSizeDistribution": size_distribution,
+                "LargestPoreRatio": f"{largest_pore_ratio:.2f}%",
+                "ThroatStats": throat_stats,
+                "PoreRadii": pore_radii.tolist()  # For visualization
             }
         )
 
@@ -242,14 +265,15 @@ class PoreToSphereProcessor(BaseProcessor):
         return adjacency
 
     def _create_throat_mesh(self, connections, centers, radii, ids_list):
-        """Creates tubes connecting the pores."""
+        """Creates tubes connecting the pores. Returns (mesh, throat_radii_list)."""
         if not connections:
-            return pv.PolyData()
+            return pv.PolyData(), np.array([])
 
         # Map ID to Index in 'centers' array
         id_map = {uid: idx for idx, uid in enumerate(ids_list)}
 
         lines = []
+        throat_radii = []
 
         for id_a, id_b in connections:
             if id_a in id_map and id_b in id_map:
@@ -261,6 +285,7 @@ class PoreToSphereProcessor(BaseProcessor):
 
                 # Estimate throat radius (smaller than pores)
                 r_throat = min(radii[idx_a], radii[idx_b]) * 0.3
+                throat_radii.append(r_throat)
 
                 # Create a single tube
                 line = pv.Line(p1, p2)
@@ -268,13 +293,46 @@ class PoreToSphereProcessor(BaseProcessor):
                 lines.append(tube)
 
         if not lines:
-            return pv.PolyData()
+            return pv.PolyData(), np.array([])
 
         # Merge all tubes
         throats = lines[0].merge(lines[1:]) if len(lines) > 1 else lines[0]
         throats["IsPore"] = np.zeros(throats.n_points, dtype=int)
 
-        return throats
+        return throats, np.array(throat_radii)
+
+    def _calculate_size_distribution(self, pore_radii):
+        """Calculate pore size distribution histogram."""
+        if len(pore_radii) == 0:
+            return {"bins": [], "counts": []}
+        
+        # Create bins (adjust based on your data range)
+        bins = np.linspace(0, np.max(pore_radii) * 1.1, 10)
+        counts, bin_edges = np.histogram(pore_radii, bins=bins)
+        
+        return {
+            "bins": bin_edges.tolist(),
+            "counts": counts.tolist()
+        }
+
+    def _calculate_connectivity(self, labels_volume, num_pores):
+        """Calculate percentage of largest connected pore volume."""
+        if num_pores == 0:
+            return 0.0
+        
+        # Find volume of each pore
+        pore_volumes = []
+        for i in range(1, num_pores + 1):
+            volume = np.sum(labels_volume == i)
+            pore_volumes.append(volume)
+        
+        if len(pore_volumes) == 0:
+            return 0.0
+        
+        largest_volume = max(pore_volumes)
+        total_volume = sum(pore_volumes)
+        
+        return (largest_volume / total_volume) * 100.0 if total_volume > 0 else 0.0
 
     def _create_empty_result(self, data: VolumeData) -> VolumeData:
         return VolumeData(metadata={"Type": "Empty", "PoreCount": 0})

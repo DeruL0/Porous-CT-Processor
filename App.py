@@ -1,6 +1,7 @@
 import sys
 import os
-from typing import Optional
+from typing import Optional, Callable
+
 from PyQt5.QtWidgets import QApplication, QFileDialog, QMessageBox, QProgressDialog
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
@@ -13,9 +14,7 @@ from Exporters import VTKExporter
 
 # Import View and UI Components
 from Visualizers import GuiVisualizer
-from GUI import StructureProcessingPanel
-
-
+from GUI import StructureProcessingPanel, StatisticsPanel
 
 
 # Note: Removed QThread implementations to resolve crash issues (0xC0000409).
@@ -24,6 +23,7 @@ from GUI import StructureProcessingPanel
 class AppController:
     """
     Application Controller (The 'C' in MVC).
+    Orchestrates interaction between Data, Logic, and UI.
     """
 
     def __init__(self):
@@ -36,8 +36,8 @@ class AppController:
         self.data_manager = ScientificDataManager()
 
         self.loader: Optional[BaseLoader] = None
-        self.processor = PoreExtractionProcessor()
-        self.sphere_processor = PoreToSphereProcessor()
+        self.processor: BaseProcessor = PoreExtractionProcessor()
+        self.sphere_processor: BaseProcessor = PoreToSphereProcessor()
 
         # 3. Setup Processing UI
         self._setup_workflow_ui()
@@ -54,7 +54,12 @@ class AppController:
         self.panel.reset_clicked.connect(self._reset_to_original)
         self.panel.export_clicked.connect(self._export_vtk_dialog)
 
-        self.visualizer.add_custom_panel(self.panel, index=2)
+        # Add to left side (controls)
+        self.visualizer.add_custom_panel(self.panel, index=1, side='left')
+        
+        # Add Statistics Panel to right side (info)
+        self.stats_panel = StatisticsPanel()
+        self.visualizer.add_custom_panel(self.stats_panel, index=1, side='right')
 
     # ==========================================
     # Logic Implementation (Slots)
@@ -146,11 +151,16 @@ class AppController:
         def on_complete(pnm_data):
             self.data_manager.set_pnm_data(pnm_data)
             self.visualizer.set_data(pnm_data)
+            
+            # Update statistics panel
+            self.stats_panel.update_statistics(pnm_data.metadata)
+            
             counts = pnm_data.metadata
             msg = (
                 f"Model Generated Successfully (Optimized Mesh)\n\n"
                 f"• Nodes (Pores): {counts.get('PoreCount')}\n"
                 f"• Throats (Connections): {counts.get('ConnectionCount')}\n"
+                f"• Largest Pore: {counts.get('LargestPoreRatio', 'N/A')}\n"
             )
             self._show_msg("Model Generated", msg)
 

@@ -1,12 +1,15 @@
-import numpy as np
 import math
+from typing import Optional, Dict, Any, List
+
+import numpy as np
 import pyvista as pv
 from pyvistaqt import BackgroundPlotter
+
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QLabel, QFrame, QMessageBox, QStatusBar)
+                             QLabel, QFrame, QMessageBox, QStatusBar, QScrollArea)
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont
-from typing import Optional
+
 from Core import BaseVisualizer, VolumeData
 from GUI import VisualizationModePanel, RenderingParametersPanel, InfoPanel
 
@@ -32,7 +35,11 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         
         # Cache for expensive isosurfaces
         # Key: threshold (int), Value: pv.PolyData
-        self._iso_cache = {}
+        self._iso_cache: Dict[int, pv.PolyData] = {}
+        
+        # Cache for volume grid to optimize updates
+        self._cached_vol_grid: Optional[pv.PolyData] = None
+        self._cached_vol_grid_source: Optional[int] = None
 
         # Track actors to allow property updates without rebuilding
         self.volume_actor = None
@@ -51,25 +58,35 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         self.setCentralWidget(main_widget)
         main_layout = QHBoxLayout(main_widget)
 
-        # Left Panel (Controls)
-        control_panel = self._create_control_panel()
-        main_layout.addWidget(control_panel, stretch=1)
+        # Left Panel (Controls) - with scroll area
+        left_scroll = self._create_scrollable_panel()
+        main_layout.addWidget(left_scroll, stretch=1)
 
-        # Right Panel (3D Canvas)
+        # Center Panel (3D Canvas)
         self.plotter = BackgroundPlotter(
             window_size=(1000, 900),
             show=False,
             title="3D Structure Viewer"
         )
         main_layout.addWidget(self.plotter.app_window, stretch=3)
+        
+        # Right Panel (Info & Statistics) - with scroll area
+        right_scroll = self._create_info_panel()
+        main_layout.addWidget(right_scroll, stretch=1)
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.update_status("Ready. Please load a sample scan.")
 
-    def _create_control_panel(self) -> QWidget:
+    def _create_scrollable_panel(self) -> QWidget:
+        """Create left control panel with scroll support."""
+        from PyQt5.QtWidgets import QScrollArea
+        
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setMaximumWidth(400)
+        
         panel = QWidget()
-        panel.setMaximumWidth(400)
         self.control_panel_layout = QVBoxLayout(panel)
         layout = self.control_panel_layout
         layout.setSpacing(10)
@@ -79,9 +96,6 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
         layout.addWidget(self._create_separator())
-
-        self.info_panel = InfoPanel()
-        layout.addWidget(self.info_panel)
 
         self.mode_panel = VisualizationModePanel()
         self.mode_panel.volume_clicked.connect(lambda: self.render_volume(reset_view=True))
@@ -94,8 +108,8 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         self.params_panel = RenderingParametersPanel()
 
         # Standard rendering triggers (Timer based)
-        for signal in [self.params_panel.colormap_changed,
-                       self.params_panel.solid_color_changed,
+        # Standard rendering triggers (Timer based)
+        for signal in [self.params_panel.solid_color_changed,
                        self.params_panel.light_angle_changed,
                        self.params_panel.coloring_mode_changed,
                        self.params_panel.render_style_changed,
@@ -104,18 +118,65 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
             signal.connect(self.trigger_render)
 
         # OPTIMIZATION: Immediate updates for Volume Transfer Function
-        # Connecting these directly to render_volume allows skipping the timer
-        # if the code logic supports in-place updates.
         self.params_panel.opacity_changed.connect(lambda: self.render_volume(reset_view=False))
         self.params_panel.clim_changed.connect(lambda: self.render_volume(reset_view=False))
+        
+        # Smart dispatch for colormap (Immediate for Volume, Delayed for others)
+        self.params_panel.colormap_changed.connect(self._on_colormap_changed)
 
         layout.addWidget(self.params_panel)
         layout.addStretch()
-        return panel
+        
+        scroll_area.setWidget(panel)
+        return scroll_area
+    
+    def _create_info_panel(self) -> QWidget:
+        """Create right info/statistics panel with scroll support."""
+        from PyQt5.QtWidgets import QScrollArea
+        
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setMaximumWidth(400)
+        
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setSpacing(10)
+        
+        title = QLabel("Information")
+        title.setFont(QFont("Arial", 16, QFont.Bold))
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        layout.addWidget(self._create_separator())
+        
+        self.info_panel = InfoPanel()
+        layout.addWidget(self.info_panel)
+        
+        layout.addStretch()
+        
+        scroll_area.setWidget(panel)
+        return scroll_area
 
-    def add_custom_panel(self, panel: QWidget, index: int = 2):
-        if hasattr(self, 'control_panel_layout'):
+    def add_custom_panel(self, panel: QWidget, index: int = 2, side: str = 'left'):
+        """
+        Add a custom panel to either left (controls) or right (info) sidebar.
+        
+        Args:
+            panel: Widget to add
+            index: Position index in the layout
+            side: 'left' for control panel, 'right' for info panel
+        """
+        if side == 'left' and hasattr(self, 'control_panel_layout'):
             self.control_panel_layout.insertWidget(index, panel)
+        elif side == 'right':
+            # Find the right panel's layout
+            # The right scroll area's widget's layout
+            right_scroll = self.centralWidget().layout().itemAt(2).widget()  # Third item is right panel
+            if isinstance(right_scroll, QScrollArea):
+                right_widget = right_scroll.widget()
+                if right_widget:
+                    right_layout = right_widget.layout()
+                    # Insert before the final stretch
+                    right_layout.insertWidget(right_layout.count() - 1, panel)
 
     def _create_separator(self):
         line = QFrame()
@@ -147,6 +208,7 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         self.mesh = None
         self.volume_actor = None  # Reset tracked actor
         self._iso_cache = {} # Clear specific cache
+        self._cached_vol_grid = None # Clear volume cache
 
         # Determine data type
         d_type = self.data.metadata.get('Type', 'Unknown')
@@ -220,17 +282,60 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
             self.params_panel.set_mode(None)
             self.plotter.enable_lightkit()
 
-        # Render Pores vs Throats
+        # Check if we have pore radius data for size-based coloring
+        pore_radii = self.data.metadata.get("PoreRadii") if self.data else None
+        
+        # Render Pores vs Throats with optional size coloring
         if "IsPore" in self.mesh.array_names:
-            self.plotter.add_mesh(
-                self.mesh,
-                scalars="IsPore",
-                cmap=["gray", "red"],
-                categories=True,
-                show_scalar_bar=False,
-                smooth_shading=True,
-                specular=0.5
-            )
+            # Check if user wants size-based coloring (future: add UI toggle)
+            # For now, automatically use size coloring if data available
+            if pore_radii and len(pore_radii) > 0:
+                # Color by pore size
+                # Need to map radii to mesh points
+                # Extract IsPore field to identify pore points
+                is_pore = self.mesh["IsPore"]
+                
+                # Create a size scalar field for the mesh
+                # This is a simplified approach - assigns radius to pore sphere vertices
+                # More sophisticated: assign based on point ID mapping
+                size_scalars = np.zeros(self.mesh.n_points)
+                
+                # Try to get radius from point cloud if available
+                if "radius" in self.mesh.point_data:
+                    # Use original radius data
+                    for i in range(self.mesh.n_points):
+                        if is_pore[i] == 1:
+                            size_scalars[i] = self.mesh.point_data["radius"][i]
+                else:
+                    # Fallback: assign based on IsPore
+                    pore_indices = np.where(is_pore == 1)[0]
+                    if len(pore_indices) > 0 and len(pore_radii) > 0:
+                        # Simple assignment
+                        avg_radius = np.mean(pore_radii)
+                        size_scalars[pore_indices] = avg_radius
+                
+                self.mesh["PoreSize"] = size_scalars
+                
+                self.plotter.add_mesh(
+                    self.mesh,
+                    scalars="PoreSize",
+                    cmap="viridis",
+                    show_scalar_bar=True,
+                    scalar_bar_args={'title': 'Pore Radius (mm)'},
+                    smooth_shading=True,
+                    specular=0.5
+                )
+            else:
+                # Default binary coloring
+                self.plotter.add_mesh(
+                    self.mesh,
+                    scalars="IsPore",
+                    cmap=["gray", "red"],
+                    categories=True,
+                    show_scalar_bar=False,
+                    smooth_shading=True,
+                    specular=0.5
+                )
         else:
             self.plotter.add_mesh(self.mesh, color='gold', smooth_shading=True, specular=0.5)
 
@@ -251,7 +356,12 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
             self.params_panel.set_mode('volume')
             self.plotter.enable_lightkit()
 
-            vol_grid = self.grid.cell_data_to_point_data()
+            # Cache the point data grid to avoid re-computation on every update
+            if not hasattr(self, '_cached_vol_grid') or self._cached_vol_grid is None or self._cached_vol_grid_source != id(self.grid):
+                self._cached_vol_grid = self.grid.cell_data_to_point_data()
+                self._cached_vol_grid_source = id(self.grid)
+            
+            vol_grid = self._cached_vol_grid
             params = self.params_panel.get_current_values()
 
             # Initial Add
@@ -266,37 +376,48 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
             if reset_view: self.reset_camera()
 
         else:
-            # OPTIMIZATION: Fast Update without clearing actors
-            # This allows dragging sliders smoothly
+            # OPTIMIZATION: Fast Update without full clearing
             self.update_status("Updating volume properties...")
             params = self.params_panel.get_current_values()
+            
+        # Use cached grid
+            vol_grid = self._cached_vol_grid if hasattr(self, '_cached_vol_grid') else self.grid.cell_data_to_point_data()
 
-            # 1. Update Opacity Mapping (The transfer function)
-            # PyVista's actor.mapper holds the lookup table
-            if self.volume_actor:
-                # Update scalar range (Contrast Limits)
-                self.volume_actor.mapper.scalar_range = params['clim']
-
-                # Update Opacity function (requires fetching the property)
-                # Note: PyVista abstracts this, but we can re-apply the property helper
-                # or use internal vtkProperty. However, calling add_volume again is slow.
-                # A trick with PyVista is that `prop.opacity = "sigmoid"` sets the mapping.
-                prop = self.volume_actor.GetProperty()
-
-                # PyVista doesn't expose easy "set_opacity_mode" on existing actor easily
-                # BUT, we can use the plotter's helper to regenerate the transfer function
-                # without reloading the data to GPU.
-                # Actually, simply modifying mapper.lookup_table is complex.
-                # Re-calling add_volume is slow because it processes the grid.
-
-                # Compromise: The 'clim' update is instant (mapper.scalar_range).
-                # The 'opacity' string change (sigmoid->linear) is rare, so full re-render is fine.
-                # But 'threshold' often maps to 'clim' in volume rendering context.
-
-                # If the user drags the CLIM slider, we only update scalar_range.
-                pass
-
+            # STRATEGY: Double Buffer to prevent flickering
+            # Add the NEW actor before removing the OLD one.
+            # IMPORTANT: Set render=False to prevent intermediate frames (flashing)
+            old_actor = self.volume_actor
+            
+            new_actor = self.plotter.add_volume(
+                vol_grid,
+                cmap=params['colormap'],
+                opacity=params['opacity'],
+                clim=params['clim'],
+                shade=False,
+                render=False  # Crucial for double buffering to work invisibly
+            )
+            
+            # FORCE UPDATE: Explicitly set scalar range to ensure it takes effect
+            # This handles cases where add_volume might default to data range
+            if new_actor.mapper:
+                new_actor.mapper.scalar_range = params['clim']
+            
+            print(f"Updating Volume: clim={params['clim']}") # Debug output
+            
+            if old_actor:
+                self.plotter.remove_actor(old_actor, render=False)
+            
+            self.volume_actor = new_actor
             self.plotter.render()
+    
+    def _on_colormap_changed(self, text):
+        """Handle colormap changes: Immediate for volume, Debounced for others."""
+        if self.active_view_mode == 'volume':
+            # Volume rendering optimization allows immediate updates
+            self.render_volume(reset_view=False)
+        else:
+            # Other modes might require geometry processing, so debounce
+            self.trigger_render()
 
     def render_slices(self, reset_view=True):
         if not self.grid: return
@@ -330,9 +451,6 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         if not self.grid: return
 
         self.update_status(f"Generating isosurface ({threshold})...")
-        # Isosurface generation is geometric, so we must recreate the mesh
-        # We cannot optimize this to be "instant" without shaders,
-        # so we rely on the timer in trigger_render to debounce it.
 
         self.clear_view()
         self.active_view_mode = 'iso'
@@ -374,6 +492,18 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
                 dist = np.linalg.norm(contours.points - contours.center, axis=1)
                 contours["RadialDistance"] = dist
                 self.plotter.add_mesh(contours, scalars="RadialDistance", cmap=params['colormap'], **mesh_kwargs)
+
+            # Apply light angle if specified
+            if 'light_angle' in params and params['light_angle'] is not None:
+                angle = params['light_angle']
+                # Light position: convert angle to 3D position
+                # Angle in degrees, position light around the scene
+                import math
+                rad = math.radians(angle)
+                # Position light in a circle around Z axis
+                light_pos = [10 * math.cos(rad), 10 * math.sin(rad), 10]
+                self.plotter.remove_all_lights()
+                self.plotter.add_light(pv.Light(position=light_pos, intensity=1.0))
 
             self.plotter.add_axes()
             if reset_view: self.reset_camera()

@@ -1,8 +1,109 @@
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QLabel,
-                             QGroupBox, QSlider, QComboBox, QFrame)
+                             QGroupBox, QSlider, QComboBox, QFrame, QTableWidget,
+                             QTableWidgetItem)
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QFont
 from typing import Dict, Any, List
+import numpy as np
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
+
+# ==========================================
+# Statistics Panel (Merged)
+# ==========================================
+
+class StatisticsPanel(QWidget):
+    """
+    Panel to display advanced statistics and visualizations for PNM analysis.
+    """
+    
+    def __init__(self):
+        super().__init__()
+        self.setMaximumHeight(400)
+        self._init_ui()
+        
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Title
+        title = QLabel("Statistics & Analysis")
+        title.setFont(QFont("Arial", 12, QFont.Bold))
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Matplotlib Figure for Histogram
+        self.figure = Figure(figsize=(5, 3), dpi=80)
+        self.canvas = FigureCanvas(self.figure)
+        self.canvas.setMinimumHeight(200)
+        layout.addWidget(self.canvas)
+        
+        # Statistics Table
+        self.stats_table = QTableWidget()
+        self.stats_table.setMaximumHeight(120)
+        self.stats_table.setColumnCount(2)
+        self.stats_table.setHorizontalHeaderLabels(["Metric", "Value"])
+        self.stats_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.stats_table)
+        
+        layout.addStretch()
+        
+    def update_statistics(self, metadata):
+        """Update the panel with new statistics from VolumeData metadata."""
+        # Clear previous
+        self.figure.clear()
+        self.stats_table.setRowCount(0)
+        
+        # Extract metrics
+        size_dist = metadata.get("PoreSizeDistribution", {})
+        largest_pore = metadata.get("LargestPoreRatio", "N/A")
+        throat_stats = metadata.get("ThroatStats", {})
+        pore_count = metadata.get("PoreCount", 0)
+        connection_count = metadata.get("ConnectionCount", 0)
+        
+        # Plot histogram
+        if size_dist.get("bins") and size_dist.get("counts"):
+            ax = self.figure.add_subplot(111)
+            bins = np.array(size_dist["bins"])
+            counts = size_dist["counts"]
+            
+            # Bar plot
+            bin_centers = (bins[:-1] + bins[1:]) / 2
+            ax.bar(bin_centers, counts, width=np.diff(bins), 
+                   alpha=0.7, color='steelblue', edgecolor='black')
+            
+            ax.set_xlabel('Pore Radius (mm)')
+            ax.set_ylabel('Count')
+            ax.set_title('Pore Size Distribution')
+            ax.grid(True, alpha=0.3)
+            self.figure.tight_layout()
+            
+        self.canvas.draw()
+        
+        # Populate stats table
+        stats_data = [
+            ("Total Pores", str(pore_count)),
+            ("Connections", str(connection_count)),
+            ("Largest Pore %", str(largest_pore)),
+        ]
+        
+        if throat_stats:
+            stats_data.extend([
+                ("Throat Min (mm)", f"{throat_stats.get('min', 0):.3f}"),
+                ("Throat Max (mm)", f"{throat_stats.get('max', 0):.3f}"),
+                ("Throat Mean (mm)", f"{throat_stats.get('mean', 0):.3f}"),
+            ])
+        
+        self.stats_table.setRowCount(len(stats_data))
+        for row, (metric, value) in enumerate(stats_data):
+            self.stats_table.setItem(row, 0, QTableWidgetItem(metric))
+            self.stats_table.setItem(row, 1, QTableWidgetItem(value))
+        
+    def clear(self):
+        """Clear all statistics."""
+        self.figure.clear()
+        self.canvas.draw()
+        self.stats_table.setRowCount(0)
 
 
 # ==========================================

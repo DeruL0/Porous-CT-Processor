@@ -12,15 +12,14 @@ from typing import Tuple, Dict, Any, Optional, Callable
 @dataclass
 class VolumeData:
     """
-    Unified Data Transfer Object (DTO).
-    Now supports both Voxel Grid (numpy) and Mesh (PyVista PolyData).
-
+    Unified Data Transfer Object (DTO) for volumetric and mesh data.
+    
     Attributes:
         raw_data (Optional[np.ndarray]): 3D Matrix (Z, Y, X) for voxel data.
         mesh (Optional[pv.PolyData]): 3D Mesh for PNM or Surface data.
-        spacing (Tuple): Voxel spacing (z, y, x) in mm.
-        origin (Tuple): Origin coordinates (z, y, x) in mm.
-        metadata (Dict): Arbitrary metadata (SampleID, etc.).
+        spacing (Tuple[float, float, float]): Voxel spacing (x, y, z) in mm.
+        origin (Tuple[float, float, float]): Origin coordinates (x, y, z) in mm.
+        metadata (Dict[str, Any]): Arbitrary metadata (SampleID, etc.).
     """
     raw_data: Optional[np.ndarray] = None
     mesh: Optional[pv.PolyData] = None
@@ -37,6 +36,7 @@ class VolumeData:
 
     @property
     def has_mesh(self) -> bool:
+        """Check if mesh data is present."""
         return self.mesh is not None
 
 
@@ -45,6 +45,15 @@ class BaseLoader(ABC):
 
     @abstractmethod
     def load(self, source: str) -> VolumeData:
+        """
+        Load data from a source path.
+        
+        Args:
+            source (str): Path to file or directory.
+            
+        Returns:
+            VolumeData: Loaded data object.
+        """
         pass
 
 
@@ -54,10 +63,15 @@ class BaseProcessor(ABC):
     @abstractmethod
     def process(self, data: VolumeData, callback: Optional[Callable[[int, str], None]] = None, **kwargs) -> VolumeData:
         """
+        Process volume data.
+        
         Args:
-            data: Input VolumeData
-            callback: Optional function (progress_percent, status_message) -> None
-            **kwargs: Algorithm specific parameters
+            data (VolumeData): Input data.
+            callback (Optional[Callable]): Progress callback (percent, message).
+            **kwargs: Algorithm specific parameters.
+            
+        Returns:
+            VolumeData: Processed result.
         """
         pass
 
@@ -67,8 +81,10 @@ class BaseVisualizer(ABC):
 
     @abstractmethod
     def set_data(self, data: VolumeData) -> None:
+        """Set valid data to the visualizer."""
         pass
 
     @abstractmethod
     def show(self) -> None:
+        """Show the visualization window."""
         pass
