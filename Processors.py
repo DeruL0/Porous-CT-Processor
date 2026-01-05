@@ -316,21 +316,23 @@ class PoreToSphereProcessor(BaseProcessor):
         }
 
     def _calculate_connectivity(self, labels_volume, num_pores):
-        """Calculate percentage of largest connected pore volume."""
+        """Calculate percentage of largest connected pore volume (OPTIMIZED)."""
         if num_pores == 0:
             return 0.0
         
-        # Find volume of each pore
-        pore_volumes = []
-        for i in range(1, num_pores + 1):
-            volume = np.sum(labels_volume == i)
-            pore_volumes.append(volume)
+        # OPTIMIZED: Use np.bincount for O(N) instead of O(N * Volume)
+        # bincount counts occurrences of each integer value in the array
+        flat_labels = labels_volume.ravel()
+        pore_volumes = np.bincount(flat_labels, minlength=num_pores + 1)
+        
+        # Ignore label 0 (background)
+        pore_volumes = pore_volumes[1:]
         
         if len(pore_volumes) == 0:
             return 0.0
         
-        largest_volume = max(pore_volumes)
-        total_volume = sum(pore_volumes)
+        largest_volume = np.max(pore_volumes)
+        total_volume = np.sum(pore_volumes)
         
         return (largest_volume / total_volume) * 100.0 if total_volume > 0 else 0.0
 

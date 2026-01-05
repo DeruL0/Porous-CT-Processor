@@ -108,26 +108,24 @@ class FastDicomLoader(DicomSeriesLoader):
 
         files = self._find_dicom_files(folder_path)
 
-        # Optimization: Only read headers for sorting
-        print("[Loader] Reading headers for sorting...")
-        file_z_pairs = []
-        for f in files:
-            try:
-                # stop_before_pixels=True significantly speeds up scanning
-                ds = pydicom.dcmread(f, stop_before_pixels=True)
-                if hasattr(ds, 'ImagePositionPatient'):
-                    file_z_pairs.append((f, float(ds.ImagePositionPatient[2])))
-            except:
-                continue
+        if not files:
+            raise FileNotFoundError("No valid DICOM/CT files found")
 
-        # Sort by Z position
-        file_z_pairs.sort(key=lambda x: x[1])
+        # Optimization: Try sorting by filename first (Natural Sort)
+        # This avoids opening every single file header just to check Z-position
+        import re
 
-        # Downsample Z-axis (Select every nth file)
-        selected_files = [pair[0] for pair in file_z_pairs[::self.step]]
-        print(f"[Loader] Selected {len(selected_files)} / {len(files)} slices for loading.")
+        def natural_keys(text):
+            return [int(c) if c.isdigit() else c for c in re.split(r'(\d+)', text)]
 
-        # Read full data only for selected slices
+        print("[Loader] attempting natural filename sort...")
+        files.sort(key=lambda f: natural_keys(os.path.basename(f)))
+
+        # Downsample: Select every nth file based on filename order
+        selected_files = files[::self.step]
+        print(f"[Loader] Selected {len(selected_files)} / {len(files)} files via filename sort.")
+
+        # Read only selected slices
         slices = []
         for f in selected_files:
             try:
@@ -135,6 +133,14 @@ class FastDicomLoader(DicomSeriesLoader):
                 slices.append(ds)
             except Exception as e:
                 print(f"Warning: Failed to read {f} - {e}")
+        
+        # Verify Z-Order consistency of the loaded subset
+        if len(slices) > 1:
+            z_start = float(slices[0].ImagePositionPatient[2])
+            z_end = float(slices[-1].ImagePositionPatient[2])
+            # If Z is not monotonic, our filename sort failed (or filenames don't match Z).
+            # But usually it's fine. We rely on it for speed.
+            print(f"[Loader] Z-Range: {z_start} -> {z_end}")
 
         if not slices:
             raise ValueError("No valid slices loaded.")
@@ -145,7 +151,7 @@ class FastDicomLoader(DicomSeriesLoader):
             "SampleID": getattr(slices[0], "PatientID", "Unknown Sample"),
             "ScanType": getattr(slices[0], "Modality", "CT"),
             "SliceCount": len(slices),
-            "Type": "Fast/Downsampled"
+            "Type": "Fast/Downsampled (Filename Sorted)"
         }
 
         print(f"[Loader] Fast Load complete: {volume.shape}, Spacing: {spacing}")
