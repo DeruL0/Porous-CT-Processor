@@ -11,7 +11,7 @@ from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont
 
 from Core import BaseVisualizer, VolumeData
-from GUI import VisualizationModePanel, RenderingParametersPanel, InfoPanel
+from GUI import VisualizationModePanel, RenderingParametersPanel, InfoPanel, ClipPlanePanel
 
 
 # Resolve Metaclass conflict between PyQt5 and ABC
@@ -125,6 +125,20 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         self.params_panel.colormap_changed.connect(self._on_colormap_changed)
 
         layout.addWidget(self.params_panel)
+        
+        # Clip Plane Panel
+        self.clip_panel = ClipPlanePanel()
+        self.clip_panel.clip_toggled.connect(self._on_clip_toggled)
+        
+        # PERFORMANCE: Debounce clip updates to avoid expensive re-renders during dragging
+        self.clip_update_timer = QTimer()
+        self.clip_update_timer.setInterval(200)  # 200ms debounce
+        self.clip_update_timer.setSingleShot(True)
+        self.clip_update_timer.timeout.connect(self._apply_clip_planes)
+        self.clip_panel.clip_changed.connect(lambda: self.clip_update_timer.start())
+        
+        layout.addWidget(self.clip_panel)
+        
         layout.addStretch()
         
         scroll_area.setWidget(panel)
@@ -279,6 +293,7 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         if reset_view or self.active_view_mode != 'mesh':
             self.clear_view()
             self.active_view_mode = 'mesh'
+            self._update_clip_panel_state() # Update UI state
             self.params_panel.set_mode(None)
             self.plotter.enable_lightkit()
 
@@ -353,6 +368,7 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
             self.update_status("Rendering volume (New)...")
             self.clear_view()
             self.active_view_mode = 'volume'
+            self._update_clip_panel_state() # Update UI state
             self.params_panel.set_mode('volume')
             self.plotter.enable_lightkit()
 
@@ -410,6 +426,25 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
             self.volume_actor = new_actor
             self.plotter.render()
     
+    def _update_clip_panel_state(self):
+        """Enable/Disable clip panel based on active mode."""
+        if not hasattr(self, 'clip_panel'):
+            return
+            
+        # Clipping supported in Volume, Mesh, and Iso modes
+        supported_modes = ['volume', 'mesh', 'iso']
+        is_supported = self.active_view_mode in supported_modes
+        
+        self.clip_panel.setEnabled(is_supported)
+        
+        # ALWAYS reset to disabled when switching modes (User request)
+        # Block signals to prevent triggering toggle logic during reset
+        self.clip_panel.enable_checkbox.blockSignals(True)
+        self.clip_panel.enable_checkbox.setChecked(False)
+        self.clip_panel.enable_checkbox.blockSignals(False)
+        self.clip_panel._enabled = False
+        self.clip_panel._update_slider_state()
+            
     def _on_colormap_changed(self, text):
         """Handle colormap changes: Immediate for volume, Debounced for others."""
         if self.active_view_mode == 'volume':
@@ -419,12 +454,157 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
             # Other modes might require geometry processing, so debounce
             self.trigger_render()
 
+    def _on_clip_toggled(self, enabled: bool):
+        """Handle clip plane enable/disable toggle."""
+        if enabled:
+            self._apply_clip_planes()
+        else:
+            # CRITICAL: Force full re-render to restore original unclipped data
+            # Using reset_view=True ensures the cached/clipped data is discarded
+            if self.active_view_mode == 'volume':
+                self.render_volume(reset_view=True)
+            elif self.active_view_mode == 'slices':
+                self.render_slices(reset_view=True)
+            elif self.active_view_mode == 'iso':
+                self.render_isosurface_auto(reset_view=True)
+            elif self.active_view_mode == 'mesh':
+                self.render_mesh(reset_view=True)
+    
+    def _apply_clip_planes(self):
+        """Apply clip planes to current visualization based on panel settings."""
+        if not hasattr(self, 'clip_panel'):
+            return
+        
+        clip_vals = self.clip_panel.get_clip_values()
+        if not clip_vals['enabled']:
+            return
+            
+        # CLAMP: Ensure minimum clip thickness to prevent empty mesh errors
+        # User requested minimum size instead of 0
+        EPS = 0.005  # 0.5%
+        for axis in ['x', 'y', 'z']:
+            # If standard (0->1), clamp min to EPS
+            # If invert (1->0), clamp max to 1-EPS
+            if not clip_vals[f'invert_{axis}']:
+                clip_vals[axis] = max(EPS, clip_vals[axis])
+            else:
+                clip_vals[axis] = min(1.0 - EPS, clip_vals[axis])
+
+        try:
+            # Determine rendering bounds and data source based on MODE
+            data_source = None
+            if self.active_view_mode == 'volume':
+                data_source = self.grid
+            elif self.active_view_mode == 'mesh':
+                data_source = self.mesh
+            elif self.active_view_mode == 'iso':
+                 # For ISO, we need the *current* isosurface
+                 # We can get it from cache using current threshold
+                 params = self.params_panel.get_current_values()
+                 thresh = params['threshold']
+                 if thresh in self._iso_cache:
+                     data_source = self._iso_cache[thresh]
+                 elif self.grid:
+                     # Fallback: generating on the fly (should generally exist from previous render)
+                     data_source = self.grid.cell_data_to_point_data().contour([thresh])
+
+            if data_source is None:
+                return
+
+            bounds = data_source.bounds
+            
+            # Calculate clip box ...
+            x_min = bounds[0]
+            x_max = bounds[0] + (bounds[1] - bounds[0]) * clip_vals['x']
+            y_min = bounds[2]
+            y_max = bounds[2] + (bounds[3] - bounds[2]) * clip_vals['y']
+            z_min = bounds[4]
+            z_max = bounds[4] + (bounds[5] - bounds[4]) * clip_vals['z']
+            
+            # Handle invert
+            if clip_vals['invert_x']: x_min, x_max = x_max, bounds[1]
+            if clip_vals['invert_y']: y_min, y_max = y_max, bounds[3]
+            if clip_vals['invert_z']: z_min, z_max = z_max, bounds[5]
+            
+            clip_bounds = [x_min, x_max, y_min, y_max, z_min, z_max]
+            
+            # --- RENDER ---
+            self.plotter.clear()
+            self.plotter.add_axes()
+            params = self.params_panel.get_current_values()
+
+            # Mode 1: Volume
+            if self.active_view_mode == 'volume' and self.grid is not None:
+                # Use clip_box on the GRID
+                clipped = self.grid.clip_box(clip_bounds, invert=False)
+                if clipped.n_cells > 0:
+                    # Render clipped volume as "Mesh" (Isosurface-like) to avoid VolumeMapper crash
+                    # OR if we want real volume rendering, we must use add_volume.
+                    # Previous crash issue: add_volume doesn't like UnstructuredGrid from clip().
+                    # Solution: Smart volume rendering or ExtractRegion?
+                    # For stability: Render as semi-transparent surface representing the volume data
+                     self.plotter.add_mesh(
+                        clipped,
+                        scalars="values",
+                        cmap=params['colormap'],
+                        clim=params['clim'],
+                        show_scalar_bar=True,
+                        opacity=0.5  # Semi-transparent to look like volume
+                    )
+
+            # Mode 2: Mesh (PNM)
+            elif self.active_view_mode == 'mesh':
+                clipped = self.mesh.clip_box(clip_bounds, invert=False)
+                if clipped.n_points > 0:
+                    self.plotter.add_mesh(
+                        clipped,
+                        scalars="IsPore" if "IsPore" in clipped.array_names else None,
+                        cmap=["gray", "red"] if "IsPore" in clipped.array_names else params['colormap'],
+                        show_scalar_bar=False,
+                        smooth_shading=True
+                    )
+
+            # Mode 3: Isosurface
+            elif self.active_view_mode == 'iso':
+                 # Clip the PolyData surface
+                 clipped = data_source.clip_box(clip_bounds, invert=False)
+                 
+                 # Re-apply iso styles
+                 style_map = {'Surface': 'surface', 'Wireframe': 'wireframe', 'Wireframe + Surface': 'surface'}
+                 render_style = style_map.get(params['render_style'], 'surface')
+                 show_edges = (params['render_style'] == 'Wireframe + Surface')
+                 
+                 mesh_kwargs = {
+                    'style': render_style, 'show_edges': show_edges, 'smooth_shading': True,
+                    'specular': 0.4, 'diffuse': 0.7, 'ambient': 0.15, 'lighting': True
+                 }
+                 
+                 mode = params['coloring_mode']
+                 if mode == 'Solid Color':
+                     self.plotter.add_mesh(clipped, color=params['solid_color'], **mesh_kwargs)
+                 elif mode == 'Depth (Z-Axis)':
+                     clipped["Elevation"] = clipped.points[:, 2]
+                     self.plotter.add_mesh(clipped, scalars="Elevation", cmap=params['colormap'], **mesh_kwargs)
+                 else:
+                     self.plotter.add_mesh(clipped, color='white', **mesh_kwargs)
+
+            # Re-apply lighting settings (critical after plotter.clear())
+            self._apply_custom_lighting(params)
+
+            self.plotter.render()
+            
+        except Exception as e:
+            print(f"[Clip] Error: {e}")
+            self._on_clip_toggled(False)
+
+
     def render_slices(self, reset_view=True):
         if not self.grid: return
 
         if reset_view or self.active_view_mode != 'slices':
             self.clear_view()
             self.active_view_mode = 'slices'
+            self._update_clip_panel_state() # Update UI state
             self.params_panel.set_mode('slices')
             self.plotter.enable_lightkit()
             self.plotter.show_grid()
@@ -454,6 +634,7 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
 
         self.clear_view()
         self.active_view_mode = 'iso'
+        self._update_clip_panel_state() # Update UI state
         self.params_panel.set_mode('iso')
         self.plotter.enable_lightkit()
         params = self.params_panel.get_current_values()
@@ -493,20 +674,23 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
                 contours["RadialDistance"] = dist
                 self.plotter.add_mesh(contours, scalars="RadialDistance", cmap=params['colormap'], **mesh_kwargs)
 
-            # Apply light angle if specified
-            if 'light_angle' in params and params['light_angle'] is not None:
-                angle = params['light_angle']
-                # Light position: convert angle to 3D position
-                # Angle in degrees, position light around the scene
-                import math
-                rad = math.radians(angle)
-                # Position light in a circle around Z axis
-                light_pos = [10 * math.cos(rad), 10 * math.sin(rad), 10]
-                self.plotter.remove_all_lights()
-                self.plotter.add_light(pv.Light(position=light_pos, intensity=1.0))
+            # Apply lighting
+            self._apply_custom_lighting(params)
 
             self.plotter.add_axes()
             if reset_view: self.reset_camera()
         except Exception as e:
             print(e)
+            
+    def _apply_custom_lighting(self, params):
+        """Apply custom lighting configuration based on parameters."""
+        if 'light_angle' in params and params['light_angle'] is not None:
+            angle = params['light_angle']
+            # Light position: convert angle to 3D position
+            import math
+            rad = math.radians(angle)
+            # Position light in a circle around Z axis
+            light_pos = [10 * math.cos(rad), 10 * math.sin(rad), 10]
+            self.plotter.remove_all_lights()
+            self.plotter.add_light(pv.Light(position=light_pos, intensity=1.0))
             self.update_status("Error generating isosurface.")

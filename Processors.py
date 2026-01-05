@@ -207,28 +207,29 @@ class PoreToSphereProcessor(BaseProcessor):
         )
 
     def _extract_pore_data(self, regions, num_pores, spacing, origin):
-        """Extracts centroids and radii for mesh generation."""
+        """Extracts centroids and radii for mesh generation (PARALLELIZED)."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
         slices = ndimage.find_objects(regions)
-        centers = []
-        radii = []
-        ids = []
-
         sx, sy, sz = spacing
         ox, oy, oz = origin
+        avg_spacing = (sx + sy + sz) / 3.0
 
-        for i in range(num_pores):
+        def process_single_pore(i):
+            """Process a single pore - thread-safe operation."""
             label_idx = i + 1
             slice_obj = slices[i]
-            if slice_obj is None: continue
+            if slice_obj is None:
+                return None
 
             local_mask = (regions[slice_obj] == label_idx)
             voxel_count = np.sum(local_mask)
+            if voxel_count == 0:
+                return None
 
             # Equivalent radius
             r_vox = (3 * voxel_count / (4 * np.pi)) ** (1 / 3)
-            # Take average spacing for radius scaling
-            avg_spacing = (sx + sy + sz) / 3.0
-            radii.append(r_vox * avg_spacing)
+            radius = r_vox * avg_spacing
 
             # Centroid (Physical Coordinates)
             local_cent = ndimage.center_of_mass(local_mask)
@@ -237,9 +238,28 @@ class PoreToSphereProcessor(BaseProcessor):
             cy = (slice_obj[1].start + local_cent[1]) * sy + oy
             cx = (slice_obj[2].start + local_cent[2]) * sx + ox
 
-            # PyVista uses (X, Y, Z) order, Numpy uses (Z, Y, X)
-            centers.append([cx, cy, cz])
-            ids.append(label_idx)
+            return (label_idx, [cx, cy, cz], radius)
+
+        # Parallel execution
+        results = []
+        max_workers = min(8, num_pores)  # Limit threads to avoid overhead
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(process_single_pore, i): i for i in range(num_pores)}
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    results.append(result)
+
+        # Sort by ID to maintain order
+        results.sort(key=lambda x: x[0])
+        
+        if not results:
+            return np.array([]), np.array([]), np.array([])
+        
+        ids = [r[0] for r in results]
+        centers = [r[1] for r in results]
+        radii = [r[2] for r in results]
 
         return np.array(centers), np.array(radii), np.array(ids)
 

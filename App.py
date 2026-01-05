@@ -3,7 +3,7 @@ import os
 from typing import Optional, Callable
 
 from PyQt5.QtWidgets import QApplication, QFileDialog, QMessageBox, QProgressDialog
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
 
 # Import Core Logic
 from Core import BaseLoader, VolumeData, BaseProcessor
@@ -17,8 +17,40 @@ from Visualizers import GuiVisualizer
 from GUI import StructureProcessingPanel, StatisticsPanel
 
 
-# Note: Removed QThread implementations to resolve crash issues (0xC0000409).
-# All loading and processing is now synchronous (blocking).
+class ProcessorWorker(QThread):
+    """Background worker for running processors without blocking UI."""
+    finished = pyqtSignal(object)  # Emits VolumeData result
+    error = pyqtSignal(str)        # Emits error message
+    progress = pyqtSignal(int, str)  # Emits (percent, message)
+    
+    def __init__(self, processor: BaseProcessor, data: VolumeData, threshold: int):
+        super().__init__()
+        self.processor = processor
+        self.data = data
+        self.threshold = threshold
+        self._cancelled = False
+    
+    def run(self):
+        try:
+            def progress_callback(percent, message):
+                if not self._cancelled:
+                    self.progress.emit(percent, message)
+            
+            result = self.processor.process(
+                self.data, 
+                callback=progress_callback, 
+                threshold=self.threshold
+            )
+            
+            if not self._cancelled:
+                self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+    
+    def cancel(self):
+        self._cancelled = True
+
+
 
 class AppController:
     """
@@ -104,18 +136,43 @@ class AppController:
         except Exception as e:
             self._show_err("Loading Error", e)
 
-    def _run_processor_sync(self, processor, data, threshold, success_callback):
-        """Run processor on main thread."""
-        try:
-            self.visualizer.update_status("Processing (Sync)...")
-            self.app.processEvents()
-            
-            # Direct call blocking the UI
-            result = processor.process(data, callback=None, threshold=threshold)
-            success_callback(result)
+    def _run_processor_async(self, processor, data, threshold, success_callback):
+        """Run processor in background thread with progress dialog."""
+        # Create progress dialog
+        self.progress_dialog = QProgressDialog("Processing...", "Cancel", 0, 100, self.visualizer)
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setMinimumDuration(0)
+        self.progress_dialog.setValue(0)
+        
+        # Create and configure worker
+        self.worker = ProcessorWorker(processor, data, threshold)
+        
+        def on_progress(percent, message):
+            self.progress_dialog.setValue(percent)
+            self.progress_dialog.setLabelText(message)
+            self.visualizer.update_status(message)
+        
+        def on_finished(result):
+            self.progress_dialog.close()
             self.visualizer.update_status("Ready.")
-        except Exception as e:
-            self._show_err("Processing Failed", e)
+            success_callback(result)
+        
+        def on_error(msg):
+            self.progress_dialog.close()
+            self._show_err("Processing Failed", Exception(msg))
+        
+        def on_cancel():
+            self.worker.cancel()
+            self.worker.wait()
+            self.visualizer.update_status("Processing cancelled.")
+        
+        self.worker.progress.connect(on_progress)
+        self.worker.finished.connect(on_finished)
+        self.worker.error.connect(on_error)
+        self.progress_dialog.canceled.connect(on_cancel)
+        
+        # Start background processing
+        self.worker.start()
 
     def _process_pores(self):
         if not self.data_manager.has_raw():
@@ -137,7 +194,7 @@ class AppController:
             )
             self._show_msg("Extraction Complete", msg)
 
-        self._run_processor_sync(self.processor, raw, thresh, on_complete)
+        self._run_processor_async(self.processor, raw, thresh, on_complete)
 
     def _process_spheres(self):
         if not self.data_manager.has_raw():
@@ -164,7 +221,7 @@ class AppController:
             )
             self._show_msg("Model Generated", msg)
 
-        self._run_processor_sync(self.sphere_processor, raw, thresh, on_complete)
+        self._run_processor_async(self.sphere_processor, raw, thresh, on_complete)
 
     def _reset_to_original(self):
         if not self.data_manager.has_raw(): return
