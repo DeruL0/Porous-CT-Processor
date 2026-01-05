@@ -2,7 +2,7 @@ import numpy as np
 import pyvista as pv
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, Callable
 
 
 # ==========================================
@@ -52,7 +52,13 @@ class BaseProcessor(ABC):
     """Abstract base class for volumetric processing algorithms."""
 
     @abstractmethod
-    def process(self, data: VolumeData, **kwargs) -> VolumeData:
+    def process(self, data: VolumeData, callback: Optional[Callable[[int, str], None]] = None, **kwargs) -> VolumeData:
+        """
+        Args:
+            data: Input VolumeData
+            callback: Optional function (progress_percent, status_message) -> None
+            **kwargs: Algorithm specific parameters
+        """
         pass
 
 

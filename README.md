@@ -1,165 +1,64 @@
 
 # Porous CT Analysis Suite
 
-An analysis suite for **Porous CT**, built with PyQt5 and PyVista.
+A scientific computing application for analyzing porous materials (rocks, ceramics, foams, etc.) using Micro-CT data. Built with **Python**, **PyQt5**, and **PyVista**.
 
 ## Overview
 
-This application provides a comprehensive suite for analyzing porous materials (such as sedimentary rocks, ceramics, foams, and foods) using Micro-CT data.
+This application provides a comprehensive workflow for Digital Rock Physics (DRP):
+1.  **Ingestion**: Load industrial DICOM series or generate synthetic test data.
+2.  **Visualization**: Interactive 3D rendering with orthogonal slices and isosurfaces.
+3.  **Quantification**: Extract porosity and segment void space.
+4.  **Modeling**: Generate Pore Network Models (PNM) using watershed segmentation.
+5.  **Export**: Save results to VTK standards (.vtp/.vti) for simulation software.
 
--   **Interactive 3D visualization** using PyVista.
-    
--   **Pore Network Modeling (PNM)**: Extract pore bodies and throats from raw scans.
-    
--   **Pore Space Extraction**: Quantify and visualize porosity.
-    
--   **Industrial CT Support**: Compatible with DICOM series from Micro-CT scanners.
-    
+## System Architecture
+
+The application follows a strict **Model-View-Controller (MVC)** pattern for extensibility:
+
+* **`App.py`**: Main entry point and Application Controller.
+* **`Core.py`**: Defines standard data structures (`VolumeData`) for Voxel and Mesh data.
+* **`Processors.py`**: Algorithms for segmentation (Watershed, Distance Transform) and topology extraction.
+* **`Visualizers.py`**: Manages the PyVista 3D canvas and rendering logic.
+* **`Loaders.py`**: Strategies for loading DICOM folders and handling downsampling.
+* **`Exporters.py`**: Handles conversion of internal data to VTK formats.
 
 ## Features
 
-### Visualization Modes
+### 1. Visualization Modes
+* **📊 Volume Rendering**: Full 3D density rendering with adjustable opacity transfer functions (Sigmoid, Linear).
+* **🔳 Orthogonal Slices**: Interactive X, Y, Z planes to inspect internal defects.
+* **🏔️ Isosurface**: Extract the solid-void interface.
+    * *Coloring Modes*: Solid Color, Depth (Z-Axis), and **Radial Distance** (visualization of core vs. shell structure).
+* **⚪ PNM Mesh**: Visualizes the network topology with Pores (Spheres) and Throats (Tubes).
 
-1.  **Volume Rendering** - Full 3D volumetric visualization of the material matrix with adjustable opacity transfer functions.
-    
-2.  **Orthogonal Slices** - Inspect internal structure via X, Y, Z planes.
-    
-3.  **Isosurface** - Extract and display the solid-void interface (surface mesh). Includes coloring and lighting options.
-    
+### 2. Structural Analysis
+* **Void Extraction**: Segments air/void voxels from the solid matrix based on intensity thresholding.
+* **Pore Network Modeling (PNM)**:
+    * Uses **Watershed Segmentation** on the distance map.
+    * Generates a **Ball-and-Stick model**:
+        * **Nodes**: Represent pore bodies (sized by equivalent radius).
+        * **Edges**: Represent throats (connections) between pores.
 
-### Structural Analysis
-
-1.  **Void Space Extraction** - Identify and segregate the pore phase from the solid matrix using morphological operations.
-    
-2.  **Pore Network Model (PNM)** - Advanced watershed segmentation to create topological ball-and-stick models:
-    
-    -   **Nodes (Spheres)**: Represent pore bodies.
-        
-    -   **Edges (Cylinders)**: Represent throats/constrictions connecting pores.
-        
-    -   Used for fluid flow simulation and permeability analysis.
-        
-
-### Loading Options
-
--   **Sample Scan Load** - Full resolution loading of DICOM series.
-    
--   **Fast Load** - Downsampled data for quick previews of large datasets.
-    
--   **Synthetic Sample** - Generate a synthetic porous structure (Hollow Sphere Phantom) for testing.
-    
+### 3. Data IO
+* **Load Dicom**: Reads standard CT image series.
+* **Fast Load**: Downsamples large datasets (Step=2) for quick previewing.
+* **Synthetic Generator**: Creates a Gaussian Random Field volume with a solid shell for testing algorithms without external data.
 
 ## Installation
 
 ### Requirements
+* Python 3.8+
+* Dependencies listed in `requirements.txt`:
+    * `PyQt5` (GUI)
+    * `pyvista`, `pyvistaqt`, `vtk` (3D Rendering)
+    * `numpy`, `scipy`, `scikit-image` (Image Processing)
+    * `pydicom` (Data Loading)
 
--   Python 3.8 or higher
-    
--   PyQt5
-    
--   PyVista and pyvistaqt
-    
--   NumPy, SciPy, scikit-image
-    
--   pydicom
-    
-
-### Install Dependencies
-
-```
+### Setup
+```bash
+# Install dependencies
 pip install -r requirements.txt
-```
 
-## Usage
-
-### Running the Application
-
-**Option 1: Start with GUI**
-
-```
+# Run the application
 python App.py
-```
-
-### GUI Controls
-
-The interface features a **Dynamic Control Panel** that automatically adjusts based on your current viewing mode (Volume, Slices, or Isosurface).
-
-#### Analysis Modes
-
--   📊 **Volume Rendering** - View density distribution.
-    
--   🔳 **Orthogonal Slices** - Inspect internal defects or pores.
-    
--   🏔️ **Isosurface** - Visualize the solid surface or pore boundary.
-    
--   🗑️ **Clear View** / 🎥 **Reset Camera** - View controls.
-    
-
-#### Rendering Parameters (Context-Aware)
-
-**Global / Volume Mode:**
-
--   **Colormap** - Analysis-friendly palettes (Viridis, Plasma, Bone, Jet, Magma).
-    
--   **Opacity Preset** - Adjust transparency (Sigmoid, Linear, Geometric) to see inside the volume.
-    
-
-**Isosurface Mode:**
-
--   **Iso-Threshold** - Adjust intensity cutoff to separate solid from void.
-    
--   **Coloring Mode**:
-    
-    -   _Solid Color_: Clean, uniform color (Ivory, Red, Gold, etc.).
-        
-    -   _Depth (Z-Axis)_: Colors the mesh based on height/depth.
-        
-    -   _Radial (Center Dist)_: Colors based on distance from the center (useful for visualizing core vs. shell).
-        
--   **Light Source Angle** - Rotatable directional light (0-360°) to enhance surface details and depth perception.
-    
-
-#### Structure Processing
-
--   📁 **Load Sample Scan** - Load Micro-CT data.
-    
--   🔬 **Extract Pore Space** - Segment the pore phase.
-    
--   ⚪ **Pore Network Model** - Generate topological network.
-    
--   ↩️ **Reset to Raw Data** - Revert to original scan.
-    
-
-## Workflow Example
-
-1.  **Load Data**: Click "📁 Load Sample Scan" to open a folder of CT slice images.
-    
-2.  **Inspect**: Use "📊 Volume Rendering" to see the material density.
-    
-3.  **Segment**: Click "🔬 Extract Void Space" to isolate pores.
-    
-4.  **Visualize Pores**: Switch to "🏔️ Isosurface". Change "Coloring Mode" to "Radial" to see the depth of the pore structure from the center outwards. Adjust the "Light Angle" to catch shadows in the crevices.
-    
-5.  **Model**: Click "⚪ Pore Network Model" to generate the Ball-and-Stick network.
-    
-
-## Algorithm Details
-
-### Pore Network Extraction (Watershed)
-
-This tool implements a standard Digital Rock Physics pipeline:
-
-1.  **Binarization**: Thresholding to separate Void vs Solid.
-    
-2.  **Distance Map**: Compute distance from pore voxels to solid walls.
-    
-3.  **Seed Detection**: Find centers of largest pore spaces (local maxima).
-    
-4.  **Watershed Segmentation**: Partition pore space into discrete regions.
-    
-5.  **Adjacency Matrix**: Determine connectivity between regions to build the topological graph.
-    
-
-## License
-
-This software is provided for research and educational purposes in the field of Porous Media Analysis.

@@ -1,19 +1,25 @@
 import sys
 import os
 from typing import Optional
-from PyQt5.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PyQt5.QtWidgets import QApplication, QFileDialog, QMessageBox, QProgressDialog
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 # Import Core Logic
-from Core import BaseLoader, VolumeData
+from Core import BaseLoader, VolumeData, BaseProcessor
 from Loaders import DicomSeriesLoader, DummyLoader, FastDicomLoader
 from Processors import PoreExtractionProcessor, PoreToSphereProcessor
 from DataManager import ScientificDataManager
-from Exporters import VTKExporter  # Import the new Exporter
+from Exporters import VTKExporter
 
 # Import View and UI Components
 from Visualizers import GuiVisualizer
 from GUI import StructureProcessingPanel
 
+
+
+
+# Note: Removed QThread implementations to resolve crash issues (0xC0000409).
+# All loading and processing is now synchronous (blocking).
 
 class AppController:
     """
@@ -64,47 +70,60 @@ class AppController:
 
     def _load_dummy_data(self):
         try:
-            self.visualizer.update_status("Generating synthetic sample...")
+            self.visualizer.update_status("Generating synthetic sample (Sync)...")
+            self.app.processEvents() # Force UI update before blocking
+            
             self.loader = DummyLoader()
             data = self.loader.load(128)
 
             self.data_manager.load_raw_data(data)
             self.visualizer.set_data(data)
             self._show_msg("Sample Loaded", "Synthetic sample ready.")
+            self.visualizer.update_status("Ready.")
         except Exception as e:
             self._show_err("Loading Error", e)
 
     def _load_data(self, folder_path, fast=False):
         try:
-            self.visualizer.update_status("Loading scan data...")
+            self.visualizer.update_status("Loading scan data (Sync)...")
+            self.app.processEvents()
+            
             self.loader = FastDicomLoader(step=2) if fast else DicomSeriesLoader()
-
             data = self.loader.load(folder_path)
 
             self.data_manager.load_raw_data(data)
             self.visualizer.set_data(data)
             self._show_msg("Scan Loaded",
                            f"Loaded successfully.\nMode: {'Fast' if fast else 'Standard'}")
+            self.visualizer.update_status("Ready.")
         except Exception as e:
             self._show_err("Loading Error", e)
+
+    def _run_processor_sync(self, processor, data, threshold, success_callback):
+        """Run processor on main thread."""
+        try:
+            self.visualizer.update_status("Processing (Sync)...")
+            self.app.processEvents()
+            
+            # Direct call blocking the UI
+            result = processor.process(data, callback=None, threshold=threshold)
+            success_callback(result)
+            self.visualizer.update_status("Ready.")
+        except Exception as e:
+            self._show_err("Processing Failed", e)
 
     def _process_pores(self):
         if not self.data_manager.has_raw():
             QMessageBox.warning(self.visualizer, "No Data", "Please load a sample first.")
             return
 
-        try:
-            self.visualizer.update_status("Extracting void space...")
-            raw = self.data_manager.raw_ct_data
+        raw = self.data_manager.raw_ct_data
+        is_synthetic = raw.metadata.get("Type") == "Synthetic"
+        thresh = 500 if is_synthetic else -300
 
-            is_synthetic = raw.metadata.get("Type") == "Synthetic"
-            thresh = 500 if is_synthetic else -300
-
-            segmented = self.processor.process(raw, threshold=thresh)
-
+        def on_complete(segmented):
             self.data_manager.set_segmented_data(segmented)
             self.visualizer.set_data(segmented)
-
             meta = segmented.metadata
             msg = (
                 f"Quantitative Analysis Results:\n\n"
@@ -112,26 +131,21 @@ class AppController:
                 f"• Pore Count: {meta.get('PoreCount', 0)}\n"
             )
             self._show_msg("Extraction Complete", msg)
-        except Exception as e:
-            self._show_err("Processing Error", e)
+
+        self._run_processor_sync(self.processor, raw, thresh, on_complete)
 
     def _process_spheres(self):
         if not self.data_manager.has_raw():
             QMessageBox.warning(self.visualizer, "No Data", "Please load a sample first.")
             return
 
-        try:
-            self.visualizer.update_status("Generating Pore Network Model (Mesh)...")
-            raw = self.data_manager.raw_ct_data
+        raw = self.data_manager.raw_ct_data
+        is_synthetic = raw.metadata.get("Type") == "Synthetic"
+        thresh = 500 if is_synthetic else -300
 
-            is_synthetic = raw.metadata.get("Type") == "Synthetic"
-            thresh = 500 if is_synthetic else -300
-
-            pnm_data = self.sphere_processor.process(raw, threshold=thresh)
-
+        def on_complete(pnm_data):
             self.data_manager.set_pnm_data(pnm_data)
             self.visualizer.set_data(pnm_data)
-
             counts = pnm_data.metadata
             msg = (
                 f"Model Generated Successfully (Optimized Mesh)\n\n"
@@ -139,8 +153,8 @@ class AppController:
                 f"• Throats (Connections): {counts.get('ConnectionCount')}\n"
             )
             self._show_msg("Model Generated", msg)
-        except Exception as e:
-            self._show_err("PNM Error", e)
+
+        self._run_processor_sync(self.sphere_processor, raw, thresh, on_complete)
 
     def _reset_to_original(self):
         if not self.data_manager.has_raw(): return
@@ -148,39 +162,32 @@ class AppController:
         self.visualizer.update_status("Reset to raw data.")
 
     def _export_vtk_dialog(self):
-        """
-        Delegates the export task to VTKExporter.
-        """
         data_to_save = self.visualizer.data
         if not data_to_save:
             QMessageBox.warning(self.visualizer, "Export Error", "No data loaded to export.")
             return
 
-        # 1. Determine default filename and filter
         default_name = "output.vtk"
         file_filter = "VTK Files (*.vtk *.vtp *.vti)"
 
         if data_to_save.has_mesh:
-            default_name = "pnm_model.vtp"  # PolyData preferred format
+            default_name = "pnm_model.vtp"
         elif data_to_save.raw_data is not None:
-            default_name = "volume_data.vti"  # ImageData preferred format
+            default_name = "volume_data.vti"
 
-        # 2. Open Dialog
         path, _ = QFileDialog.getSaveFileName(
             self.visualizer, "Export to VTK", default_name, file_filter
         )
 
-        if not path:
-            return
+        if not path: return
 
-        # 3. Call Exporter
         try:
             self.visualizer.update_status(f"Exporting to {path}...")
+            # For exporting, we can leave it on main thread as usually fast enough or acceptable to block
+            self.app.processEvents()
             VTKExporter.export(data_to_save, path)
-
             self.visualizer.update_status("Export successful.")
-            self._show_msg("Export Successful", f"File saved to:\n{path}\n\n(Includes 'IsPore' attribute if PNM)")
-
+            self._show_msg("Export Successful", f"File saved to:\n{path}")
         except Exception as e:
             self._show_err("Export Failed", e)
             self.visualizer.update_status("Export failed.")
@@ -197,6 +204,7 @@ class AppController:
             self._load_data(source_path)
         self.visualizer.show()
         sys.exit(self.app.exec_())
+
 
 
 if __name__ == "__main__":

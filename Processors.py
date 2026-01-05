@@ -3,7 +3,7 @@ import scipy.ndimage as ndimage
 import pyvista as pv
 from skimage.segmentation import watershed
 from skimage.feature import peak_local_max
-from typing import Tuple, Dict, Set
+from typing import Tuple, Dict, Set, Optional, Callable
 from Core import BaseProcessor, VolumeData
 
 
@@ -17,18 +17,25 @@ class PoreExtractionProcessor(BaseProcessor):
     Returns a Voxel-based VolumeData object representing "Air".
     """
 
-    def process(self, data: VolumeData, threshold: int = -300) -> VolumeData:
+    def process(self, data: VolumeData, callback: Optional[Callable[[int, str], None]] = None,
+                threshold: int = -300) -> VolumeData:
         if data.raw_data is None:
             raise ValueError("Input data must contain raw voxel data.")
 
-        print(f"[Processor] Starting pore detection (Threshold < {threshold})...")
+        def report(p, msg):
+            print(f"[Processor] {msg}")
+            if callback: callback(p, msg)
+
+        report(0, f"Starting pore detection (Threshold < {threshold})...")
 
         # 1. Binarization (Air vs Solid)
         solid_mask = data.raw_data > threshold
+        report(20, "Binarization complete. Filling holes...")
 
-        print("[Processor] Filling holes...")
+        # 2. Morphology
         filled_volume = ndimage.binary_fill_holes(solid_mask)
         pores_mask = filled_volume ^ solid_mask
+        report(50, "Morphology operations complete. Calculating stats...")
 
         # Quantitative Analysis
         pore_voxels = np.sum(pores_mask)
@@ -36,13 +43,16 @@ class PoreExtractionProcessor(BaseProcessor):
         porosity_pct = (pore_voxels / total_voxels) * 100.0
 
         # Label connected components
+        report(70, "Labeling connected components (this may take a while)...")
         labeled_array, num_features = ndimage.label(pores_mask, structure=np.ones((3, 3, 3)))
 
-        print(f"[Processor] Found {num_features} pores.")
+        report(90, f"Found {num_features} pores. Generating output volume...")
 
         # Create Output Volume (Voxel Grid)
         processed_volume = np.zeros_like(data.raw_data)
         processed_volume[pores_mask] = 1000  # Highlight Pores
+
+        report(100, "Processing complete.")
 
         return VolumeData(
             raw_data=processed_volume,
@@ -59,46 +69,79 @@ class PoreExtractionProcessor(BaseProcessor):
 class PoreToSphereProcessor(BaseProcessor):
     """
     Optimized Pore Network Modeling (PNM).
-
-    Improvements:
-    1. Direct Mesh Generation: Creates pyvista.PolyData directly (no slow rasterization).
-    2. Data Classification: Adds 'IsPore' boolean field to distinguish Pores (1) from Throats (0).
     """
 
     MIN_PEAK_DISTANCE = 6
 
-    def process(self, data: VolumeData, threshold: int = -300) -> VolumeData:
+    def __init__(self):
+        super().__init__()
+        # Simple in-memory cache
+        # Key: (data_id, threshold)
+        # Value: { 'distance_map': ..., 'labels': ..., 'num_pores': ... }
+        self._cache = {}
+
+    def process(self, data: VolumeData, callback: Optional[Callable[[int, str], None]] = None,
+                threshold: int = -300) -> VolumeData:
         if data.raw_data is None:
             raise ValueError("Input data must contain raw voxel data.")
 
-        print(f"[PNM] Starting Mesh Extraction (Threshold > {threshold})...")
+        def report(p, msg):
+            print(f"[PNM] {msg}")
+            if callback: callback(p, msg)
 
-        # --- Step 1: Segmentation (Same as Extraction) ---
-        solid_mask = data.raw_data > threshold
-        filled_mask = ndimage.binary_fill_holes(solid_mask)
-        pores_mask = filled_mask ^ solid_mask
+        # Generate a semi-unique ID for the input data to allow caching
+        # We use memory address + shape + sum (cheap-ish hash) or just object ID if we assume immutability logic
+        # For safety in this demo, we'll use object ID + threshold
+        cache_key = (id(data.raw_data), threshold)
+        cached_result = self._cache.get(cache_key)
 
-        if np.sum(pores_mask) == 0:
-            return self._create_empty_result(data)
+        if cached_result:
+            report(10, "Cache Hit! Reusing segmentation results...")
+            distance_map = cached_result['distance_map']
+            segmented_regions = cached_result['labels']
+            num_pores = cached_result['num_pores']
+            
+            # Skip to mesh generation
+            report(80, "Skipped segmentation. Generating optimized mesh...")
+        else:
+            report(0, f"Starting PNM Extraction (Threshold > {threshold})...")
+            
+            # --- Step 1: Segmentation ---
+            solid_mask = data.raw_data > threshold
+            filled_mask = ndimage.binary_fill_holes(solid_mask)
+            pores_mask = filled_mask ^ solid_mask
+    
+            report(20, "Segmentation complete. Calculating distance map...")
+    
+            if np.sum(pores_mask) == 0:
+                return self._create_empty_result(data)
+    
+            # --- Step 2: Watershed Analysis ---
+            distance_map = ndimage.distance_transform_edt(pores_mask)
+            report(40, "Distance map computed. Finding local maxima...")
+    
+            local_maxi = peak_local_max(
+                distance_map,
+                labels=pores_mask,
+                min_distance=self.MIN_PEAK_DISTANCE
+            )
+    
+            markers = np.zeros_like(distance_map, dtype=int)
+            markers[tuple(local_maxi.T)] = np.arange(len(local_maxi)) + 1
+    
+            report(60, "Running Watershed segmentation...")
+            segmented_regions = watershed(-distance_map, markers, mask=pores_mask)
+            num_pores = np.max(segmented_regions)
+            
+            # Save to Cache
+            self._cache[cache_key] = {
+                'distance_map': distance_map,
+                'labels': segmented_regions,
+                'num_pores': num_pores
+            }
 
-        # --- Step 2: Watershed Analysis ---
-        print("[PNM] Computing Distance Map & Watershed...")
-        distance_map = ndimage.distance_transform_edt(pores_mask)
-
-        local_maxi = peak_local_max(
-            distance_map,
-            labels=pores_mask,
-            min_distance=self.MIN_PEAK_DISTANCE
-        )
-
-        markers = np.zeros_like(distance_map, dtype=int)
-        markers[tuple(local_maxi.T)] = np.arange(len(local_maxi)) + 1
-
-        segmented_regions = watershed(-distance_map, markers, mask=pores_mask)
-        num_pores = np.max(segmented_regions)
-
-        # --- Step 3: Mesh Generation (Optimization) ---
-        print("[PNM] Generating optimized mesh structures...")
+        # --- Step 3: Mesh Generation ---
+        report(80, "Generating optimized mesh structures (Spheres & Tubes)...")
 
         # A. Nodes (Pores) -> Spheres
         pore_centers, pore_radii, pore_ids = self._extract_pore_data(segmented_regions, num_pores, data.spacing,
@@ -108,24 +151,24 @@ class PoreToSphereProcessor(BaseProcessor):
         if len(pore_centers) > 0:
             pore_cloud = pv.PolyData(pore_centers)
             pore_cloud["radius"] = pore_radii
-            # IsPore = 1 (True)
             pore_cloud["IsPore"] = np.ones(len(pore_centers), dtype=int)
             pore_cloud["ID"] = pore_ids
 
-            # Efficient Glyphing: Scale a unit sphere by the radius array
             sphere_glyph = pv.Sphere(theta_resolution=10, phi_resolution=10)
             pores_mesh = pore_cloud.glyph(scale="radius", geom=sphere_glyph)
         else:
             pores_mesh = pv.PolyData()
 
         # B. Edges (Throats) -> Tubes
+        report(90, "Connecting pores...")
         connections = self._find_adjacency(segmented_regions)
         throats_mesh = self._create_throat_mesh(connections, pore_centers, pore_radii, pore_ids)
 
         # --- Step 4: Combine ---
-        print("[PNM] Merging geometry...")
-        # Combine Pores and Throats into one mesh
+        report(95, "Merging geometry...")
         combined_mesh = pores_mesh.merge(throats_mesh)
+
+        report(100, "PNM Generation Complete.")
 
         return VolumeData(
             raw_data=None,  # No Voxel data in this result, purely Mesh
@@ -229,8 +272,6 @@ class PoreToSphereProcessor(BaseProcessor):
 
         # Merge all tubes
         throats = lines[0].merge(lines[1:]) if len(lines) > 1 else lines[0]
-
-        # IsPore = 0 (False) -> This is a Throat
         throats["IsPore"] = np.zeros(throats.n_points, dtype=int)
 
         return throats
