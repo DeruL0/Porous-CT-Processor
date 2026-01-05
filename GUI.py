@@ -20,11 +20,15 @@ class StatisticsPanel(QWidget):
     
     def __init__(self):
         super().__init__()
-        self.setMaximumHeight(400)
+        # Removed: self.setMaximumHeight(400) - allow free resizing
         self._init_ui()
         
     def _init_ui(self):
+        from PyQt5.QtWidgets import QSplitter, QWidget
+
+        # Use VBoxLayout
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
         
         # Title
         title = QLabel("Statistics & Analysis")
@@ -32,21 +36,33 @@ class StatisticsPanel(QWidget):
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
         
+        # Create Splitter for resizing
+        splitter = QSplitter(Qt.Vertical)
+        
         # Matplotlib Figure for Histogram
         self.figure = Figure(figsize=(5, 3), dpi=80)
         self.canvas = FigureCanvas(self.figure)
-        self.canvas.setMinimumHeight(200)
-        layout.addWidget(self.canvas)
+        # Removed fixed height constraint
+        self.canvas.setMinimumHeight(100) 
+        splitter.addWidget(self.canvas)
         
         # Statistics Table
         self.stats_table = QTableWidget()
-        self.stats_table.setMaximumHeight(120)
+        # Removed fixed height constraint
         self.stats_table.setColumnCount(2)
         self.stats_table.setHorizontalHeaderLabels(["Metric", "Value"])
         self.stats_table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self.stats_table)
+        # Enable selection + copy support (standard behaviors)
+        self.stats_table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.stats_table.setEditTriggers(QTableWidget.NoEditTriggers)
         
-        layout.addStretch()
+        splitter.addWidget(self.stats_table)
+        
+        # Set initial sizes (prioritize chart)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
+        
+        layout.addWidget(splitter)
         
     def update_statistics(self, metadata):
         """Update the panel with new statistics from VolumeData metadata."""
@@ -120,54 +136,168 @@ class Separator(QFrame):
 
 
 class InfoPanel(QGroupBox):
-    """Panel to display sample metadata and statistics"""
+    """Enhanced panel to display sample metadata and computed statistics."""
 
-    def __init__(self, title: str = "Sample Information"):
+    def __init__(self, title: str = "📊 Sample Information"):
         super().__init__(title)
         self._init_ui()
 
     def _init_ui(self):
-        layout = QVBoxLayout()
-        self.lbl_type = QLabel("Type: No data loaded")
-        self.lbl_dim = QLabel("Grid: N/A")
-        self.lbl_spacing = QLabel("Voxel Size: N/A")
-        self.lbl_meta = QLabel("Sample Data: N/A")
+        from PyQt5.QtWidgets import QSplitter, QWidget
 
-        for lbl in [self.lbl_type, self.lbl_dim, self.lbl_spacing, self.lbl_meta]:
-            lbl.setWordWrap(True)
-            layout.addWidget(lbl)
-
-        self.setLayout(layout)
+        # Use VBoxLayout for the GroupBox
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(4, 10, 4, 4)
+        
+        # Create Splitter for resizing
+        splitter = QSplitter(Qt.Vertical)
+        
+        # --- Top Section: Basic Info ---
+        self.info_table = QTableWidget()
+        self.info_table.setColumnCount(2)
+        self.info_table.setHorizontalHeaderLabels(["Property", "Value"])
+        self.info_table.horizontalHeader().setStretchLastSection(True)
+        self.info_table.verticalHeader().setVisible(False)
+        self.info_table.setAlternatingRowColors(True)
+        self.info_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.info_table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.info_table.setStyleSheet("""
+            QTableWidget {
+                background-color: transparent;
+                gridline-color: #555555;
+                font-size: 15px;
+            }
+            QTableWidget::item {
+                padding: 6px;
+            }
+            QHeaderView::section {
+                background-color: transparent;
+                font-weight: bold;
+                padding: 8px;
+                border-bottom: 1px solid #666666;
+                font-size: 15px;
+            }
+        """)
+        splitter.addWidget(self.info_table)
+        
+        # --- Bottom Section: Computed Metrics ---
+        bottom_widget = QWidget()
+        bottom_layout = QVBoxLayout(bottom_widget)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.computed_label = QLabel("<b>Computed Metrics</b>")
+        self.computed_label.setStyleSheet("font-size: 15px; margin-top: 5px;")
+        bottom_layout.addWidget(self.computed_label)
+        
+        self.computed_table = QTableWidget()
+        self.computed_table.setColumnCount(2)
+        self.computed_table.setHorizontalHeaderLabels(["Metric", "Value"])
+        self.computed_table.horizontalHeader().setStretchLastSection(True)
+        self.computed_table.verticalHeader().setVisible(False)
+        self.computed_table.setAlternatingRowColors(True)
+        self.computed_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.computed_table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.computed_table.setStyleSheet("""
+            QTableWidget {
+                background-color: transparent;
+                gridline-color: #555555;
+                font-size: 15px;
+            }
+            QTableWidget::item {
+                padding: 6px;
+            }
+            QHeaderView::section {
+                background-color: transparent;
+                font-weight: bold;
+                padding: 8px;
+                border-bottom: 1px solid #666666;
+                font-size: 15px;
+            }
+        """)
+        bottom_layout.addWidget(self.computed_table)
+        
+        splitter.addWidget(bottom_widget)
+        
+        # Set initial sizes for splitter (e.g., 50/50 starting point, or prioritized)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        
+        main_layout.addWidget(splitter)
+        self.setLayout(main_layout)
 
     def update_info(self, type_str: str, dim: tuple, spacing: tuple, metadata: dict):
-        """Update labels with new data"""
-        self.lbl_type.setText(f"Type: {type_str}")
-
-        if dim == (0, 0, 0) and 'MeshPoints' in metadata:
-            self.lbl_dim.setText(f"Mesh Points: {metadata['MeshPoints']}")
-        else:
-            self.lbl_dim.setText(f"Grid: {dim}")
-
-        self.lbl_spacing.setText(f"Voxel Size: ({spacing[0]:.2f}, {spacing[1]:.2f}, {spacing[2]:.2f}) mm")
-
-        # Intelligent Metadata Display
-        # Prioritize Quantitative Analysis Keys
-        priority_keys = ['Porosity', 'PoreCount', 'ConnectionCount', 'SampleID', 'MeshPoints']
-        display_items = []
-
-        # 1. Add priority items first
-        for k in priority_keys:
-            if k in metadata:
-                display_items.append(f"{k}: {metadata[k]}")
-
-        # 2. Add other items until we hit limit
-        for k, v in metadata.items():
-            if k not in priority_keys and k != 'Type':
-                display_items.append(f"{k}: {v}")
-
-        # Show top 5 items
-        meta_str = "\n".join(display_items[:6])
-        self.lbl_meta.setText(f"Sample Data:\n{meta_str}" if meta_str else "Sample Data: None")
+        """Update with new data including computed scientific metrics."""
+        # Clear tables
+        self.info_table.setRowCount(0)
+        self.computed_table.setRowCount(0)
+        
+        # === Basic Info ===
+        basic_data = [
+            ("📁 Data Type", type_str),
+        ]
+        
+        if dim != (0, 0, 0):
+            basic_data.append(("📐 Dimensions", f"{dim[0]} × {dim[1]} × {dim[2]}"))
+        elif 'MeshPoints' in metadata:
+            basic_data.append(("🔷 Mesh Points", str(metadata['MeshPoints'])))
+        
+        basic_data.append(("📏 Voxel Size", f"{spacing[0]:.3f} × {spacing[1]:.3f} × {spacing[2]:.3f} mm"))
+        
+        # Add priority metadata
+        priority_keys = ['Porosity', 'PoreCount', 'ConnectionCount']
+        icons = {'Porosity': '💨', 'PoreCount': '🔴', 'ConnectionCount': '🔗'}
+        for key in priority_keys:
+            if key in metadata:
+                icon = icons.get(key, '•')
+                val = metadata[key]
+                if isinstance(val, float):
+                    val = f"{val:.2f}%"
+                basic_data.append((f"{icon} {key}", str(val)))
+        
+        self.info_table.setRowCount(len(basic_data))
+        for row, (prop, val) in enumerate(basic_data):
+            self.info_table.setItem(row, 0, QTableWidgetItem(prop))
+            self.info_table.setItem(row, 1, QTableWidgetItem(val))
+        
+        # === Computed Metrics ===
+        computed = []
+        
+        if dim != (0, 0, 0):
+            # Total voxels
+            total_voxels = dim[0] * dim[1] * dim[2]
+            computed.append(("Total Voxels", f"{total_voxels:,}"))
+            
+            # Physical volume (mm³)
+            phys_volume = dim[0] * spacing[0] * dim[1] * spacing[1] * dim[2] * spacing[2]
+            if phys_volume > 1000:
+                computed.append(("Physical Volume", f"{phys_volume/1000:.2f} cm³"))
+            else:
+                computed.append(("Physical Volume", f"{phys_volume:.2f} mm³"))
+            
+            # Physical dimensions
+            phys_dim = (dim[0] * spacing[0], dim[1] * spacing[1], dim[2] * spacing[2])
+            computed.append(("Physical Size", f"{phys_dim[0]:.1f} × {phys_dim[1]:.1f} × {phys_dim[2]:.1f} mm"))
+            
+            # Memory estimate (assuming float32)
+            mem_mb = (total_voxels * 4) / (1024 * 1024)
+            computed.append(("Memory (Est.)", f"{mem_mb:.1f} MB"))
+        
+        # Add throat stats if available
+        if 'ThroatStats' in metadata:
+            ts = metadata['ThroatStats']
+            if 'mean' in ts:
+                computed.append(("Avg Throat Radius", f"{ts['mean']:.3f} mm"))
+            if 'min' in ts and 'max' in ts:
+                computed.append(("Throat Range", f"{ts['min']:.3f} - {ts['max']:.3f} mm"))
+        
+        # Largest pore ratio
+        if 'LargestPoreRatio' in metadata:
+            computed.append(("Largest Pore %", str(metadata['LargestPoreRatio'])))
+        
+        self.computed_table.setRowCount(len(computed))
+        for row, (metric, val) in enumerate(computed):
+            self.computed_table.setItem(row, 0, QTableWidgetItem(metric))
+            self.computed_table.setItem(row, 1, QTableWidgetItem(val))
 
 
 class StructureProcessingPanel(QGroupBox):

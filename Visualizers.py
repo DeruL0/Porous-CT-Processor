@@ -57,13 +57,19 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         self.update_timer.timeout.connect(self._perform_delayed_render)
 
     def _init_ui(self):
+        from PyQt5.QtWidgets import QSplitter
+        
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
-        main_layout = QHBoxLayout(main_widget)
+        main_layout = QVBoxLayout(main_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Main horizontal splitter for resizable panels
+        self.main_splitter = QSplitter(Qt.Horizontal)
 
         # Left Panel (Controls) - with scroll area
         left_scroll = self._create_scrollable_panel()
-        main_layout.addWidget(left_scroll, stretch=1)
+        self.main_splitter.addWidget(left_scroll)
 
         # Center Panel (3D Canvas)
         self.plotter = BackgroundPlotter(
@@ -71,11 +77,18 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
             show=False,
             title="3D Structure Viewer"
         )
-        main_layout.addWidget(self.plotter.app_window, stretch=3)
+        self.main_splitter.addWidget(self.plotter.app_window)
         
         # Right Panel (Info & Statistics) - with scroll area
         right_scroll = self._create_info_panel()
-        main_layout.addWidget(right_scroll, stretch=1)
+        self.main_splitter.addWidget(right_scroll)
+        
+        # Set initial sizes (left:center:right = 1:3:1)
+        self.main_splitter.setStretchFactor(0, 1)
+        self.main_splitter.setStretchFactor(1, 3)
+        self.main_splitter.setStretchFactor(2, 1)
+        
+        main_layout.addWidget(self.main_splitter)
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -87,7 +100,7 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setMaximumWidth(400)
+        # Removed: setMaximumWidth - allow splitter resizing
         
         panel = QWidget()
         self.control_panel_layout = QVBoxLayout(panel)
@@ -156,26 +169,29 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
     
     def _create_info_panel(self) -> QWidget:
         """Create right info/statistics panel with scroll support."""
-        from PyQt5.QtWidgets import QScrollArea
+        from PyQt5.QtWidgets import QScrollArea, QSplitter
         
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setMaximumWidth(400)
+        # Removed: setMaximumWidth - allow splitter resizing
         
         panel = QWidget()
         layout = QVBoxLayout(panel)
-        layout.setSpacing(10)
+        layout.setContentsMargins(4, 4, 4, 4)
         
         title = QLabel("Information")
         title.setFont(QFont("Arial", 16, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
-        layout.addWidget(self._create_separator())
+        
+        # Create Splitter for resizing
+        self.right_splitter = QSplitter(Qt.Vertical)
         
         self.info_panel = InfoPanel()
-        layout.addWidget(self.info_panel)
+        self.right_splitter.addWidget(self.info_panel)
         
-        layout.addStretch()
+        # Add splitter to layout
+        layout.addWidget(self.right_splitter)
         
         scroll_area.setWidget(panel)
         return scroll_area
@@ -186,21 +202,25 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         
         Args:
             panel: Widget to add
-            index: Position index in the layout
+            index: Position index in the layout (ignored for right side splitter)
             side: 'left' for control panel, 'right' for info panel
         """
         if side == 'left' and hasattr(self, 'control_panel_layout'):
             self.control_panel_layout.insertWidget(index, panel)
         elif side == 'right':
-            # Find the right panel's layout
-            # The right scroll area's widget's layout
-            right_scroll = self.centralWidget().layout().itemAt(2).widget()  # Third item is right panel
-            if isinstance(right_scroll, QScrollArea):
-                right_widget = right_scroll.widget()
-                if right_widget:
-                    right_layout = right_widget.layout()
-                    # Insert before the final stretch
-                    right_layout.insertWidget(right_layout.count() - 1, panel)
+            # Add to the right splitter if available
+            if hasattr(self, 'right_splitter'):
+                self.right_splitter.addWidget(panel)
+                # Ensure reasonable initial sizing (50/50)
+                self.right_splitter.setStretchFactor(0, 1)
+                self.right_splitter.setStretchFactor(1, 1)
+            else:
+                # Fallback to old method
+                right_scroll = self.centralWidget().layout().itemAt(2).widget()
+                if isinstance(right_scroll, QScrollArea):
+                    right_widget = right_scroll.widget()
+                    if right_widget:
+                        right_widget.layout().addWidget(panel)
 
     def _create_separator(self):
         line = QFrame()
