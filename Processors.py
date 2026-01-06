@@ -3,8 +3,29 @@ import scipy.ndimage as ndimage
 import pyvista as pv
 from skimage.segmentation import watershed
 from skimage.feature import peak_local_max
+from skimage.filters import threshold_otsu
 from typing import Tuple, Dict, Set, Optional, Callable
 from core import BaseProcessor, VolumeData
+
+# Optional high-performance libraries
+try:
+    from numba import jit, prange
+    NUMBA_AVAILABLE = True
+except ImportError:
+    from skimage.filters import threshold_otsu
+    NUMBA_AVAILABLE = False
+    # Fallback decorator that does nothing
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    prange = range
+
+try:
+    from joblib import Parallel, delayed
+    JOBLIB_AVAILABLE = True
+except ImportError:
+    JOBLIB_AVAILABLE = False
 
 
 # ==========================================
@@ -16,6 +37,27 @@ class PoreExtractionProcessor(BaseProcessor):
     Segments the void space (pores) from the solid matrix.
     Returns a Voxel-based VolumeData object representing "Air".
     """
+
+    @staticmethod
+    def suggest_threshold(data: VolumeData) -> int:
+        """
+        Calculate optimal threshold using Otsu's method.
+        """
+        if data.raw_data is None:
+            return -300
+        
+        # Otsu expects clean data, handling NaN/Inf
+        clean_data = data.raw_data[np.isfinite(data.raw_data)]
+        if clean_data.size == 0:
+            return -300
+            
+        try:
+            # Calculate Otsu threshold
+            thresh = threshold_otsu(clean_data)
+            return int(thresh)
+        except Exception as e:
+            print(f"Otsu failed: {e}")
+            return -300
 
     def process(self, data: VolumeData, callback: Optional[Callable[[int, str], None]] = None,
                 threshold: int = -300) -> VolumeData:
@@ -259,9 +301,7 @@ class PoreToSphereProcessor(BaseProcessor):
         )
 
     def _extract_pore_data(self, regions, num_pores, spacing, origin):
-        """Extracts centroids and radii for mesh generation (PARALLELIZED)."""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
+        """Extracts centroids and radii for mesh generation (PARALLELIZED with joblib)."""
         slices = ndimage.find_objects(regions)
         sx, sy, sz = spacing
         ox, oy, oz = origin
@@ -279,7 +319,7 @@ class PoreToSphereProcessor(BaseProcessor):
             if voxel_count == 0:
                 return None
 
-            # Equivalent radius
+            # Equivalent radius (sphere)
             r_vox = (3 * voxel_count / (4 * np.pi)) ** (1 / 3)
             radius = r_vox * avg_spacing
 
@@ -292,16 +332,26 @@ class PoreToSphereProcessor(BaseProcessor):
 
             return (label_idx, [cx, cy, cz], radius)
 
-        # Parallel execution
-        results = []
-        max_workers = min(8, num_pores)  # Limit threads to avoid overhead
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(process_single_pore, i): i for i in range(num_pores)}
-            for future in as_completed(futures):
-                result = future.result()
-                if result is not None:
-                    results.append(result)
+        # Choose parallelization strategy
+        if JOBLIB_AVAILABLE and num_pores > 10:
+            # Joblib with process-based backend for better CPU utilization
+            n_jobs = min(-1, num_pores)  # -1 uses all cores
+            results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(process_single_pore)(i) for i in range(num_pores)
+            )
+            results = [r for r in results if r is not None]
+        else:
+            # Fallback to ThreadPoolExecutor
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            results = []
+            max_workers = min(8, num_pores)
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(process_single_pore, i): i for i in range(num_pores)}
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result is not None:
+                        results.append(result)
 
         # Sort by ID to maintain order
         results.sort(key=lambda x: x[0])
@@ -337,35 +387,48 @@ class PoreToSphereProcessor(BaseProcessor):
         return adjacency
 
     def _create_throat_mesh(self, connections, centers, radii, ids_list):
-        """Creates tubes connecting the pores. Returns (mesh, throat_radii_list)."""
+        """Creates tubes connecting the pores (PARALLELIZED). Returns (mesh, throat_radii_list)."""
         if not connections:
             return pv.PolyData(), np.array([])
 
         # Map ID to Index in 'centers' array
         id_map = {uid: idx for idx, uid in enumerate(ids_list)}
 
-        lines = []
-        throat_radii = []
-
+        # Pre-compute valid connections and throat radii
+        valid_connections = []
         for id_a, id_b in connections:
             if id_a in id_map and id_b in id_map:
                 idx_a = id_map[id_a]
                 idx_b = id_map[id_b]
-
                 p1 = centers[idx_a]
                 p2 = centers[idx_b]
-
-                # Estimate throat radius (smaller than pores)
                 r_throat = min(radii[idx_a], radii[idx_b]) * 0.3
-                throat_radii.append(r_throat)
+                valid_connections.append((p1, p2, r_throat))
 
-                # Create a single tube
-                line = pv.Line(p1, p2)
-                tube = line.tube(radius=r_throat)
-                lines.append(tube)
-
-        if not lines:
+        if not valid_connections:
             return pv.PolyData(), np.array([])
+
+        def create_single_tube(conn):
+            """Create a single tube - parallelizable operation."""
+            p1, p2, r_throat = conn
+            line = pv.Line(p1, p2)
+            return line.tube(radius=r_throat), r_throat
+
+        # Parallel tube generation
+        if JOBLIB_AVAILABLE and len(valid_connections) > 20:
+            results = Parallel(n_jobs=-1, prefer="threads")(
+                delayed(create_single_tube)(conn) for conn in valid_connections
+            )
+            lines = [r[0] for r in results]
+            throat_radii = [r[1] for r in results]
+        else:
+            # Sequential fallback
+            lines = []
+            throat_radii = []
+            for conn in valid_connections:
+                tube, r_throat = create_single_tube(conn)
+                lines.append(tube)
+                throat_radii.append(r_throat)
 
         # Merge all tubes
         throats = lines[0].merge(lines[1:]) if len(lines) > 1 else lines[0]

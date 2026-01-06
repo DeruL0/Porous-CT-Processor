@@ -88,6 +88,7 @@ class AppController:
         self.panel.pnm_clicked.connect(self._process_spheres)
         self.panel.reset_clicked.connect(self._reset_to_original)
         self.panel.export_clicked.connect(self._export_vtk_dialog)
+        self.panel.auto_threshold_clicked.connect(self._auto_detect_threshold)
 
         # Add to left side (controls)
         self.visualizer.add_custom_panel(self.panel, index=1, side='left')
@@ -95,6 +96,26 @@ class AppController:
         # Add Statistics Panel to right side (info)
         self.stats_panel = StatisticsPanel()
         self.visualizer.add_custom_panel(self.stats_panel, index=1, side='right')
+        
+    def _auto_detect_threshold(self):
+        """Calculate and set optimal threshold using Otsu's method."""
+        current_data = self.data_manager.active_data
+        if current_data is None or current_data.raw_data is None:
+             QMessageBox.warning(self.visualizer, "No Data", "Please load a sample first.")
+             return
+            
+        self.visualizer.update_status("Calculating optimal threshold (Otsu)...")
+        self.app.processEvents()
+        
+        try:
+            # Use static method from processor
+            suggested = PoreExtractionProcessor.suggest_threshold(current_data)
+            self.panel.set_threshold(suggested)
+            
+            self.visualizer.update_status(f"Threshold set to {suggested} HU (Otsu)")
+            self._show_msg("Auto Threshold", f"Optimal threshold calculated: {suggested} HU\n\nMethod: Otsu's Binarization")
+        except Exception as e:
+            self._show_err("Auto Threshold Failed", e)
 
     # ==========================================
     # Logic Implementation (Slots)
@@ -109,35 +130,78 @@ class AppController:
         if folder: self._load_data(folder, fast=True)
 
     def _load_dummy_data(self):
+        # Create Progress Dialog
+        progress = QProgressDialog("Generating synthetic sample...", "Cancel", 0, 100, self.visualizer)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        def progress_callback(percent, message):
+            progress.setValue(percent)
+            progress.setLabelText(message)
+            self.app.processEvents()
+            # Check cancellation (simple check)
+            if progress.wasCanceled():
+                raise InterruptedError("Loading cancelled by user.")
+
         try:
-            self.visualizer.update_status("Generating synthetic sample (Sync)...")
-            self.app.processEvents() # Force UI update before blocking
+            self.visualizer.update_status("Generating synthetic sample...")
             
             self.loader = DummyLoader()
-            data = self.loader.load(128)
+            # Pass callback to loader
+            data = self.loader.load(128, callback=progress_callback)
 
             self.data_manager.load_raw_data(data)
             self.visualizer.set_data(data)
+            
+            # Set default threshold for synthetic data
+            self.panel.set_threshold(500)
+            
             self._show_msg("Sample Loaded", "Synthetic sample ready.")
             self.visualizer.update_status("Ready.")
+        except InterruptedError:
+            self.visualizer.update_status("Loading cancelled.")
         except Exception as e:
             self._show_err("Loading Error", e)
+        finally:
+            progress.close()
 
     def _load_data(self, folder_path, fast=False):
-        try:
-            self.visualizer.update_status("Loading scan data (Sync)...")
+        # Create Progress Dialog
+        progress = QProgressDialog("Loading scan data...", "Cancel", 0, 100, self.visualizer)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        def progress_callback(percent, message):
+            progress.setValue(percent)
+            progress.setLabelText(message)
             self.app.processEvents()
+            if progress.wasCanceled():
+                raise InterruptedError("Loading cancelled by user.")
+
+        try:
+            self.visualizer.update_status("Loading scan data...")
             
             self.loader = FastDicomLoader(step=2) if fast else DicomSeriesLoader()
-            data = self.loader.load(folder_path)
+            # Pass callback to loader
+            data = self.loader.load(folder_path, callback=progress_callback)
 
             self.data_manager.load_raw_data(data)
             self.visualizer.set_data(data)
+            
+            # Set default threshold for CT data (Air)
+            self.panel.set_threshold(-300)
+            
             self._show_msg("Scan Loaded",
                            f"Loaded successfully.\nMode: {'Fast' if fast else 'Standard'}")
             self.visualizer.update_status("Ready.")
+        except InterruptedError:
+            self.visualizer.update_status("Loading cancelled.")
         except Exception as e:
             self._show_err("Loading Error", e)
+        finally:
+            progress.close()
 
     def _run_processor_async(self, processor, data, threshold, success_callback):
         """Run processor in background thread with progress dialog."""
@@ -184,8 +248,8 @@ class AppController:
             QMessageBox.warning(self.visualizer, "No Data", "Please load a sample first.")
             return
 
-        is_synthetic = "Synthetic" in current_data.metadata.get("Type", "") or "ROI" in current_data.metadata.get("Type", "")
-        thresh = 500 if is_synthetic else -300
+        # Get threshold from UI
+        thresh = self.panel.get_threshold()
 
         def on_complete(segmented):
             self.data_manager.set_segmented_data(segmented)
@@ -207,8 +271,8 @@ class AppController:
             QMessageBox.warning(self.visualizer, "No Data", "Please load a sample first.")
             return
 
-        is_synthetic = "Synthetic" in current_data.metadata.get("Type", "") or "ROI" in current_data.metadata.get("Type", "")
-        thresh = 500 if is_synthetic else -300
+        # Get threshold from UI
+        thresh = self.panel.get_threshold()
 
         def on_complete(pnm_data):
             self.data_manager.set_pnm_data(pnm_data)

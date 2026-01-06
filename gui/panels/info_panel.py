@@ -48,6 +48,7 @@ class StatisticsPanel(QWidget):
         self.stats_table.setColumnCount(2)
         self.stats_table.setHorizontalHeaderLabels(["Metric", "Value"])
         self.stats_table.horizontalHeader().setStretchLastSection(True)
+        self.stats_table.verticalHeader().setVisible(False)
         self.stats_table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.stats_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.stats_table.setStyleSheet("""
@@ -99,16 +100,16 @@ class StatisticsPanel(QWidget):
 
         # Stats table
         stats_data = [
-            ("Total Pores", str(pore_count)),
-            ("Connections", str(connection_count)),
-            ("Largest Pore %", str(largest_pore)),
+            ("🔴 Total Pores", str(pore_count)),
+            ("🔗 Connections", str(connection_count)),
+            ("👑 Largest Pore %", str(largest_pore)),
         ]
 
         if throat_stats:
             stats_data.extend([
-                ("Throat Min (mm)", f"{throat_stats.get('min', 0):.3f}"),
-                ("Throat Max (mm)", f"{throat_stats.get('max', 0):.3f}"),
-                ("Throat Mean (mm)", f"{throat_stats.get('mean', 0):.3f}"),
+                ("📉 Throat Min", f"{throat_stats.get('min', 0):.3f} mm"),
+                ("📈 Throat Max", f"{throat_stats.get('max', 0):.3f} mm"),
+                ("⚖️ Throat Mean", f"{throat_stats.get('mean', 0):.3f} mm"),
             ])
 
         self.stats_table.setRowCount(len(stats_data))

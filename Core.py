@@ -44,7 +44,7 @@ class BaseLoader(ABC):
     """Abstract base class for data acquisition strategies."""
 
     @abstractmethod
-    def load(self, source: str) -> VolumeData:
+    def load(self, source: str, callback: Optional[Callable[[int, str], None]] = None) -> VolumeData:
         """
         Load data from a source path.
         

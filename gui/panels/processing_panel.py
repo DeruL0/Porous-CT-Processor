@@ -2,7 +2,7 @@
 Structure Processing Panel for workflow actions.
 """
 
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton, QLabel, QGroupBox
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton, QLabel, QGroupBox, QSpinBox, QHBoxLayout
 from PyQt5.QtCore import pyqtSignal
 
 from gui.styles import PANEL_TITLE_STYLE
@@ -17,6 +17,7 @@ class StructureProcessingPanel(QGroupBox):
     fast_load_clicked = pyqtSignal()
     dummy_clicked = pyqtSignal()
     extract_pores_clicked = pyqtSignal()
+    auto_threshold_clicked = pyqtSignal()
     pnm_clicked = pyqtSignal()
     reset_clicked = pyqtSignal()
     export_clicked = pyqtSignal()
@@ -40,6 +41,26 @@ class StructureProcessingPanel(QGroupBox):
         
         # Processing Section
         layout.addSpacing(10)
+        
+        # Threshold Input
+        thresh_layout = QHBoxLayout()
+        thresh_lbl = QLabel("Threshold (HU):")
+        self.threshold_spin = QSpinBox()
+        self.threshold_spin.setRange(-10000, 30000)
+        self.threshold_spin.setValue(-300)  # Default for air
+        self.threshold_spin.setSingleStep(50)
+        
+        # Auto Button
+        auto_btn = QPushButton("Auto")
+        auto_btn.setFixedWidth(50)
+        auto_btn.setToolTip("Auto-detect using Otsu's method")
+        auto_btn.clicked.connect(self.auto_threshold_clicked.emit)
+        
+        thresh_layout.addWidget(thresh_lbl)
+        thresh_layout.addWidget(self.threshold_spin)
+        thresh_layout.addWidget(auto_btn)
+        layout.addLayout(thresh_layout)
+        
         self._add_button(layout, "🔬 Extract Pores", self.extract_pores_clicked)
         self._add_button(layout, "🌐 Generate PNM Model", self.pnm_clicked)
         
@@ -55,3 +76,9 @@ class StructureProcessingPanel(QGroupBox):
         btn.setMinimumHeight(min_height)
         btn.clicked.connect(signal.emit)
         layout.addWidget(btn)
+
+    def get_threshold(self) -> int:
+        return self.threshold_spin.value()
+
+    def set_threshold(self, value: int):
+        self.threshold_spin.setValue(value)

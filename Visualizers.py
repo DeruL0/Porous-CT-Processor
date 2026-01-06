@@ -61,6 +61,9 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
         self.update_timer.setInterval(100)  # Debounce for expensive ops
         self.update_timer.setSingleShot(True)
         self.update_timer.timeout.connect(self._perform_delayed_render)
+        
+        # Setup interaction
+        self._setup_mouse_probe()
 
     def _init_ui(self):
         from PyQt5.QtWidgets import QSplitter
@@ -838,7 +841,91 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
             light_pos = [10 * math.cos(rad), 10 * math.sin(rad), 10]
             self.plotter.remove_all_lights()
             self.plotter.add_light(pv.Light(position=light_pos, intensity=1.0))
-            self.update_status("Error generating isosurface.")
+
+    # ==========================================
+    # Interactive Probe Logic
+    # ==========================================
+
+    def _setup_mouse_probe(self):
+        """Setup mouse probing to display values on hover."""
+        # Using observer pattern on the Interactor
+        # This is safe because BackgroundPlotter initializes iren
+        self.plotter.iren.add_observer("MouseMoveEvent", self._on_mouse_move)
+
+    def _on_mouse_move(self, obj, event):
+        """
+        Handle mouse move to probe data values.
+        Active only in Orthogonal Slices mode.
+        """
+        if self.data is None or self.active_view_mode != 'slices':
+            return
+            
+        try:
+            # 1. Get Mouse Position in Display Coords
+            # Use 'obj' (the interactor) directly. 
+            # Try VTK style first, then PyVista snake_case
+            if hasattr(obj, "GetEventPosition"):
+                pos = obj.GetEventPosition()
+            elif hasattr(obj, "get_event_position"):
+                pos = obj.get_event_position()
+            else:
+                # Fallback to plotter.iren if obj is unexpected
+                pos = self.plotter.iren.GetEventPosition()
+            
+            # 2. Pick using the plotter's default picker logic
+            # Use vtkPointPicker for precise coordinate on the plane
+            import vtk
+            picker = vtk.vtkPointPicker()
+            picker.Pick(pos[0], pos[1], 0, self.plotter.renderer)
+            
+            world_pos = picker.GetPickPosition()
+            
+            # Check if we hit a valid actor
+            if picker.GetViewProp() is None:
+                return
+
+            if self.data.raw_data is None:
+                return
+
+            # 3. Convert World Coords -> Voxel Indices
+            ox, oy, oz = self.data.origin
+            sx, sy, sz = self.data.spacing
+            
+            # Grid Space Indices
+            ix = int(round((world_pos[0] - ox) / sx))
+            iy = int(round((world_pos[1] - oy) / sy))
+            iz = int(round((world_pos[2] - oz) / sz))
+            
+            # Map valid logic:
+            # Note: The mapping depends on how ImageData was created.
+            # in _create_pyvista_grid: dimensions = shape + 1. 
+            # PyVista (VTK) treats:
+            #   Axis 0 (X) -> matches raw_data axis 0 (Z) due to F-order flatten?
+            #   No, let's re-verify axis mapping based on _extract_roi_subvolume fix.
+            #   _extract_roi_subvolume said:
+            #   PyVista X -> numpy axis 0
+            #   PyVista Y -> numpy axis 1
+            #   PyVista Z -> numpy axis 2
+            
+            raw_z = ix
+            raw_y = iy
+            raw_x = iz
+            
+            shape = self.data.raw_data.shape # (Z, Y, X)
+            
+            val = 0.0
+            
+            # Boundary check
+            if (0 <= raw_z < shape[0]) and (0 <= raw_y < shape[1]) and (0 <= raw_x < shape[2]):
+                 val = self.data.raw_data[raw_z, raw_y, raw_x]
+                 self.status_bar.showMessage(f"📍 Pos: ({world_pos[0]:.1f}, {world_pos[1]:.1f}, {world_pos[2]:.1f}) | Indices: [{raw_z}, {raw_y}, {raw_x}] | 💡 HU: {val:.1f}")
+            else:
+                 pass
+                 # self.status_bar.showMessage(f"Out of bounds: {raw_z}, {raw_y}, {raw_x}")
+            
+        except Exception as e:
+            print(f"Probe Error: {e}")
+            pass
 
 
 # ==========================================

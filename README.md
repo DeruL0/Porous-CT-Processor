@@ -28,6 +28,7 @@ The application follows a strict **Model-View-Controller (MVC)** pattern for ext
 ### 1. Visualization Modes
 * **📊 Volume Rendering**: Full 3D density rendering with adjustable opacity transfer functions (Sigmoid, Linear).
 * **🔳 Orthogonal Slices**: Interactive X, Y, Z planes to inspect internal defects.
+    * **📍 Mouse Probe**: Hover over any slice to see the exact 3D coordinate (XYZ), Voxel Index, and HU Value in the status bar.
 * **🏔️ Isosurface**: Extract the solid-void interface.
     * *Coloring Modes*: Solid Color, Depth (Z-Axis), and **Radial Distance** (visualization of core vs. shell structure).
 * **⚪ PNM Mesh**: Visualizes the network topology with Pores (Spheres) and Throats (Tubes).
