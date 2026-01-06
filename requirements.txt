@@ -11,6 +11,8 @@ pydicom>=2.3.0
 pyvista>=0.38.0
 pyvistaqt>=0.9.0
 PyQt5>=5.15.0
-
-# Optional but recommended
 vtk>=9.1.0
+
+# Optional performance optimization
+joblib>=1.2.0
+numba>=0.56.0

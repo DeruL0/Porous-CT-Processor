@@ -1,4 +1,3 @@
-
 # Porous CT Analysis Suite
 
 A scientific computing application for analyzing porous materials (rocks, ceramics, foams, etc.) using Micro-CT data. Built with **Python**, **PyQt5**, and **PyVista**.
@@ -12,54 +11,67 @@ This application provides a comprehensive workflow for Digital Rock Physics (DRP
 4.  **Modeling**: Generate Pore Network Models (PNM) using watershed segmentation.
 5.  **Export**: Save results to VTK standards (.vtp/.vti) for simulation software.
 
-## System Architecture
+## Project Structure
 
-The application follows a strict **Model-View-Controller (MVC)** pattern for extensibility:
-
-* **`App.py`**: Main entry point and Application Controller.
-* **`Core.py`**: Defines standard data structures (`VolumeData`) for Voxel and Mesh data.
-* **`Processors.py`**: Algorithms for segmentation (Watershed, Distance Transform) and topology extraction.
-* **`Visualizers.py`**: Manages the PyVista 3D canvas and rendering logic.
-* **`Loaders.py`**: Strategies for loading DICOM folders and handling downsampling.
-* **`Exporters.py`**: Handles conversion of internal data to VTK formats.
+```
+Porous/
+├── app.py              # Application entry point
+├── config.py           # Configuration settings
+├── core/               # Base classes (VolumeData, BaseLoader, BaseProcessor)
+├── loaders/            # Data loading strategies
+│   ├── dicom.py        # DICOM series loaders
+│   └── dummy.py        # Synthetic data generator
+├── processors/         # Analysis algorithms
+│   ├── pore.py         # Void space extraction
+│   └── pnm.py          # Pore Network Modeling (PNM)
+├── exporters/          # Data export handlers
+│   └── vtk.py          # VTK format exporter
+├── data/               # Data management
+│   └── manager.py      # Scientific workflow state
+├── gui/                # User interface
+│   ├── main_window.py  # Main application window
+│   └── panels/         # Reusable UI panels
+└── rendering/          # 3D rendering engine
+    ├── render_engine.py
+    ├── clip_handler.py
+    └── roi_handler.py
+```
 
 ## Features
 
-### 1. Visualization Modes
-* **📊 Volume Rendering**: Full 3D density rendering with adjustable opacity transfer functions (Sigmoid, Linear).
-* **🔳 Orthogonal Slices**: Interactive X, Y, Z planes to inspect internal defects.
-    * **📍 Mouse Probe**: Hover over any slice to see the exact 3D coordinate (XYZ), Voxel Index, and HU Value in the status bar.
-* **🏔️ Isosurface**: Extract the solid-void interface.
-    * *Coloring Modes*: Solid Color, Depth (Z-Axis), and **Radial Distance** (visualization of core vs. shell structure).
-* **⚪ PNM Mesh**: Visualizes the network topology with Pores (Spheres) and Throats (Tubes).
+### Visualization Modes
+* **📊 Volume Rendering**: Full 3D density rendering with adjustable opacity transfer functions.
+* **🔳 Orthogonal Slices**: Interactive X, Y, Z planes with mouse probe (shows XYZ coordinates and HU values).
+* **🏔️ Isosurface**: Solid-void interface with multiple coloring modes (Solid, Depth, Radial Distance).
+* **⚪ PNM Mesh**: Network topology visualization with Pores (Spheres) and Throats (Tubes).
 
-### 2. Structural Analysis
-* **Void Extraction**: Segments air/void voxels from the solid matrix based on intensity thresholding.
-* **Pore Network Modeling (PNM)**:
-    * Uses **Watershed Segmentation** on the distance map.
-    * Generates a **Ball-and-Stick model**:
-        * **Nodes**: Represent pore bodies (sized by equivalent radius).
-        * **Edges**: Represent throats (connections) between pores.
+### Structural Analysis
+* **Void Extraction**: Segments air/void voxels from solid matrix using intensity thresholding.
+* **Pore Network Modeling (PNM)**: Watershed segmentation with Ball-and-Stick model generation.
 
-### 3. Data IO
-* **Load Dicom**: Reads standard CT image series.
-* **Fast Load**: Downsamples large datasets (Step=2) for quick previewing.
-* **Synthetic Generator**: Creates a Gaussian Random Field volume with a solid shell for testing algorithms without external data.
+### Data IO
+* **Load DICOM**: Standard CT image series support.
+* **Fast Load**: Downsampled preview for large datasets.
+* **Synthetic Generator**: Gaussian Random Field volume for testing.
 
 ## Installation
 
 ### Requirements
 * Python 3.8+
-* Dependencies listed in `requirements.txt`:
-    * `PyQt5` (GUI)
-    * `pyvista`, `pyvistaqt`, `vtk` (3D Rendering)
-    * `numpy`, `scipy`, `scikit-image` (Image Processing)
-    * `pydicom` (Data Loading)
+* See `requirements.txt` for dependencies
 
 ### Setup
 ```bash
-# Install dependencies
 pip install -r requirements.txt
+python app.py
+```
 
-# Run the application
-python App.py
+## Dependencies
+
+| Package | Purpose |
+|---------|---------|
+| PyQt5 | GUI framework |
+| pyvista, pyvistaqt, vtk | 3D rendering |
+| numpy, scipy, scikit-image | Image processing |
+| pydicom | DICOM data loading |
+| joblib, numba (optional) | Performance optimization |
