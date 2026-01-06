@@ -9,12 +9,11 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
 from core import BaseLoader, VolumeData, BaseProcessor
 from loaders import DicomSeriesLoader, DummyLoader, FastDicomLoader
 from processors import PoreExtractionProcessor, PoreToSphereProcessor
-from data_manager import ScientificDataManager
+from data import ScientificDataManager
 from exporters import VTKExporter
 
 # Import View and UI Components
-from visualizers import GuiVisualizer
-from gui import StructureProcessingPanel, StatisticsPanel
+from gui import MainWindow, StructureProcessingPanel, StatisticsPanel
 
 
 class ProcessorWorker(QThread):
@@ -62,7 +61,7 @@ class AppController:
         self.app = QApplication(sys.argv)
 
         # 1. Initialize View
-        self.visualizer = GuiVisualizer()
+        self.visualizer = MainWindow()
 
         # 2. Initialize Logic
         self.data_manager = ScientificDataManager()

@@ -1,5 +1,10 @@
+"""
+VTK format exporter for volumetric and mesh data.
+"""
+
 import numpy as np
 import pyvista as pv
+
 from core import VolumeData
 
 
@@ -34,13 +39,11 @@ class VTKExporter:
     @staticmethod
     def _export_mesh(mesh: pv.PolyData, filepath: str) -> bool:
         """导出 PNM 网格数据 (.vtp, .vtk)"""
-        # 检查是否包含关键属性
         if "IsPore" in mesh.array_names:
             print(f"[Exporter] Detected 'IsPore' attribute. Pore=1, Throat=0.")
         else:
             print(f"[Exporter] Warning: 'IsPore' attribute missing in mesh.")
 
-        # PyVista 会根据文件后缀自动选择格式，建议使用 .vtp (XML PolyData)
         mesh.save(filepath)
         print(f"[Exporter] Mesh saved to {filepath}")
         return True
@@ -48,13 +51,11 @@ class VTKExporter:
     @staticmethod
     def _export_volume(data: VolumeData, filepath: str) -> bool:
         """导出体素数据 (.vti)"""
-        # 将 numpy 数组包装为 PyVista ImageData
         grid = pv.ImageData()
         grid.dimensions = np.array(data.raw_data.shape) + 1
         grid.origin = data.origin
         grid.spacing = data.spacing
 
-        # 注意：PyVista/VTK 的 flatten 顺序与 Numpy 默认不同，需使用 order='F'
         grid.cell_data["values"] = data.raw_data.flatten(order="F")
 
         grid.save(filepath)

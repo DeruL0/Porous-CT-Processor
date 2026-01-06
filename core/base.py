@@ -1,13 +1,13 @@
+"""
+Core data structures and abstract base classes.
+"""
+
 import numpy as np
 import pyvista as pv
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 from typing import Tuple, Dict, Any, Optional, Callable
 
-
-# ==========================================
-# Core Data Structures and Interface Definitions
-# ==========================================
 
 @dataclass
 class VolumeData:
@@ -50,6 +50,7 @@ class BaseLoader(ABC):
         
         Args:
             source (str): Path to file or directory.
+            callback: Optional progress callback (percent, message).
             
         Returns:
             VolumeData: Loaded data object.

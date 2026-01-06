@@ -1,4 +1,9 @@
+"""
+Scientific data manager for porous media analysis workflow.
+"""
+
 from typing import Optional
+
 from core import VolumeData
 
 
@@ -14,16 +19,9 @@ class ScientificDataManager:
     """
 
     def __init__(self):
-        # 1. 未提取孔洞之前的原始CT数据
         self.raw_ct_data: Optional[VolumeData] = None
-
-        # 2. 提取孔洞后的划分体积数据 (Air/Solid Binary Volume)
         self.segmented_volume: Optional[VolumeData] = None
-
-        # 3. 构建PNW后能够区分孔洞，空气，吼道 (Optimized Mesh)
         self.pnm_model: Optional[VolumeData] = None
-        
-        # 4. ROI提取后的子体积
         self.roi_data: Optional[VolumeData] = None
 
     @property
@@ -39,10 +37,9 @@ class ScientificDataManager:
     def load_raw_data(self, data: VolumeData):
         """Sets the raw input data."""
         self.raw_ct_data = data
-        # Reset downstream data when new raw data is loaded
         self.segmented_volume = None
         self.pnm_model = None
-        self.roi_data = None  # Clear ROI when loading new data
+        self.roi_data = None
 
     def set_segmented_data(self, data: VolumeData):
         """Stores the intermediate segmented void space."""
@@ -55,7 +52,6 @@ class ScientificDataManager:
     def set_roi_data(self, data: VolumeData):
         """Stores ROI-extracted sub-volume for focused analysis."""
         self.roi_data = data
-        # Clear downstream when ROI changes
         self.segmented_volume = None
         self.pnm_model = None
 

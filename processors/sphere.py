@@ -1,10 +1,14 @@
+"""
+Pore to sphere processor for Pore Network Modeling (PNM).
+"""
+
 import numpy as np
 import scipy.ndimage as ndimage
 import pyvista as pv
 from skimage.segmentation import watershed
 from skimage.feature import peak_local_max
-from skimage.filters import threshold_otsu
-from typing import Tuple, Dict, Set, Optional, Callable
+from typing import Tuple, Set, Optional, Callable
+
 from core import BaseProcessor, VolumeData
 
 # Optional high-performance libraries
@@ -12,9 +16,7 @@ try:
     from numba import jit, prange
     NUMBA_AVAILABLE = True
 except ImportError:
-    from skimage.filters import threshold_otsu
     NUMBA_AVAILABLE = False
-    # Fallback decorator that does nothing
     def jit(*args, **kwargs):
         def decorator(func):
             return func
@@ -28,98 +30,13 @@ except ImportError:
     JOBLIB_AVAILABLE = False
 
 
-# ==========================================
-# Image Processors
-# ==========================================
-
-class PoreExtractionProcessor(BaseProcessor):
-    """
-    Segments the void space (pores) from the solid matrix.
-    Returns a Voxel-based VolumeData object representing "Air".
-    """
-
-    @staticmethod
-    def suggest_threshold(data: VolumeData) -> int:
-        """
-        Calculate optimal threshold using Otsu's method.
-        """
-        if data.raw_data is None:
-            return -300
-        
-        # Otsu expects clean data, handling NaN/Inf
-        clean_data = data.raw_data[np.isfinite(data.raw_data)]
-        if clean_data.size == 0:
-            return -300
-            
-        try:
-            # Calculate Otsu threshold
-            thresh = threshold_otsu(clean_data)
-            return int(thresh)
-        except Exception as e:
-            print(f"Otsu failed: {e}")
-            return -300
-
-    def process(self, data: VolumeData, callback: Optional[Callable[[int, str], None]] = None,
-                threshold: int = -300) -> VolumeData:
-        if data.raw_data is None:
-            raise ValueError("Input data must contain raw voxel data.")
-
-        def report(p: int, msg: str):
-            print(f"[Processor] {msg}")
-            if callback: callback(p, msg)
-
-        report(0, f"Starting pore detection (Threshold < {threshold})...")
-
-        # 1. Binarization (Air vs Solid)
-        solid_mask = data.raw_data > threshold
-        report(20, "Binarization complete. Filling holes...")
-
-        # 2. Morphology
-        filled_volume = ndimage.binary_fill_holes(solid_mask)
-        pores_mask = filled_volume ^ solid_mask
-        report(50, "Morphology operations complete. Calculating stats...")
-
-        # Quantitative Analysis
-        pore_voxels = np.sum(pores_mask)
-        total_voxels = data.raw_data.size
-        porosity_pct = (pore_voxels / total_voxels) * 100.0
-
-        # Label connected components
-        report(70, "Labeling connected components (this may take a while)...")
-        labeled_array, num_features = ndimage.label(pores_mask, structure=np.ones((3, 3, 3)))
-
-        report(90, f"Found {num_features} pores. Generating output volume...")
-
-        # Create Output Volume (Voxel Grid)
-        processed_volume = np.zeros_like(data.raw_data)
-        processed_volume[pores_mask] = 1000  # Highlight Pores
-
-        report(100, "Processing complete.")
-
-        return VolumeData(
-            raw_data=processed_volume,
-            spacing=data.spacing,
-            origin=data.origin,
-            metadata={
-                "Type": "Processed - Void Volume",
-                "Porosity": f"{porosity_pct:.2f}%",
-                "PoreCount": int(num_features)
-            }
-        )
-
-
 class PoreToSphereProcessor(BaseProcessor):
-    """
-    Optimized Pore Network Modeling (PNM).
-    """
+    """Optimized Pore Network Modeling (PNM)."""
 
     MIN_PEAK_DISTANCE = 6
 
     def __init__(self):
         super().__init__()
-        # Simple in-memory cache
-        # Key: (data_id, threshold)
-        # Value: { 'distance_map': ..., 'labels': ..., 'num_pores': ... }
         self._cache = {}
 
     def process(self, data: VolumeData, callback: Optional[Callable[[int, str], None]] = None,
@@ -131,9 +48,6 @@ class PoreToSphereProcessor(BaseProcessor):
             print(f"[PNM] {msg}")
             if callback: callback(p, msg)
 
-        # Generate a semi-unique ID for the input data to allow caching
-        # We use memory address + shape + sum (cheap-ish hash) or just object ID if we assume immutability logic
-        # For safety in this demo, we'll use object ID + threshold
         cache_key = (id(data.raw_data), threshold)
         cached_result = self._cache.get(cache_key)
 
@@ -142,13 +56,11 @@ class PoreToSphereProcessor(BaseProcessor):
             distance_map = cached_result['distance_map']
             segmented_regions = cached_result['labels']
             num_pores = cached_result['num_pores']
-            
-            # Skip to mesh generation
             report(80, "Skipped segmentation. Generating optimized mesh...")
         else:
             report(0, f"Starting PNM Extraction (Threshold > {threshold})...")
             
-            # --- Step 1: Segmentation ---
+            # Step 1: Segmentation
             solid_mask = data.raw_data > threshold
             filled_mask = ndimage.binary_fill_holes(solid_mask)
             pores_mask = filled_mask ^ solid_mask
@@ -158,7 +70,7 @@ class PoreToSphereProcessor(BaseProcessor):
             if np.sum(pores_mask) == 0:
                 return self._create_empty_result(data)
     
-            # --- Step 2: Watershed Analysis ---
+            # Step 2: Watershed Analysis
             distance_map = ndimage.distance_transform_edt(pores_mask)
             report(40, "Distance map computed. Finding local maxima...")
     
@@ -175,21 +87,19 @@ class PoreToSphereProcessor(BaseProcessor):
             segmented_regions = watershed(-distance_map, markers, mask=pores_mask)
             num_pores = np.max(segmented_regions)
             
-            # Save to Cache
             self._cache[cache_key] = {
                 'distance_map': distance_map,
                 'labels': segmented_regions,
                 'num_pores': num_pores
             }
 
-        # --- Step 3: Mesh Generation ---
+        # Step 3: Mesh Generation
         report(80, "Generating optimized mesh structures (Spheres & Tubes)...")
 
-        # A. Nodes (Pores) -> Spheres
-        pore_centers, pore_radii, pore_ids = self._extract_pore_data(segmented_regions, num_pores, data.spacing,
-                                                                     data.origin)
+        pore_centers, pore_radii, pore_ids = self._extract_pore_data(
+            segmented_regions, num_pores, data.spacing, data.origin
+        )
 
-        # Create PyVista PolyData for Pores
         if len(pore_centers) > 0:
             pore_cloud = pv.PolyData(pore_centers)
             pore_cloud["radius"] = pore_radii
@@ -199,29 +109,22 @@ class PoreToSphereProcessor(BaseProcessor):
             sphere_glyph = pv.Sphere(theta_resolution=10, phi_resolution=10)
             pores_mesh = pore_cloud.glyph(scale="radius", geom=sphere_glyph)
             
-            # Propagate PoreRadius scalar to glyph mesh for colormap
-            # Each sphere has sphere_glyph.n_points points, all should share the same radius
             n_pts_per_sphere = sphere_glyph.n_points
             pore_radius_scalars = np.repeat(pore_radii, n_pts_per_sphere)
             pores_mesh["PoreRadius"] = pore_radius_scalars
         else:
             pores_mesh = pv.PolyData()
 
-        # B. Edges (Throats) -> Tubes
         report(90, "Connecting pores...")
         connections = self._find_adjacency(segmented_regions)
         throats_mesh, throat_radii = self._create_throat_mesh(connections, pore_centers, pore_radii, pore_ids)
 
-        # --- Step 4: Enhanced Analysis ---
+        # Step 4: Enhanced Analysis
         report(93, "Calculating advanced metrics...")
         
-        # Pore size distribution (histogram bins)
         size_distribution = self._calculate_size_distribution(pore_radii)
-        
-        # Connectivity analysis
         largest_pore_ratio = self._calculate_connectivity(segmented_regions, num_pores)
         
-        # Throat statistics
         throat_stats = {}
         if len(throat_radii) > 0:
             throat_stats = {
@@ -230,45 +133,32 @@ class PoreToSphereProcessor(BaseProcessor):
                 'mean': float(np.mean(throat_radii))
             }
         
-        # === NEW SCIENTIFIC METRICS ===
-        
-        # 1. Porosity (from segmented data)
+        # Scientific Metrics
         total_voxels = segmented_regions.size
         pore_voxels = np.sum(segmented_regions > 0)
         porosity = pore_voxels / total_voxels if total_voxels > 0 else 0
         
-        # 2. Kozeny-Carman Permeability Estimation
-        # k = (ε³ × d²) / (180 × (1-ε)²) in m²
-        # Convert to milliDarcy (1 Darcy = 9.869e-13 m²)
         permeability_md = 0.0
         if len(pore_radii) > 0 and porosity > 0 and porosity < 1:
-            mean_diameter = 2 * np.mean(pore_radii) * 1e-3  # mm to m
+            mean_diameter = 2 * np.mean(pore_radii) * 1e-3
             k_m2 = (porosity**3 * mean_diameter**2) / (180 * (1 - porosity)**2)
-            permeability_md = k_m2 / 9.869e-16  # Convert m² to milliDarcy
+            permeability_md = k_m2 / 9.869e-16
         
-        # 3. Tortuosity Estimation (Bruggeman model)
-        # τ = 1 / √ε (simplified)
         tortuosity = 1.0 / np.sqrt(porosity) if porosity > 0 else float('inf')
         
-        # 4. Coordination Number (average connections per pore)
         coordination_number = 0.0
         if num_pores > 0:
             coordination_number = (2 * len(connections)) / num_pores
         
-        # 5. Connected Pore Fraction (uses existing connectivity analysis)
-        connected_fraction = 100.0 - largest_pore_ratio if largest_pore_ratio > 0 else 0
-        # Actually, largest_pore_ratio IS the connected fraction of the largest cluster
-        # Let's calculate what % of pores are in connected clusters (have at least 1 connection)
         connected_pore_ids = set()
         for id_a, id_b in connections:
             connected_pore_ids.add(id_a)
             connected_pore_ids.add(id_b)
         connected_pore_fraction = (len(connected_pore_ids) / num_pores * 100) if num_pores > 0 else 0
 
-        # --- Step 5: Combine ---
+        # Step 5: Combine
         report(95, "Merging geometry...")
         
-        # Add PoreRadius field to throats_mesh (0 for throats) to ensure merge preserves this field
         if throats_mesh.n_points > 0:
             throats_mesh["PoreRadius"] = np.zeros(throats_mesh.n_points)
         
@@ -277,7 +167,7 @@ class PoreToSphereProcessor(BaseProcessor):
         report(100, "PNM Generation Complete.")
 
         return VolumeData(
-            raw_data=None,  # No Voxel data in this result, purely Mesh
+            raw_data=None,
             mesh=combined_mesh,
             spacing=data.spacing,
             origin=data.origin,
@@ -286,12 +176,10 @@ class PoreToSphereProcessor(BaseProcessor):
                 "PoreCount": int(num_pores),
                 "ConnectionCount": len(connections),
                 "MeshPoints": combined_mesh.n_points,
-                # Enhanced metrics
                 "PoreSizeDistribution": size_distribution,
                 "LargestPoreRatio": f"{largest_pore_ratio:.2f}%",
                 "ThroatStats": throat_stats,
                 "PoreRadii": pore_radii.tolist(),
-                # Scientific Analysis
                 "Porosity": f"{porosity * 100:.2f}%",
                 "Permeability_mD": f"{permeability_md:.4f}",
                 "Tortuosity": f"{tortuosity:.3f}",
@@ -301,14 +189,13 @@ class PoreToSphereProcessor(BaseProcessor):
         )
 
     def _extract_pore_data(self, regions, num_pores, spacing, origin):
-        """Extracts centroids and radii for mesh generation (PARALLELIZED with joblib)."""
+        """Extracts centroids and radii for mesh generation."""
         slices = ndimage.find_objects(regions)
         sx, sy, sz = spacing
         ox, oy, oz = origin
         avg_spacing = (sx + sy + sz) / 3.0
 
         def process_single_pore(i):
-            """Process a single pore - thread-safe operation."""
             label_idx = i + 1
             slice_obj = slices[i]
             if slice_obj is None:
@@ -319,11 +206,9 @@ class PoreToSphereProcessor(BaseProcessor):
             if voxel_count == 0:
                 return None
 
-            # Equivalent radius (sphere)
             r_vox = (3 * voxel_count / (4 * np.pi)) ** (1 / 3)
             radius = r_vox * avg_spacing
 
-            # Centroid (Physical Coordinates)
             local_cent = ndimage.center_of_mass(local_mask)
 
             cz = (slice_obj[0].start + local_cent[0]) * sz + oz
@@ -332,16 +217,13 @@ class PoreToSphereProcessor(BaseProcessor):
 
             return (label_idx, [cx, cy, cz], radius)
 
-        # Choose parallelization strategy
         if JOBLIB_AVAILABLE and num_pores > 10:
-            # Joblib with process-based backend for better CPU utilization
-            n_jobs = min(-1, num_pores)  # -1 uses all cores
+            n_jobs = min(-1, num_pores)
             results = Parallel(n_jobs=n_jobs, prefer="threads")(
                 delayed(process_single_pore)(i) for i in range(num_pores)
             )
             results = [r for r in results if r is not None]
         else:
-            # Fallback to ThreadPoolExecutor
             from concurrent.futures import ThreadPoolExecutor, as_completed
             results = []
             max_workers = min(8, num_pores)
@@ -353,7 +235,6 @@ class PoreToSphereProcessor(BaseProcessor):
                     if result is not None:
                         results.append(result)
 
-        # Sort by ID to maintain order
         results.sort(key=lambda x: x[0])
         
         if not results:
@@ -387,14 +268,12 @@ class PoreToSphereProcessor(BaseProcessor):
         return adjacency
 
     def _create_throat_mesh(self, connections, centers, radii, ids_list):
-        """Creates tubes connecting the pores (PARALLELIZED). Returns (mesh, throat_radii_list)."""
+        """Creates tubes connecting the pores."""
         if not connections:
             return pv.PolyData(), np.array([])
 
-        # Map ID to Index in 'centers' array
         id_map = {uid: idx for idx, uid in enumerate(ids_list)}
 
-        # Pre-compute valid connections and throat radii
         valid_connections = []
         for id_a, id_b in connections:
             if id_a in id_map and id_b in id_map:
@@ -409,12 +288,10 @@ class PoreToSphereProcessor(BaseProcessor):
             return pv.PolyData(), np.array([])
 
         def create_single_tube(conn):
-            """Create a single tube - parallelizable operation."""
             p1, p2, r_throat = conn
             line = pv.Line(p1, p2)
             return line.tube(radius=r_throat), r_throat
 
-        # Parallel tube generation
         if JOBLIB_AVAILABLE and len(valid_connections) > 20:
             results = Parallel(n_jobs=-1, prefer="threads")(
                 delayed(create_single_tube)(conn) for conn in valid_connections
@@ -422,7 +299,6 @@ class PoreToSphereProcessor(BaseProcessor):
             lines = [r[0] for r in results]
             throat_radii = [r[1] for r in results]
         else:
-            # Sequential fallback
             lines = []
             throat_radii = []
             for conn in valid_connections:
@@ -430,7 +306,6 @@ class PoreToSphereProcessor(BaseProcessor):
                 lines.append(tube)
                 throat_radii.append(r_throat)
 
-        # Merge all tubes
         throats = lines[0].merge(lines[1:]) if len(lines) > 1 else lines[0]
         throats["IsPore"] = np.zeros(throats.n_points, dtype=int)
 
@@ -441,26 +316,18 @@ class PoreToSphereProcessor(BaseProcessor):
         if len(pore_radii) == 0:
             return {"bins": [], "counts": []}
         
-        # Create bins (adjust based on your data range)
         bins = np.linspace(0, np.max(pore_radii) * 1.1, 10)
         counts, bin_edges = np.histogram(pore_radii, bins=bins)
         
-        return {
-            "bins": bin_edges.tolist(),
-            "counts": counts.tolist()
-        }
+        return {"bins": bin_edges.tolist(), "counts": counts.tolist()}
 
     def _calculate_connectivity(self, labels_volume, num_pores):
-        """Calculate percentage of largest connected pore volume (OPTIMIZED)."""
+        """Calculate percentage of largest connected pore volume."""
         if num_pores == 0:
             return 0.0
         
-        # OPTIMIZED: Use np.bincount for O(N) instead of O(N * Volume)
-        # bincount counts occurrences of each integer value in the array
         flat_labels = labels_volume.ravel()
         pore_volumes = np.bincount(flat_labels, minlength=num_pores + 1)
-        
-        # Ignore label 0 (background)
         pore_volumes = pore_volumes[1:]
         
         if len(pore_volumes) == 0:
