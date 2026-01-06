@@ -1,6 +1,6 @@
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QLabel,
                              QGroupBox, QSlider, QComboBox, QFrame, QTableWidget,
-                             QTableWidgetItem)
+                             QTableWidgetItem, QSpinBox, QHBoxLayout)
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QFont
 from typing import Dict, Any, List
@@ -17,35 +17,43 @@ class StatisticsPanel(QWidget):
     """
     Panel to display advanced statistics and visualizations for PNM analysis.
     """
-    
+
     def __init__(self):
         super().__init__()
         # Removed: self.setMaximumHeight(400) - allow free resizing
         self._init_ui()
-        
+
     def _init_ui(self):
         from PyQt5.QtWidgets import QSplitter, QWidget
 
         # Use VBoxLayout
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
-        
+
         # Title
-        title = QLabel("Statistics & Analysis")
-        title.setFont(QFont("Arial", 12, QFont.Bold))
-        title.setAlignment(Qt.AlignCenter)
+        title = QLabel("📈 Statistics & Analysis")
+        # Unified Style
+        title.setStyleSheet("""
+            font-size: 20px; 
+            font-weight: bold; 
+            margin-top: 15px; 
+            margin-bottom: 5px;
+            padding: 5px;
+        """)
+        # title.setFont(QFont("Arial", 12, QFont.Bold)) # Removed
+        # title.setAlignment(Qt.AlignCenter) # Removed to match other panels
         layout.addWidget(title)
-        
+
         # Create Splitter for resizing
         splitter = QSplitter(Qt.Vertical)
-        
+
         # Matplotlib Figure for Histogram
         self.figure = Figure(figsize=(5, 3), dpi=80)
         self.canvas = FigureCanvas(self.figure)
         # Removed fixed height constraint
-        self.canvas.setMinimumHeight(100) 
+        self.canvas.setMinimumHeight(100)
         splitter.addWidget(self.canvas)
-        
+
         # Statistics Table
         self.stats_table = QTableWidget()
         # Removed fixed height constraint
@@ -55,66 +63,78 @@ class StatisticsPanel(QWidget):
         # Enable selection + copy support (standard behaviors)
         self.stats_table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.stats_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        
+        self.stats_table.setStyleSheet("""
+            QHeaderView::section {
+                background-color: transparent;
+                font-weight: bold;
+                padding: 10px;
+                border-bottom: 1px solid #666666;
+                font-size: 15px;
+            }
+            QTableWidget {
+                font-size: 15px;
+            }
+        """)
+
         splitter.addWidget(self.stats_table)
-        
+
         # Set initial sizes (prioritize chart)
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 1)
-        
+
         layout.addWidget(splitter)
-        
+
     def update_statistics(self, metadata):
         """Update the panel with new statistics from VolumeData metadata."""
         # Clear previous
         self.figure.clear()
         self.stats_table.setRowCount(0)
-        
+
         # Extract metrics
         size_dist = metadata.get("PoreSizeDistribution", {})
         largest_pore = metadata.get("LargestPoreRatio", "N/A")
         throat_stats = metadata.get("ThroatStats", {})
         pore_count = metadata.get("PoreCount", 0)
         connection_count = metadata.get("ConnectionCount", 0)
-        
+
         # Plot histogram
         if size_dist.get("bins") and size_dist.get("counts"):
             ax = self.figure.add_subplot(111)
             bins = np.array(size_dist["bins"])
             counts = size_dist["counts"]
-            
+
             # Bar plot
             bin_centers = (bins[:-1] + bins[1:]) / 2
-            ax.bar(bin_centers, counts, width=np.diff(bins), 
+            ax.bar(bin_centers, counts, width=np.diff(bins),
                    alpha=0.7, color='steelblue', edgecolor='black')
-            
+
             ax.set_xlabel('Pore Radius (mm)')
             ax.set_ylabel('Count')
             ax.set_title('Pore Size Distribution')
             ax.grid(True, alpha=0.3)
             self.figure.tight_layout()
-            
+
         self.canvas.draw()
-        
+
         # Populate stats table
         stats_data = [
             ("Total Pores", str(pore_count)),
             ("Connections", str(connection_count)),
             ("Largest Pore %", str(largest_pore)),
         ]
-        
+
         if throat_stats:
             stats_data.extend([
                 ("Throat Min (mm)", f"{throat_stats.get('min', 0):.3f}"),
                 ("Throat Max (mm)", f"{throat_stats.get('max', 0):.3f}"),
                 ("Throat Mean (mm)", f"{throat_stats.get('mean', 0):.3f}"),
             ])
-        
+
         self.stats_table.setRowCount(len(stats_data))
         for row, (metric, value) in enumerate(stats_data):
             self.stats_table.setItem(row, 0, QTableWidgetItem(metric))
             self.stats_table.setItem(row, 1, QTableWidgetItem(value))
-        
+
     def clear(self):
         """Clear all statistics."""
         self.figure.clear()
@@ -139,7 +159,8 @@ class InfoPanel(QGroupBox):
     """Enhanced panel to display sample metadata and computed statistics."""
 
     def __init__(self, title: str = "📊 Sample Information"):
-        super().__init__(title)
+        super().__init__()
+        self.custom_title = title
         self._init_ui()
 
     def _init_ui(self):
@@ -147,7 +168,18 @@ class InfoPanel(QGroupBox):
 
         # Use VBoxLayout for the GroupBox
         main_layout = QVBoxLayout()
-        main_layout.setContentsMargins(4, 10, 4, 4)
+        main_layout.setContentsMargins(4, 4, 4, 4)
+        
+        # Custom Title Label
+        title_lbl = QLabel(self.custom_title)
+        title_lbl.setStyleSheet("""
+            font-size: 20px; 
+            font-weight: bold; 
+            margin-top: 15px; 
+            margin-bottom: 5px;
+            padding: 5px;
+        """)
+        main_layout.addWidget(title_lbl)
         
         # Create Splitter for resizing
         splitter = QSplitter(Qt.Vertical)
@@ -164,20 +196,23 @@ class InfoPanel(QGroupBox):
         self.info_table.setStyleSheet("""
             QTableWidget {
                 background-color: transparent;
-                gridline-color: #555555;
+                gridline-color: #666666;
                 font-size: 15px;
+                border: 1px solid #555555;
             }
             QTableWidget::item {
-                padding: 6px;
+                padding: 10px;
+                border: 1px solid #444444;
             }
             QHeaderView::section {
                 background-color: transparent;
                 font-weight: bold;
-                padding: 8px;
-                border-bottom: 1px solid #666666;
+                padding: 10px;
+                border: 1px solid #555555;
                 font-size: 15px;
             }
         """)
+        self.info_table.setShowGrid(True)
         splitter.addWidget(self.info_table)
         
         # --- Bottom Section: Computed Metrics ---
@@ -185,8 +220,14 @@ class InfoPanel(QGroupBox):
         bottom_layout = QVBoxLayout(bottom_widget)
         bottom_layout.setContentsMargins(0, 0, 0, 0)
         
-        self.computed_label = QLabel("<b>Computed Metrics</b>")
-        self.computed_label.setStyleSheet("font-size: 15px; margin-top: 5px;")
+        self.computed_label = QLabel("<b>🧮 Computed Metrics</b>")
+        self.computed_label.setStyleSheet("""
+            font-size: 20px; 
+            font-weight: bold; 
+            margin-top: 15px; 
+            margin-bottom: 5px;
+            padding: 5px;
+        """)
         bottom_layout.addWidget(self.computed_label)
         
         self.computed_table = QTableWidget()
@@ -200,28 +241,31 @@ class InfoPanel(QGroupBox):
         self.computed_table.setStyleSheet("""
             QTableWidget {
                 background-color: transparent;
-                gridline-color: #555555;
+                gridline-color: #666666;
                 font-size: 15px;
+                border: 1px solid #555555;
             }
             QTableWidget::item {
-                padding: 6px;
+                padding: 10px;
+                border: 1px solid #444444;
             }
             QHeaderView::section {
                 background-color: transparent;
                 font-weight: bold;
-                padding: 8px;
-                border-bottom: 1px solid #666666;
+                padding: 10px;
+                border: 1px solid #555555;
                 font-size: 15px;
             }
         """)
+        self.computed_table.setShowGrid(True)
         bottom_layout.addWidget(self.computed_table)
-        
+
         splitter.addWidget(bottom_widget)
-        
+
         # Set initial sizes for splitter (e.g., 50/50 starting point, or prioritized)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 1)
-        
+
         main_layout.addWidget(splitter)
         self.setLayout(main_layout)
 
@@ -230,19 +274,19 @@ class InfoPanel(QGroupBox):
         # Clear tables
         self.info_table.setRowCount(0)
         self.computed_table.setRowCount(0)
-        
+
         # === Basic Info ===
         basic_data = [
             ("📁 Data Type", type_str),
         ]
-        
+
         if dim != (0, 0, 0):
             basic_data.append(("📐 Dimensions", f"{dim[0]} × {dim[1]} × {dim[2]}"))
         elif 'MeshPoints' in metadata:
             basic_data.append(("🔷 Mesh Points", str(metadata['MeshPoints'])))
-        
+
         basic_data.append(("📏 Voxel Size", f"{spacing[0]:.3f} × {spacing[1]:.3f} × {spacing[2]:.3f} mm"))
-        
+
         # Add priority metadata
         priority_keys = ['Porosity', 'PoreCount', 'ConnectionCount']
         icons = {'Porosity': '💨', 'PoreCount': '🔴', 'ConnectionCount': '🔗'}
@@ -253,47 +297,57 @@ class InfoPanel(QGroupBox):
                 if isinstance(val, float):
                     val = f"{val:.2f}%"
                 basic_data.append((f"{icon} {key}", str(val)))
-        
+
         self.info_table.setRowCount(len(basic_data))
         for row, (prop, val) in enumerate(basic_data):
             self.info_table.setItem(row, 0, QTableWidgetItem(prop))
             self.info_table.setItem(row, 1, QTableWidgetItem(val))
-        
+
         # === Computed Metrics ===
         computed = []
-        
+
         if dim != (0, 0, 0):
             # Total voxels
             total_voxels = dim[0] * dim[1] * dim[2]
-            computed.append(("Total Voxels", f"{total_voxels:,}"))
-            
+            computed.append(("🔢 Total Voxels", f"{total_voxels:,}"))
+
             # Physical volume (mm³)
             phys_volume = dim[0] * spacing[0] * dim[1] * spacing[1] * dim[2] * spacing[2]
             if phys_volume > 1000:
-                computed.append(("Physical Volume", f"{phys_volume/1000:.2f} cm³"))
+                computed.append(("🧊 Physical Volume", f"{phys_volume / 1000:.2f} cm³"))
             else:
-                computed.append(("Physical Volume", f"{phys_volume:.2f} mm³"))
-            
+                computed.append(("🧊 Physical Volume", f"{phys_volume:.2f} mm³"))
+
             # Physical dimensions
             phys_dim = (dim[0] * spacing[0], dim[1] * spacing[1], dim[2] * spacing[2])
-            computed.append(("Physical Size", f"{phys_dim[0]:.1f} × {phys_dim[1]:.1f} × {phys_dim[2]:.1f} mm"))
-            
+            computed.append(("📏 Physical Size", f"{phys_dim[0]:.1f} × {phys_dim[1]:.1f} × {phys_dim[2]:.1f} mm"))
+
             # Memory estimate (assuming float32)
             mem_mb = (total_voxels * 4) / (1024 * 1024)
-            computed.append(("Memory (Est.)", f"{mem_mb:.1f} MB"))
-        
+            computed.append(("💾 Memory (Est.)", f"{mem_mb:.1f} MB"))
+
         # Add throat stats if available
         if 'ThroatStats' in metadata:
             ts = metadata['ThroatStats']
             if 'mean' in ts:
-                computed.append(("Avg Throat Radius", f"{ts['mean']:.3f} mm"))
+                computed.append(("⭕ Avg Throat Radius", f"{ts['mean']:.3f} mm"))
             if 'min' in ts and 'max' in ts:
-                computed.append(("Throat Range", f"{ts['min']:.3f} - {ts['max']:.3f} mm"))
-        
+                computed.append(("📶 Throat Range", f"{ts['min']:.3f} - {ts['max']:.3f} mm"))
+
         # Largest pore ratio
         if 'LargestPoreRatio' in metadata:
-            computed.append(("Largest Pore %", str(metadata['LargestPoreRatio'])))
+            computed.append(("👑 Largest Pore %", str(metadata['LargestPoreRatio'])))
         
+        # === Scientific Analysis Metrics ===
+        if 'Permeability_mD' in metadata:
+            computed.append(("🔬 Permeability", f"{metadata['Permeability_mD']} mD"))
+        if 'Tortuosity' in metadata:
+            computed.append(("🌀 Tortuosity", str(metadata['Tortuosity'])))
+        if 'CoordinationNumber' in metadata:
+            computed.append(("🔗 Coord. Number", str(metadata['CoordinationNumber'])))
+        if 'ConnectedPoreFraction' in metadata:
+            computed.append(("📡 Connected Pores", str(metadata['ConnectedPoreFraction'])))
+
         self.computed_table.setRowCount(len(computed))
         for row, (metric, val) in enumerate(computed):
             self.computed_table.setItem(row, 0, QTableWidgetItem(metric))
@@ -313,12 +367,24 @@ class StructureProcessingPanel(QGroupBox):
     reset_clicked = pyqtSignal()
     export_clicked = pyqtSignal()  # NEW SIGNAL
 
-    def __init__(self, title: str = "Structure Processing"):
-        super().__init__(title)
+    def __init__(self, title: str = "🔧 Structure Processing"):
+        super().__init__()
+        self.custom_title = title
         self._init_ui()
 
     def _init_ui(self):
         layout = QVBoxLayout()
+        
+        # Custom Title
+        title_lbl = QLabel(self.custom_title)
+        title_lbl.setStyleSheet("""
+            font-size: 20px; 
+            font-weight: bold; 
+            margin-top: 15px; 
+            margin-bottom: 5px;
+            padding: 5px;
+        """)
+        layout.addWidget(title_lbl)
 
         # Group 1: Loading
         self._add_button(layout, "📁 Load Sample Scan", self.load_clicked)
@@ -357,12 +423,24 @@ class VisualizationModePanel(QGroupBox):
     clear_clicked = pyqtSignal()
     reset_camera_clicked = pyqtSignal()
 
-    def __init__(self, title: str = "Analysis Modes"):
-        super().__init__(title)
+    def __init__(self, title: str = "🖼️ Analysis Modes"):
+        super().__init__()
+        self.custom_title = title
         self._init_ui()
 
     def _init_ui(self):
         layout = QVBoxLayout()
+        
+        # Custom Title
+        title_lbl = QLabel(self.custom_title)
+        title_lbl.setStyleSheet("""
+            font-size: 20px; 
+            font-weight: bold; 
+            margin-top: 15px; 
+            margin-bottom: 5px;
+            padding: 5px;
+        """)
+        layout.addWidget(title_lbl)
         self._add_button(layout, "📊 Volume Rendering", self.volume_clicked)
         self._add_button(layout, "🔳 Orthogonal Slices", self.slices_clicked)
         self._add_button(layout, "🏔️ Isosurface (Solid/Pore)", self.iso_clicked)
@@ -385,15 +463,27 @@ class ClipPlanePanel(QGroupBox):
     clip_changed = pyqtSignal()  # Emits when any clip parameter changes
     clip_toggled = pyqtSignal(bool)  # Emits when clipping is enabled/disabled
 
-    def __init__(self, title: str = "Clip Planes"):
-        super().__init__(title)
+    def __init__(self, title: str = "✂️ Clip Planes"):
+        super().__init__()
+        self.custom_title = title
         self._enabled = False
         self._init_ui()
 
     def _init_ui(self):
         from PyQt5.QtWidgets import QCheckBox, QHBoxLayout
-        
+
         layout = QVBoxLayout()
+        
+        # Custom Title
+        title_lbl = QLabel(self.custom_title)
+        title_lbl.setStyleSheet("""
+            font-size: 20px; 
+            font-weight: bold; 
+            margin-top: 15px; 
+            margin-bottom: 5px;
+            padding: 5px;
+        """)
+        layout.addWidget(title_lbl)
 
         # Enable checkbox
         self.enable_checkbox = QCheckBox("Enable Clipping")
@@ -476,16 +566,28 @@ class ROIPanel(QGroupBox):
     apply_roi = pyqtSignal()  # Emits when user clicks Apply
     reset_roi = pyqtSignal()  # Emits when user clicks Reset
 
-    def __init__(self, title: str = "ROI Selection"):
-        super().__init__(title)
+    def __init__(self, title: str = "📦 ROI Selection"):
+        super().__init__()
+        self.custom_title = title
         self._enabled = False
         self._bounds = None  # (xmin, xmax, ymin, ymax, zmin, zmax)
         self._init_ui()
 
     def _init_ui(self):
         from PyQt5.QtWidgets import QCheckBox, QHBoxLayout
-        
+
         layout = QVBoxLayout()
+        
+        # Custom Title
+        title_lbl = QLabel(self.custom_title)
+        title_lbl.setStyleSheet("""
+            font-size: 20px; 
+            font-weight: bold; 
+            margin-top: 15px; 
+            margin-bottom: 5px;
+            padding: 5px;
+        """)
+        layout.addWidget(title_lbl)
 
         # Enable checkbox
         self.enable_checkbox = QCheckBox("Enable ROI Selection")
@@ -546,6 +648,7 @@ class ROIPanel(QGroupBox):
     def is_enabled(self) -> bool:
         return self._enabled
 
+
 class RenderingParametersPanel(QGroupBox):
     """
     Panel for controlling fine-grained rendering parameters.
@@ -561,13 +664,25 @@ class RenderingParametersPanel(QGroupBox):
     slice_position_changed = pyqtSignal()
     clim_changed = pyqtSignal()
 
-    def __init__(self, title: str = "Rendering Parameters"):
-        super().__init__(title)
+    def __init__(self, title: str = "🎨 Rendering Parameters"):
+        super().__init__()
+        self.custom_title = title
         self.active_mode = None
         self._init_ui()
 
     def _init_ui(self):
         layout = QVBoxLayout()
+        
+        # Custom Title
+        title_lbl = QLabel(self.custom_title)
+        title_lbl.setStyleSheet("""
+            font-size: 20px; 
+            font-weight: bold; 
+            margin-top: 15px; 
+            margin-bottom: 5px;
+            padding: 5px;
+        """)
+        layout.addWidget(title_lbl)
 
         # 1. Threshold (Iso)
         self.lbl_threshold, self.threshold_slider, self.threshold_value_label = self._create_slider_group(
@@ -601,16 +716,45 @@ class RenderingParametersPanel(QGroupBox):
                                                  [self.colormap_changed.emit]
                                                  )
 
-        # 5. Colormap Range (CLim)
+        # 5. Colormap Range (CLim) with Slider + SpinBox
         self.lbl_clim = QLabel("Colormap Range (Min/Max):")
         layout.addWidget(self.lbl_clim)
 
-        self.lbl_clim_min, self.slider_clim_min, self.val_clim_min = self._create_slider_group(
-            layout, "Min:", 0, 100, 0, self._on_clim_change
-        )
-        self.lbl_clim_max, self.slider_clim_max, self.val_clim_max = self._create_slider_group(
-            layout, "Max:", 0, 100, 100, self._on_clim_change
-        )
+        # Min row: label + slider + spinbox
+        min_container = QWidget()
+        min_layout = QHBoxLayout(min_container)
+        min_layout.setContentsMargins(0, 0, 0, 0)
+        self.lbl_clim_min = QLabel("Min:")
+        min_layout.addWidget(self.lbl_clim_min)
+        self.slider_clim_min = QSlider(Qt.Horizontal)
+        self.slider_clim_min.setRange(0, 100)
+        self.slider_clim_min.setValue(0)
+        self.slider_clim_min.valueChanged.connect(self._on_clim_slider_change)
+        min_layout.addWidget(self.slider_clim_min, stretch=1)
+        self.spinbox_clim_min = QSpinBox()
+        self.spinbox_clim_min.setRange(0, 100)
+        self.spinbox_clim_min.setValue(0)
+        self.spinbox_clim_min.valueChanged.connect(self._on_clim_spinbox_change)
+        min_layout.addWidget(self.spinbox_clim_min)
+        layout.addWidget(min_container)
+
+        # Max row: label + slider + spinbox
+        max_container = QWidget()
+        max_layout = QHBoxLayout(max_container)
+        max_layout.setContentsMargins(0, 0, 0, 0)
+        self.lbl_clim_max = QLabel("Max:")
+        max_layout.addWidget(self.lbl_clim_max)
+        self.slider_clim_max = QSlider(Qt.Horizontal)
+        self.slider_clim_max.setRange(0, 100)
+        self.slider_clim_max.setValue(100)
+        self.slider_clim_max.valueChanged.connect(self._on_clim_slider_change)
+        max_layout.addWidget(self.slider_clim_max, stretch=1)
+        self.spinbox_clim_max = QSpinBox()
+        self.spinbox_clim_max.setRange(0, 100)
+        self.spinbox_clim_max.setValue(100)
+        self.spinbox_clim_max.valueChanged.connect(self._on_clim_spinbox_change)
+        max_layout.addWidget(self.spinbox_clim_max)
+        layout.addWidget(max_container)
 
         # 6. Solid Color
         self.lbl_solid_color = QLabel("Solid Color:")
@@ -699,10 +843,12 @@ class RenderingParametersPanel(QGroupBox):
         self.block_signals(True)
         self.slider_clim_min.setRange(int(min_val), int(max_val))
         self.slider_clim_max.setRange(int(min_val), int(max_val))
+        self.spinbox_clim_min.setRange(int(min_val), int(max_val))
+        self.spinbox_clim_max.setRange(int(min_val), int(max_val))
         self.slider_clim_min.setValue(int(min_val))
         self.slider_clim_max.setValue(int(max_val))
-        self.val_clim_min.setText(f"{int(min_val)}")
-        self.val_clim_max.setText(f"{int(max_val)}")
+        self.spinbox_clim_min.setValue(int(min_val))
+        self.spinbox_clim_max.setValue(int(max_val))
         self.block_signals(False)
 
     def block_signals(self, block: bool):
@@ -711,6 +857,8 @@ class RenderingParametersPanel(QGroupBox):
         self.slider_slice_z.blockSignals(block)
         self.slider_clim_min.blockSignals(block)
         self.slider_clim_max.blockSignals(block)
+        self.spinbox_clim_min.blockSignals(block)
+        self.spinbox_clim_max.blockSignals(block)
 
     def get_current_values(self) -> Dict[str, Any]:
         return {
@@ -731,11 +879,30 @@ class RenderingParametersPanel(QGroupBox):
         self.threshold_value_label.setText(f"Value: {value}")
         self.threshold_changed.emit(value)
 
-    def _on_clim_change(self, value):
-        self.val_clim_min.setText(f"{self.slider_clim_min.value()}")
-        self.val_clim_max.setText(f"{self.slider_clim_max.value()}")
+    def _on_clim_slider_change(self, value):
+        """Slider changed -> sync spinbox and emit signal."""
+        self.spinbox_clim_min.blockSignals(True)
+        self.spinbox_clim_max.blockSignals(True)
+        self.spinbox_clim_min.setValue(self.slider_clim_min.value())
+        self.spinbox_clim_max.setValue(self.slider_clim_max.value())
+        self.spinbox_clim_min.blockSignals(False)
+        self.spinbox_clim_max.blockSignals(False)
+        # Ensure min <= max
         if self.slider_clim_min.value() > self.slider_clim_max.value():
             self.slider_clim_max.setValue(self.slider_clim_min.value())
+        self.clim_changed.emit()
+
+    def _on_clim_spinbox_change(self, value):
+        """Spinbox changed -> sync slider and emit signal."""
+        self.slider_clim_min.blockSignals(True)
+        self.slider_clim_max.blockSignals(True)
+        self.slider_clim_min.setValue(self.spinbox_clim_min.value())
+        self.slider_clim_max.setValue(self.spinbox_clim_max.value())
+        self.slider_clim_min.blockSignals(False)
+        self.slider_clim_max.blockSignals(False)
+        # Ensure min <= max
+        if self.spinbox_clim_min.value() > self.spinbox_clim_max.value():
+            self.spinbox_clim_max.setValue(self.spinbox_clim_min.value())
         self.clim_changed.emit()
 
     def _update_visibility(self):
@@ -743,12 +910,10 @@ class RenderingParametersPanel(QGroupBox):
         is_iso = (mode == 'iso')
         is_vol = (mode == 'volume')
         is_slice = (mode == 'slices')
-        # Mesh mode typically uses ISO logic for lighting, but no sliders needed usually.
-        # But if 'mesh', we might want to hide most sliders or show scalar selection.
-        # For now, treat 'mesh' as having minimal controls visible.
+        is_mesh = (mode == 'mesh')
 
         show_solid_col = is_iso and (self.coloring_mode_combo.currentText() == 'Solid Color')
-        show_cmap = is_vol or is_slice or (is_iso and not show_solid_col)
+        show_cmap = is_vol or is_slice or is_mesh or (is_iso and not show_solid_col)
         show_clim = is_vol or is_slice
 
         def visible(widgets, status):
@@ -767,8 +932,8 @@ class RenderingParametersPanel(QGroupBox):
         visible([self.lbl_opacity, self.opacity_combo], is_vol)
         visible([self.lbl_colormap, self.colormap_combo], show_cmap)
 
-        visible([self.lbl_clim, self.lbl_clim_min, self.slider_clim_min, self.val_clim_min,
-                 self.lbl_clim_max, self.slider_clim_max, self.val_clim_max], show_clim)
+        visible([self.lbl_clim, self.lbl_clim_min, self.slider_clim_min, self.spinbox_clim_min,
+                 self.lbl_clim_max, self.slider_clim_max, self.spinbox_clim_max], show_clim)
 
         visible([self.lbl_slice_x, self.slider_slice_x], is_slice)
         visible([self.lbl_slice_y, self.slider_slice_y], is_slice)

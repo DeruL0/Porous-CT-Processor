@@ -156,6 +156,12 @@ class PoreToSphereProcessor(BaseProcessor):
 
             sphere_glyph = pv.Sphere(theta_resolution=10, phi_resolution=10)
             pores_mesh = pore_cloud.glyph(scale="radius", geom=sphere_glyph)
+            
+            # Propagate PoreRadius scalar to glyph mesh for colormap
+            # Each sphere has sphere_glyph.n_points points, all should share the same radius
+            n_pts_per_sphere = sphere_glyph.n_points
+            pore_radius_scalars = np.repeat(pore_radii, n_pts_per_sphere)
+            pores_mesh["PoreRadius"] = pore_radius_scalars
         else:
             pores_mesh = pv.PolyData()
 
@@ -181,9 +187,49 @@ class PoreToSphereProcessor(BaseProcessor):
                 'max': float(np.max(throat_radii)),
                 'mean': float(np.mean(throat_radii))
             }
+        
+        # === NEW SCIENTIFIC METRICS ===
+        
+        # 1. Porosity (from segmented data)
+        total_voxels = segmented_regions.size
+        pore_voxels = np.sum(segmented_regions > 0)
+        porosity = pore_voxels / total_voxels if total_voxels > 0 else 0
+        
+        # 2. Kozeny-Carman Permeability Estimation
+        # k = (ε³ × d²) / (180 × (1-ε)²) in m²
+        # Convert to milliDarcy (1 Darcy = 9.869e-13 m²)
+        permeability_md = 0.0
+        if len(pore_radii) > 0 and porosity > 0 and porosity < 1:
+            mean_diameter = 2 * np.mean(pore_radii) * 1e-3  # mm to m
+            k_m2 = (porosity**3 * mean_diameter**2) / (180 * (1 - porosity)**2)
+            permeability_md = k_m2 / 9.869e-16  # Convert m² to milliDarcy
+        
+        # 3. Tortuosity Estimation (Bruggeman model)
+        # τ = 1 / √ε (simplified)
+        tortuosity = 1.0 / np.sqrt(porosity) if porosity > 0 else float('inf')
+        
+        # 4. Coordination Number (average connections per pore)
+        coordination_number = 0.0
+        if num_pores > 0:
+            coordination_number = (2 * len(connections)) / num_pores
+        
+        # 5. Connected Pore Fraction (uses existing connectivity analysis)
+        connected_fraction = 100.0 - largest_pore_ratio if largest_pore_ratio > 0 else 0
+        # Actually, largest_pore_ratio IS the connected fraction of the largest cluster
+        # Let's calculate what % of pores are in connected clusters (have at least 1 connection)
+        connected_pore_ids = set()
+        for id_a, id_b in connections:
+            connected_pore_ids.add(id_a)
+            connected_pore_ids.add(id_b)
+        connected_pore_fraction = (len(connected_pore_ids) / num_pores * 100) if num_pores > 0 else 0
 
         # --- Step 5: Combine ---
         report(95, "Merging geometry...")
+        
+        # Add PoreRadius field to throats_mesh (0 for throats) to ensure merge preserves this field
+        if throats_mesh.n_points > 0:
+            throats_mesh["PoreRadius"] = np.zeros(throats_mesh.n_points)
+        
         combined_mesh = pores_mesh.merge(throats_mesh)
 
         report(100, "PNM Generation Complete.")
@@ -202,7 +248,13 @@ class PoreToSphereProcessor(BaseProcessor):
                 "PoreSizeDistribution": size_distribution,
                 "LargestPoreRatio": f"{largest_pore_ratio:.2f}%",
                 "ThroatStats": throat_stats,
-                "PoreRadii": pore_radii.tolist()  # For visualization
+                "PoreRadii": pore_radii.tolist(),
+                # Scientific Analysis
+                "Porosity": f"{porosity * 100:.2f}%",
+                "Permeability_mD": f"{permeability_md:.4f}",
+                "Tortuosity": f"{tortuosity:.3f}",
+                "CoordinationNumber": f"{coordination_number:.2f}",
+                "ConnectedPoreFraction": f"{connected_pore_fraction:.1f}%"
             }
         )
 
