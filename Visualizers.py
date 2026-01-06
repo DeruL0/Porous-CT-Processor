@@ -11,7 +11,13 @@ from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont
 
 from Core import BaseVisualizer, VolumeData
-from GUI import VisualizationModePanel, RenderingParametersPanel, InfoPanel, ClipPlanePanel, ROIPanel
+from gui.panels import (
+    VisualizationModePanel, 
+    RenderingParametersPanel, 
+    InfoPanel, 
+    ClipPlanePanel, 
+    ROIPanel
+)
 
 
 # Resolve Metaclass conflict between PyQt5 and ABC
@@ -833,3 +839,391 @@ class GuiVisualizer(QMainWindow, BaseVisualizer, metaclass=VisualizerMeta):
             self.plotter.remove_all_lights()
             self.plotter.add_light(pv.Light(position=light_pos, intensity=1.0))
             self.update_status("Error generating isosurface.")
+
+
+# ==========================================
+# Renderer Class (Decoupled from QMainWindow)
+# ==========================================
+
+class Renderer:
+    """
+    Pure 3D rendering class.
+    Handles PyVista rendering without any QMainWindow dependencies.
+    Receives panel references and plotter from MainWindow.
+    """
+    
+    def __init__(self, plotter, params_panel, info_panel, clip_panel, roi_panel, status_callback=None):
+        """
+        Initialize renderer with external dependencies.
+        
+        Args:
+            plotter: BackgroundPlotter instance
+            params_panel: RenderingParametersPanel instance
+            info_panel: InfoPanel instance
+            clip_panel: ClipPlanePanel instance
+            roi_panel: ROIPanel instance
+            status_callback: Function to call for status updates
+        """
+        self.plotter = plotter
+        self.params_panel = params_panel
+        self.info_panel = info_panel
+        self.clip_panel = clip_panel
+        self.roi_panel = roi_panel
+        self._status_callback = status_callback
+        
+        # Data state
+        self.data: Optional[VolumeData] = None
+        self.grid: Optional[pv.ImageData] = None
+        self.mesh: Optional[pv.PolyData] = None
+        self.active_view_mode: Optional[str] = None
+        
+        # Caches
+        self._iso_cache: Dict[int, pv.PolyData] = {}
+        self._cached_vol_grid: Optional[pv.PolyData] = None
+        self._cached_vol_grid_source: Optional[int] = None
+        
+        # Actors
+        self.volume_actor = None
+        
+        # Data manager reference
+        self._data_manager = None
+    
+    def update_status(self, message: str):
+        """Update status via callback."""
+        if self._status_callback:
+            self._status_callback(message)
+        else:
+            print(f"[Renderer] {message}")
+    
+    def set_data_manager(self, data_manager):
+        """Set reference to DataManager for centralized data flow."""
+        self._data_manager = data_manager
+    
+    def set_data(self, data: VolumeData):
+        """Load data and trigger appropriate rendering."""
+        self.data = data
+        self.grid = None
+        self.mesh = None
+        self.volume_actor = None
+        self._iso_cache = {}
+        self._cached_vol_grid = None
+        
+        d_type = self.data.metadata.get('Type', 'Unknown')
+        
+        if self.data.has_mesh:
+            self.mesh = self.data.mesh
+            self.update_status(f"Loaded Mesh: {d_type}")
+            self.render_mesh(reset_view=True)
+            self.info_panel.update_info(d_type, (0, 0, 0), self.data.spacing, self.data.metadata)
+        
+        elif self.data.raw_data is not None:
+            self._create_pyvista_grid()
+            self.update_status(f"Loaded Volume: {d_type}")
+            
+            is_processed = ("Processed" in d_type)
+            default_color = "red" if is_processed else "ivory"
+            idx = self.params_panel.solid_color_combo.findText(default_color)
+            if idx >= 0:
+                self.params_panel.solid_color_combo.setCurrentIndex(idx)
+            
+            min_val = np.nanmin(self.data.raw_data)
+            max_val = np.nanmax(self.data.raw_data)
+            self.params_panel.set_data_range(min_val, max_val)
+            
+            dims = self.grid.dimensions
+            self.params_panel.set_slice_limits(dims[0] - 1, dims[1] - 1, dims[2] - 1)
+            self.params_panel.set_slice_defaults(dims[0] // 2, dims[1] // 2, dims[2] // 2)
+            
+            self.render_volume(reset_view=True)
+            self.info_panel.update_info(d_type, self.data.dimensions, self.data.spacing, self.data.metadata)
+    
+    def _create_pyvista_grid(self):
+        if not self.data or self.data.raw_data is None:
+            return
+        grid = pv.ImageData()
+        grid.dimensions = np.array(self.data.raw_data.shape) + 1
+        grid.origin = self.data.origin
+        grid.spacing = self.data.spacing
+        grid.cell_data["values"] = self.data.raw_data.flatten(order="F")
+        self.grid = grid
+    
+    def clear_view(self):
+        self.plotter.clear()
+        self.plotter.add_axes()
+        self.active_view_mode = None
+        self.volume_actor = None
+        self.params_panel.set_mode(None)
+    
+    def reset_camera(self):
+        self.plotter.reset_camera()
+        self.plotter.view_isometric()
+    
+    def render_mesh(self, reset_view=True):
+        """Render PNM mesh with PoreRadius colormap."""
+        if not self.mesh:
+            return
+        if reset_view or self.active_view_mode != 'mesh':
+            self.clear_view()
+            self.active_view_mode = 'mesh'
+            self._update_clip_panel_state()
+            self.params_panel.set_mode('mesh')
+            self.plotter.enable_lightkit()
+        
+        params = self.params_panel.get_current_values()
+        
+        if "PoreRadius" in self.mesh.point_data:
+            self.plotter.add_mesh(
+                self.mesh,
+                scalars="PoreRadius",
+                cmap=params['colormap'],
+                show_scalar_bar=True,
+                scalar_bar_args={'title': 'Pore Radius (mm)'},
+                smooth_shading=True,
+                specular=0.5
+            )
+        elif "IsPore" in self.mesh.array_names:
+            self.plotter.add_mesh(
+                self.mesh,
+                scalars="IsPore",
+                cmap=["gray", "red"],
+                categories=True,
+                show_scalar_bar=False,
+                smooth_shading=True,
+                specular=0.5
+            )
+        else:
+            self.plotter.add_mesh(self.mesh, color='gold', smooth_shading=True, specular=0.5)
+        
+        if reset_view:
+            self.reset_camera()
+    
+    def render_volume(self, reset_view=True):
+        """Optimized volume rendering."""
+        if not self.grid:
+            return
+        
+        if reset_view or self.active_view_mode != 'volume' or self.volume_actor is None:
+            self.update_status("Rendering volume (New)...")
+            self.clear_view()
+            self.active_view_mode = 'volume'
+            self._update_clip_panel_state()
+            self.params_panel.set_mode('volume')
+            self.plotter.enable_lightkit()
+            
+            if not hasattr(self, '_cached_vol_grid') or self._cached_vol_grid is None or self._cached_vol_grid_source != id(self.grid):
+                self._cached_vol_grid = self.grid.cell_data_to_point_data()
+                self._cached_vol_grid_source = id(self.grid)
+            
+            vol_grid = self._cached_vol_grid
+            params = self.params_panel.get_current_values()
+            
+            self.volume_actor = self.plotter.add_volume(
+                vol_grid,
+                cmap=params['colormap'],
+                opacity=params['opacity'],
+                clim=params['clim'],
+                shade=False
+            )
+            self.plotter.add_axes()
+            if reset_view:
+                self.reset_camera()
+        else:
+            self.update_status("Updating volume properties...")
+            params = self.params_panel.get_current_values()
+            vol_grid = self._cached_vol_grid if hasattr(self, '_cached_vol_grid') else self.grid.cell_data_to_point_data()
+            
+            old_actor = self.volume_actor
+            new_actor = self.plotter.add_volume(
+                vol_grid,
+                cmap=params['colormap'],
+                opacity=params['opacity'],
+                clim=params['clim'],
+                shade=False,
+                render=False
+            )
+            
+            if new_actor.mapper:
+                new_actor.mapper.scalar_range = params['clim']
+            
+            if old_actor:
+                self.plotter.remove_actor(old_actor, render=False)
+            
+            self.volume_actor = new_actor
+            self.plotter.render()
+    
+    def render_slices(self, reset_view=True):
+        """Render orthogonal slices."""
+        if not self.grid:
+            return
+        
+        if reset_view or self.active_view_mode != 'slices':
+            self.clear_view()
+            self.active_view_mode = 'slices'
+            self._update_clip_panel_state()
+            self.params_panel.set_mode('slices')
+            self.plotter.enable_lightkit()
+            self.plotter.show_grid()
+        
+        params = self.params_panel.get_current_values()
+        ox, oy, oz = self.grid.origin
+        dx, dy, dz = self.grid.spacing
+        x = ox + params['slice_x'] * dx
+        y = oy + params['slice_y'] * dy
+        z = oz + params['slice_z'] * dz
+        
+        self.plotter.clear_actors()
+        slices = self.grid.slice_orthogonal(x=x, y=y, z=z)
+        self.plotter.add_mesh(slices, cmap=params['colormap'], clim=params['clim'], show_scalar_bar=False)
+        self.plotter.add_axes()
+        if reset_view:
+            self.reset_camera()
+    
+    def render_isosurface_auto(self, reset_view=True):
+        """Render isosurface with current threshold."""
+        if not self.grid:
+            return
+        params = self.params_panel.get_current_values()
+        self.render_isosurface(threshold=params['threshold'], reset_view=reset_view)
+    
+    def render_isosurface(self, threshold=300, reset_view=True):
+        """Render isosurface at specified threshold."""
+        if not self.grid:
+            return
+        
+        self.update_status(f"Generating isosurface ({threshold})...")
+        
+        if reset_view or self.active_view_mode != 'iso':
+            self.clear_view()
+            self.active_view_mode = 'iso'
+            self._update_clip_panel_state()
+            self.params_panel.set_mode('iso')
+            self.plotter.enable_lightkit()
+        
+        try:
+            if threshold in self._iso_cache:
+                iso_mesh = self._iso_cache[threshold]
+            else:
+                iso_mesh = self.grid.cell_data_to_point_data().contour([threshold])
+                self._iso_cache[threshold] = iso_mesh
+            
+            if iso_mesh.n_points == 0:
+                self.update_status("No surface at this threshold.")
+                return
+            
+            params = self.params_panel.get_current_values()
+            style_map = {'Surface': 'surface', 'Wireframe': 'wireframe', 'Wireframe + Surface': 'surface'}
+            render_style = style_map.get(params['render_style'], 'surface')
+            show_edges = (params['render_style'] == 'Wireframe + Surface')
+            
+            mesh_kwargs = {
+                'style': render_style,
+                'show_edges': show_edges,
+                'smooth_shading': True,
+                'specular': 0.4,
+                'diffuse': 0.7,
+                'ambient': 0.15,
+                'lighting': True
+            }
+            
+            mode = params['coloring_mode']
+            if mode == 'Solid Color':
+                self.plotter.add_mesh(iso_mesh, color=params['solid_color'], **mesh_kwargs)
+            elif mode == 'Depth (Z-Axis)':
+                iso_mesh["Elevation"] = iso_mesh.points[:, 2]
+                self.plotter.add_mesh(iso_mesh, scalars="Elevation", cmap=params['colormap'], **mesh_kwargs)
+            elif mode == 'Radial (Center Dist)':
+                center = iso_mesh.center
+                distances = np.linalg.norm(iso_mesh.points - center, axis=1)
+                iso_mesh["Radial"] = distances
+                self.plotter.add_mesh(iso_mesh, scalars="Radial", cmap=params['colormap'], **mesh_kwargs)
+            
+            self._apply_custom_lighting(params)
+            
+            if reset_view:
+                self.reset_camera()
+        except Exception as e:
+            print(e)
+            self.update_status("Error generating isosurface.")
+    
+    def _update_clip_panel_state(self):
+        """Enable/Disable clip panel based on active mode."""
+        if not self.clip_panel:
+            return
+        
+        supported_modes = ['volume', 'mesh', 'iso']
+        is_supported = self.active_view_mode in supported_modes
+        self.clip_panel.setEnabled(is_supported)
+        
+        self.clip_panel.enable_checkbox.blockSignals(True)
+        self.clip_panel.enable_checkbox.setChecked(False)
+        self.clip_panel.enable_checkbox.blockSignals(False)
+        self.clip_panel._enabled = False
+        self.clip_panel._update_slider_state()
+    
+    def _on_clip_toggled(self, enabled: bool):
+        """Handle clip plane toggle."""
+        if enabled:
+            self._apply_clip_planes()
+        else:
+            if self.active_view_mode == 'volume':
+                self.render_volume(reset_view=True)
+            elif self.active_view_mode == 'slices':
+                self.render_slices(reset_view=True)
+            elif self.active_view_mode == 'iso':
+                self.render_isosurface_auto(reset_view=True)
+            elif self.active_view_mode == 'mesh':
+                self.render_mesh(reset_view=True)
+    
+    def _apply_clip_planes(self):
+        """Apply clip planes (simplified version)."""
+        # Implementation would be similar to GuiVisualizer._apply_clip_planes
+        pass
+    
+    def _on_roi_toggled(self, enabled: bool):
+        """Handle ROI mode toggle."""
+        if enabled and self.grid:
+            bounds = self.grid.bounds
+            self.plotter.add_box_widget(
+                callback=self._on_roi_bounds_changed,
+                bounds=bounds,
+                factor=1.0,
+                rotation_enabled=False,
+                color='cyan',
+                use_planes=False
+            )
+            self.update_status("ROI mode: Drag the box to select region")
+        else:
+            self.plotter.clear_box_widgets()
+            self.roi_panel.update_bounds(None)
+            self.update_status("ROI mode disabled")
+    
+    def _on_roi_bounds_changed(self, bounds):
+        """Callback when ROI box moves."""
+        if hasattr(bounds, 'bounds'):
+            actual_bounds = bounds.bounds
+        else:
+            actual_bounds = bounds
+        self.roi_panel.update_bounds(actual_bounds)
+    
+    def _on_apply_roi(self):
+        """Apply ROI selection."""
+        # Implementation similar to GuiVisualizer._on_apply_roi
+        pass
+    
+    def _on_reset_roi(self):
+        """Reset ROI selection."""
+        self.plotter.clear_box_widgets()
+        if self._data_manager:
+            self._data_manager.clear_roi()
+            if self._data_manager.raw_ct_data:
+                self.set_data(self._data_manager.raw_ct_data)
+        self.update_status("ROI reset")
+    
+    def _apply_custom_lighting(self, params):
+        """Apply custom lighting configuration."""
+        if 'light_angle' in params and params['light_angle'] is not None:
+            angle = params['light_angle']
+            rad = math.radians(angle)
+            light_pos = [10 * math.cos(rad), 10 * math.sin(rad), 10]
+            self.plotter.remove_all_lights()
+            self.plotter.add_light(pv.Light(position=light_pos, intensity=1.0))

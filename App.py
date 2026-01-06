@@ -6,15 +6,15 @@ from PyQt5.QtWidgets import QApplication, QFileDialog, QMessageBox, QProgressDia
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
 
 # Import Core Logic
-from Core import BaseLoader, VolumeData, BaseProcessor
-from Loaders import DicomSeriesLoader, DummyLoader, FastDicomLoader
-from Processors import PoreExtractionProcessor, PoreToSphereProcessor
-from DataManager import ScientificDataManager
-from Exporters import VTKExporter
+from core import BaseLoader, VolumeData, BaseProcessor
+from loaders import DicomSeriesLoader, DummyLoader, FastDicomLoader
+from processors import PoreExtractionProcessor, PoreToSphereProcessor
+from data_manager import ScientificDataManager
+from exporters import VTKExporter
 
 # Import View and UI Components
-from Visualizers import GuiVisualizer
-from GUI import StructureProcessingPanel, StatisticsPanel
+from visualizers import GuiVisualizer
+from gui import StructureProcessingPanel, StatisticsPanel
 
 
 class ProcessorWorker(QThread):
