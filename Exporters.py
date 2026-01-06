@@ -1,6 +1,6 @@
 import numpy as np
 import pyvista as pv
-from Core import VolumeData
+from core import VolumeData
 
 
 class VTKExporter:

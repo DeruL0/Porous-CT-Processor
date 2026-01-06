@@ -1,5 +1,5 @@
 from typing import Optional
-from Core import VolumeData
+from core import VolumeData
 
 
 class ScientificDataManager:

@@ -4,7 +4,7 @@ import pyvista as pv
 from skimage.segmentation import watershed
 from skimage.feature import peak_local_max
 from typing import Tuple, Dict, Set, Optional, Callable
-from Core import BaseProcessor, VolumeData
+from core import BaseProcessor, VolumeData
 
 
 # ==========================================

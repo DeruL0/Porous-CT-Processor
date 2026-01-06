@@ -1,7 +1,7 @@
 import unittest
 import numpy as np
-from Core import VolumeData
-from Processors import PoreExtractionProcessor, PoreToSphereProcessor
+from core import VolumeData
+from processors import PoreExtractionProcessor, PoreToSphereProcessor
 
 class TestProcessors(unittest.TestCase):
     def setUp(self):

@@ -4,7 +4,7 @@ import pydicom
 from glob import glob
 from typing import List, Tuple
 from scipy.ndimage import gaussian_filter
-from Core import BaseLoader, VolumeData
+from core import BaseLoader, VolumeData
 
 
 # ==========================================

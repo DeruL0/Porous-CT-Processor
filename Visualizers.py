@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont
 
-from Core import BaseVisualizer, VolumeData
+from core import BaseVisualizer, VolumeData
 from gui.panels import (
     VisualizationModePanel, 
     RenderingParametersPanel, 

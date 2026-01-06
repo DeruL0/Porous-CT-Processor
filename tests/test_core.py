@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from Core import VolumeData
+from core import VolumeData
 
 class TestVolumeData(unittest.TestCase):
     def test_initialization(self):
