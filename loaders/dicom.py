@@ -1,19 +1,43 @@
 """
 DICOM series loaders for CT/Micro-CT data.
+Optimized for uncompressed files with parallel reading and filename-based sorting.
 """
 
 import os
 import re
 import numpy as np
 import pydicom
+import concurrent.futures
 from glob import glob
 from typing import List, Tuple, Optional, Callable
 
 from core import BaseLoader, VolumeData
 
 
+def _natural_sort_key(text: str):
+    """Natural sorting key for filenames like img_1, img_2, ..., img_10"""
+    return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', text)]
+
+
 class DicomSeriesLoader(BaseLoader):
-    """Concrete DICOM series loader for Industrial CT/Micro-CT scans"""
+    """Concrete DICOM series loader for Industrial CT/Micro-CT scans.
+    
+    Optimized for performance with:
+    - Filename-based natural sorting (default, fast and reliable)
+    - Optional header-based sorting verification
+    - Parallel file reading using ThreadPoolExecutor
+    """
+
+    def __init__(self, use_header_sort: bool = True, max_workers: int = 4):
+        """
+        Args:
+            use_header_sort: If True, sort files using ImagePositionPatient headers (default).
+                            This ensures correct Z-axis ordering regardless of filename.
+                            Falls back to filename sort if headers are missing/corrupt.
+            max_workers: Number of parallel threads for file reading.
+        """
+        self.use_header_sort = use_header_sort
+        self.max_workers = max_workers
 
     def load(self, folder_path: str, callback: Optional[Callable[[int, str], None]] = None) -> VolumeData:
         print(f"[Loader] Scanning sample folder: {folder_path} ...")
@@ -23,18 +47,38 @@ class DicomSeriesLoader(BaseLoader):
             raise FileNotFoundError(f"Path does not exist: {folder_path}")
 
         files = self._find_dicom_files(folder_path)
-        if callback: callback(10, f"Found {len(files)} files. Reading headers...")
+        if callback: callback(10, f"Found {len(files)} files. Sorting...")
         
-        slices = self._read_and_sort_slices(files)
-        if callback: callback(30, "Headers read. Building 3D volume...")
-
+        # Sort files by filename (natural sort)
+        files.sort(key=lambda f: _natural_sort_key(os.path.basename(f)))
+        
+        # Optionally verify with header positions
+        if self.use_header_sort:
+            files = self._verify_sort_with_headers(files, callback)
+        
+        if callback: callback(20, f"Reading {len(files)} slices...")
+        slices = self._parallel_read_files(files, callback)
+        
+        if not slices:
+            raise ValueError("No valid DICOM slices loaded.")
+        
+        # Sort slices by ImagePositionPatient if available (ensures correct Z-order)
+        if len(slices) > 1 and hasattr(slices[0], 'ImagePositionPatient'):
+            try:
+                slices.sort(key=lambda s: float(s.ImagePositionPatient[2]))
+                print(f"[Loader] Sorted by ImagePositionPatient Z: {slices[0].ImagePositionPatient[2]:.2f} -> {slices[-1].ImagePositionPatient[2]:.2f}")
+            except Exception as e:
+                print(f"[Loader] Warning: Could not sort by header position: {e}")
+        
+        if callback: callback(50, "Building 3D volume...")
         volume, spacing, origin = self._build_volume(slices, callback)
 
         metadata = {
             "SampleID": getattr(slices[0], "PatientID", "Unknown Sample"),
             "ScanType": getattr(slices[0], "Modality", "CT"),
             "SliceCount": len(slices),
-            "Description": getattr(slices[0], "StudyDescription", "No Description")
+            "Description": getattr(slices[0], "StudyDescription", "No Description"),
+            "SortMethod": "Header (ImagePositionPatient)" if hasattr(slices[0], 'ImagePositionPatient') else "Filename"
         }
 
         print(f"[Loader] Loading complete: {volume.shape}, Voxel Spacing: {spacing}")
@@ -42,8 +86,10 @@ class DicomSeriesLoader(BaseLoader):
         return VolumeData(raw_data=volume, spacing=spacing, origin=origin, metadata=metadata)
 
     def _find_dicom_files(self, folder_path: str) -> List[str]:
+        """Find DICOM files in folder, checking extension first then content."""
         files = glob(os.path.join(folder_path, "*.dcm"))
         if not files:
+            # Check all files for DICOM magic bytes or valid header
             all_files = glob(os.path.join(folder_path, "*"))
             files = []
             for f in all_files:
@@ -57,42 +103,95 @@ class DicomSeriesLoader(BaseLoader):
             raise FileNotFoundError("No valid DICOM/CT files found")
         return files
 
-    def _read_and_sort_slices(self, files: List[str]) -> List[pydicom.dataset.FileDataset]:
-        slices = []
-        for f in files:
-            try:
-                ds = pydicom.dcmread(f)
+    def _verify_sort_with_headers(self, files: List[str], 
+                                   callback: Optional[Callable] = None) -> List[str]:
+        """Optionally verify sort order using ImagePositionPatient headers."""
+        try:
+            file_positions = []
+            total = len(files)
+            for i, f in enumerate(files):
+                if callback and i % 50 == 0:
+                    callback(10 + int(10 * i / total), f"Reading header {i+1}/{total}...")
+                ds = pydicom.dcmread(f, stop_before_pixels=True)
                 if hasattr(ds, 'ImagePositionPatient'):
-                    slices.append(ds)
+                    file_positions.append((f, float(ds.ImagePositionPatient[2])))
+                else:
+                    print(f"[Loader] Header missing ImagePositionPatient, using filename order")
+                    return files
+            
+            # Sort by Z position
+            file_positions.sort(key=lambda x: x[1])
+            print(f"[Loader] Header sort verified. Z-range: {file_positions[0][1]:.2f} -> {file_positions[-1][1]:.2f}")
+            return [fp[0] for fp in file_positions]
+        except Exception as e:
+            print(f"[Loader] Header sort failed ({e}), using filename order")
+            return files
+
+    def _parallel_read_files(self, files: List[str], 
+                             callback: Optional[Callable] = None) -> List[pydicom.dataset.FileDataset]:
+        """Parallel DICOM file reading using ThreadPoolExecutor."""
+        def read_single(args):
+            idx, f = args
+            try:
+                return (idx, pydicom.dcmread(f))
             except Exception as e:
-                print(f"Warning: Skipping file {f} - {e}")
+                print(f"Warning: Failed to read {f} - {e}")
+                return (idx, None)
+        
+        total = len(files)
+        results = [None] * total
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(read_single, (i, f)): i for i, f in enumerate(files)}
+            completed = 0
+            for future in concurrent.futures.as_completed(futures):
+                idx, ds = future.result()
+                results[idx] = ds
+                completed += 1
+                if callback and completed % 20 == 0:
+                    percent = 20 + int(30 * completed / total)
+                    callback(percent, f"Reading slice {completed}/{total}...")
+        
+        return [r for r in results if r is not None]
 
-        slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
-        return slices
-
-    def _build_volume(self, slices: List[pydicom.dataset.FileDataset], callback: Optional[Callable] = None) -> Tuple[np.ndarray, tuple, tuple]:
+    def _build_volume(self, slices: List[pydicom.dataset.FileDataset], 
+                      callback: Optional[Callable] = None) -> Tuple[np.ndarray, tuple, tuple]:
+        """Build 3D volume from DICOM slices with optimized memory operations."""
         pixel_spacing = slices[0].PixelSpacing
         if len(slices) > 1:
-            z_spacing = abs(slices[1].ImagePositionPatient[2] - slices[0].ImagePositionPatient[2])
+            # Use header positions if available, otherwise estimate
+            if hasattr(slices[0], 'ImagePositionPatient') and hasattr(slices[1], 'ImagePositionPatient'):
+                z_spacing = abs(slices[1].ImagePositionPatient[2] - slices[0].ImagePositionPatient[2])
+            else:
+                z_spacing = getattr(slices[0], 'SliceThickness', 1.0)
         else:
             z_spacing = getattr(slices[0], 'SliceThickness', 1.0)
 
         spacing = (float(pixel_spacing[0]), float(pixel_spacing[1]), float(z_spacing))
-        origin = tuple(slices[0].ImagePositionPatient)
+        origin = tuple(getattr(slices[0], 'ImagePositionPatient', (0.0, 0.0, 0.0)))
 
         img_shape = list(slices[0].pixel_array.shape)
         img_shape.insert(0, len(slices))
-        volume = np.zeros(img_shape, dtype=np.float32)
+        
+        # Pre-allocate with np.empty (faster than zeros)
+        volume = np.empty(img_shape, dtype=np.float32)
 
         total = len(slices)
         for i, s in enumerate(slices):
-            if callback and i % 10 == 0:
-                percent = 30 + int(70 * i / total)
-                callback(percent, f"Loading slice {i+1}/{total}...")
-                
-            slope = getattr(s, 'RescaleSlope', 1)
-            intercept = getattr(s, 'RescaleIntercept', 0)
-            volume[i, :, :] = s.pixel_array * slope + intercept
+            if callback and i % 20 == 0:
+                percent = 50 + int(50 * i / total)
+                callback(percent, f"Building volume {i+1}/{total}...")
+            
+            slope = float(getattr(s, 'RescaleSlope', 1))
+            intercept = float(getattr(s, 'RescaleIntercept', 0))
+            
+            # Optimized: direct assignment with type conversion
+            arr = s.pixel_array.astype(np.float32)
+            if slope != 1.0:
+                arr *= slope
+            if intercept != 0.0:
+                arr += intercept
+            volume[i] = arr
 
         return volume, spacing, origin
 
@@ -103,7 +202,8 @@ class FastDicomLoader(DicomSeriesLoader):
     Essential for previewing large Micro-CT datasets.
     """
 
-    def __init__(self, step: int = 2):
+    def __init__(self, step: int = 2, max_workers: int = 4):
+        super().__init__(use_header_sort=False, max_workers=max_workers)
         self.step = step
 
     def load(self, folder_path: str, callback: Optional[Callable[[int, str], None]] = None) -> VolumeData:
@@ -117,55 +217,53 @@ class FastDicomLoader(DicomSeriesLoader):
         if not files:
             raise FileNotFoundError("No valid DICOM/CT files found")
 
-        def natural_keys(text):
-            return [int(c) if c.isdigit() else c for c in re.split(r'(\d+)', text)]
-
-        print("[Loader] Attempting natural filename sort...")
+        print("[Loader] Sorting files by natural filename order...")
         if callback: callback(10, "Sorting files...")
-        files.sort(key=lambda f: natural_keys(os.path.basename(f)))
+        files.sort(key=lambda f: _natural_sort_key(os.path.basename(f)))
 
         selected_files = files[::self.step]
-        print(f"[Loader] Selected {len(selected_files)} / {len(files)} files via filename sort.")
+        print(f"[Loader] Selected {len(selected_files)} / {len(files)} files.")
 
-        slices = []
-        total_selected = len(selected_files)
-        for i, f in enumerate(selected_files):
-            if callback and i % 20 == 0:
-                percent = 10 + int(20 * i / total_selected)
-                callback(percent, f"Reading headers {i}/{total_selected}...")
-            try:
-                ds = pydicom.dcmread(f)
-                slices.append(ds)
-            except Exception as e:
-                print(f"Warning: Failed to read {f} - {e}")
+        if callback: callback(20, f"Reading {len(selected_files)} slices...")
+        slices = self._parallel_read_files(selected_files, callback)
         
-        if len(slices) > 1:
-            z_start = float(slices[0].ImagePositionPatient[2])
-            z_end = float(slices[-1].ImagePositionPatient[2])
-            print(f"[Loader] Z-Range: {z_start} -> {z_end}")
-
         if not slices:
             raise ValueError("No valid slices loaded.")
+        
+        # Sort slices by ImagePositionPatient if available (ensures correct Z-order)
+        if len(slices) > 1 and hasattr(slices[0], 'ImagePositionPatient'):
+            try:
+                slices.sort(key=lambda s: float(s.ImagePositionPatient[2]))
+                z_start = float(slices[0].ImagePositionPatient[2])
+                z_end = float(slices[-1].ImagePositionPatient[2])
+                print(f"[Loader] Sorted by Z-position: {z_start:.2f} -> {z_end:.2f}")
+            except Exception as e:
+                print(f"[Loader] Warning: Could not sort by header position: {e}")
 
-        if callback: callback(30, "Headers read. Building downsampled volume...")
+        if callback: callback(50, "Building downsampled volume...")
         volume, spacing, origin = self._build_volume_downsampled(slices, callback)
 
         metadata = {
             "SampleID": getattr(slices[0], "PatientID", "Unknown Sample"),
             "ScanType": getattr(slices[0], "Modality", "CT"),
             "SliceCount": len(slices),
-            "Type": "Fast/Downsampled (Filename Sorted)"
+            "Type": "Fast/Downsampled",
+            "SortMethod": "Header (ImagePositionPatient)" if hasattr(slices[0], 'ImagePositionPatient') else "Filename"
         }
 
         print(f"[Loader] Fast Load complete: {volume.shape}, Spacing: {spacing}")
         if callback: callback(100, "Fast load complete.")
         return VolumeData(raw_data=volume, spacing=spacing, origin=origin, metadata=metadata)
 
-    def _build_volume_downsampled(self, slices: List[pydicom.dataset.FileDataset], callback: Optional[Callable] = None) -> Tuple[np.ndarray, tuple, tuple]:
+    def _build_volume_downsampled(self, slices: List[pydicom.dataset.FileDataset], 
+                                   callback: Optional[Callable] = None) -> Tuple[np.ndarray, tuple, tuple]:
         pixel_spacing = slices[0].PixelSpacing
 
         if len(slices) > 1:
-            z_spacing = abs(slices[1].ImagePositionPatient[2] - slices[0].ImagePositionPatient[2])
+            if hasattr(slices[0], 'ImagePositionPatient') and hasattr(slices[1], 'ImagePositionPatient'):
+                z_spacing = abs(slices[1].ImagePositionPatient[2] - slices[0].ImagePositionPatient[2])
+            else:
+                z_spacing = getattr(slices[0], 'SliceThickness', 1.0) * self.step
         else:
             z_spacing = getattr(slices[0], 'SliceThickness', 1.0) * self.step
 
@@ -174,26 +272,30 @@ class FastDicomLoader(DicomSeriesLoader):
             float(pixel_spacing[1]) * self.step,
             float(z_spacing)
         )
-        origin = tuple(slices[0].ImagePositionPatient)
+        origin = tuple(getattr(slices[0], 'ImagePositionPatient', (0.0, 0.0, 0.0)))
 
         base_shape = slices[0].pixel_array.shape
         new_h = base_shape[0] // self.step
         new_w = base_shape[1] // self.step
 
         img_shape = (len(slices), new_h, new_w)
-        volume = np.zeros(img_shape, dtype=np.float32)
+        volume = np.empty(img_shape, dtype=np.float32)
 
         total = len(slices)
         for i, s in enumerate(slices):
             if callback and i % 10 == 0:
-                percent = 30 + int(70 * i / total)
+                percent = 50 + int(50 * i / total)
                 callback(percent, f"Downsampling slice {i+1}/{total}...")
                 
-            slope = getattr(s, 'RescaleSlope', 1)
-            intercept = getattr(s, 'RescaleIntercept', 0)
-            arr = s.pixel_array[::self.step, ::self.step]
+            slope = float(getattr(s, 'RescaleSlope', 1))
+            intercept = float(getattr(s, 'RescaleIntercept', 0))
+            arr = s.pixel_array[::self.step, ::self.step].astype(np.float32)
             arr = arr[:new_h, :new_w]
-            volume[i, :, :] = arr * slope + intercept
+            if slope != 1.0:
+                arr *= slope
+            if intercept != 0.0:
+                arr += intercept
+            volume[i] = arr
 
         return volume, spacing, origin
 
@@ -204,7 +306,8 @@ class MemoryMappedDicomLoader(DicomSeriesLoader):
     Uses numpy memory-mapping to avoid loading entire volume into RAM.
     """
     
-    def __init__(self, cache_dir: str = None):
+    def __init__(self, cache_dir: str = None, use_header_sort: bool = False, max_workers: int = 4):
+        super().__init__(use_header_sort=use_header_sort, max_workers=max_workers)
         import tempfile
         self.cache_dir = cache_dir or tempfile.gettempdir()
     
@@ -216,41 +319,34 @@ class MemoryMappedDicomLoader(DicomSeriesLoader):
             raise FileNotFoundError(f"Path does not exist: {folder_path}")
         
         files = self._find_dicom_files(folder_path)
-        if callback: callback(10, f"Found {len(files)} files. Reading metadata...")
+        if callback: callback(10, f"Found {len(files)} files. Sorting...")
         
-        first_ds = pydicom.dcmread(files[0], stop_before_pixels=True)
+        # Sort by filename first
+        files.sort(key=lambda f: _natural_sort_key(os.path.basename(f)))
         
-        file_positions = []
-        total_files = len(files)
-        for i, f in enumerate(files):
-            if callback and i % 50 == 0:
-                percent = 10 + int(20 * i / total_files)
-                callback(percent, f"Reading headers {i}/{total_files}...")
-            try:
-                ds = pydicom.dcmread(f, stop_before_pixels=True)
-                if hasattr(ds, 'ImagePositionPatient'):
-                    file_positions.append((f, float(ds.ImagePositionPatient[2])))
-            except Exception as e:
-                print(f"Warning: Skipping {f} - {e}")
+        # Optionally verify with headers
+        if self.use_header_sort:
+            files = self._verify_sort_with_headers(files, callback)
         
-        file_positions.sort(key=lambda x: x[1])
-        sorted_files = [fp[0] for fp in file_positions]
+        print(f"[MemoryMappedLoader] Found {len(files)} valid slices")
         
-        print(f"[MemoryMappedLoader] Found {len(sorted_files)} valid slices")
-        
-        first_full = pydicom.dcmread(sorted_files[0])
+        # Read first file for metadata
+        first_full = pydicom.dcmread(files[0])
         rows, cols = first_full.pixel_array.shape
-        num_slices = len(sorted_files)
+        num_slices = len(files)
         
         pixel_spacing = first_full.PixelSpacing
         if num_slices > 1:
-            second_ds = pydicom.dcmread(sorted_files[1], stop_before_pixels=True)
-            z_spacing = abs(float(second_ds.ImagePositionPatient[2]) - float(first_full.ImagePositionPatient[2]))
+            second_ds = pydicom.dcmread(files[1], stop_before_pixels=True)
+            if hasattr(second_ds, 'ImagePositionPatient') and hasattr(first_full, 'ImagePositionPatient'):
+                z_spacing = abs(float(second_ds.ImagePositionPatient[2]) - float(first_full.ImagePositionPatient[2]))
+            else:
+                z_spacing = getattr(first_full, 'SliceThickness', 1.0)
         else:
             z_spacing = getattr(first_full, 'SliceThickness', 1.0)
         
         spacing = (float(pixel_spacing[0]), float(pixel_spacing[1]), float(z_spacing))
-        origin = tuple(first_full.ImagePositionPatient)
+        origin = tuple(getattr(first_full, 'ImagePositionPatient', (0.0, 0.0, 0.0)))
         
         mmap_file = os.path.join(self.cache_dir, f"ct_volume_{id(self)}_{num_slices}.dat")
         print(f"[MemoryMappedLoader] Creating memory-mapped file: {mmap_file}")
@@ -260,16 +356,21 @@ class MemoryMappedDicomLoader(DicomSeriesLoader):
         volume = np.memmap(mmap_file, dtype=np.float32, mode='w+', shape=shape)
         
         print(f"[MemoryMappedLoader] Loading {num_slices} slices into memory-mapped array...")
-        for i, f in enumerate(sorted_files):
+        for i, f in enumerate(files):
             if i % 10 == 0:
                 if callback:
                     percent = 30 + int(70 * i / num_slices)
                     callback(percent, f"Mapping slice {i+1}/{num_slices}...")
             
             ds = pydicom.dcmread(f)
-            slope = getattr(ds, 'RescaleSlope', 1)
-            intercept = getattr(ds, 'RescaleIntercept', 0)
-            volume[i, :, :] = ds.pixel_array * slope + intercept
+            slope = float(getattr(ds, 'RescaleSlope', 1))
+            intercept = float(getattr(ds, 'RescaleIntercept', 0))
+            arr = ds.pixel_array.astype(np.float32)
+            if slope != 1.0:
+                arr *= slope
+            if intercept != 0.0:
+                arr += intercept
+            volume[i] = arr
         
         volume.flush()
         
@@ -292,7 +393,8 @@ class ChunkedDicomLoader(DicomSeriesLoader):
     Chunked loader that loads data in smaller chunks for memory efficiency.
     """
     
-    def __init__(self, chunk_size: int = 64):
+    def __init__(self, chunk_size: int = 64, use_header_sort: bool = False):
+        super().__init__(use_header_sort=use_header_sort, max_workers=4)
         self.chunk_size = chunk_size
         self._file_list = None
         self._metadata = None
@@ -307,25 +409,18 @@ class ChunkedDicomLoader(DicomSeriesLoader):
             raise FileNotFoundError(f"Path does not exist: {folder_path}")
         
         files = self._find_dicom_files(folder_path)
-        if callback: callback(10, f"Found {len(files)} files. Reading headers...")
+        if callback: callback(10, f"Found {len(files)} files. Sorting...")
         
-        file_positions = []
-        total_files = len(files)
-        for i, f in enumerate(files):
-            if callback and i % 50 == 0:
-                percent = 10 + int(30 * i / total_files)
-                callback(percent, f"Reading header {i}/{total_files}...")
-            try:
-                ds = pydicom.dcmread(f, stop_before_pixels=True)
-                if hasattr(ds, 'ImagePositionPatient'):
-                    file_positions.append((f, float(ds.ImagePositionPatient[2])))
-            except Exception:
-                continue
+        # Sort by filename
+        files.sort(key=lambda f: _natural_sort_key(os.path.basename(f)))
         
-        file_positions.sort(key=lambda x: x[1])
-        self._file_list = [fp[0] for fp in file_positions]
+        # Optionally verify with headers
+        if self.use_header_sort:
+            files = self._verify_sort_with_headers(files, callback)
         
-        if callback: callback(50, "Headers read. Reading first slice metadata...")
+        self._file_list = files
+        
+        if callback: callback(50, "Reading first slice metadata...")
         first = pydicom.dcmread(self._file_list[0])
         rows, cols = first.pixel_array.shape
         num_slices = len(self._file_list)
@@ -333,12 +428,15 @@ class ChunkedDicomLoader(DicomSeriesLoader):
         pixel_spacing = first.PixelSpacing
         if num_slices > 1:
             second = pydicom.dcmread(self._file_list[1], stop_before_pixels=True)
-            z_spacing = abs(float(second.ImagePositionPatient[2]) - float(first.ImagePositionPatient[2]))
+            if hasattr(second, 'ImagePositionPatient') and hasattr(first, 'ImagePositionPatient'):
+                z_spacing = abs(float(second.ImagePositionPatient[2]) - float(first.ImagePositionPatient[2]))
+            else:
+                z_spacing = getattr(first, 'SliceThickness', 1.0)
         else:
             z_spacing = getattr(first, 'SliceThickness', 1.0)
         
         spacing = (float(pixel_spacing[0]), float(pixel_spacing[1]), float(z_spacing))
-        origin = tuple(first.ImagePositionPatient)
+        origin = tuple(getattr(first, 'ImagePositionPatient', (0.0, 0.0, 0.0)))
         
         self._metadata = {
             "SampleID": getattr(first, "PatientID", "Unknown"),
@@ -373,13 +471,18 @@ class ChunkedDicomLoader(DicomSeriesLoader):
         rows, cols = first.pixel_array.shape
         chunk_size = end_slice - start_slice
         
-        chunk = np.zeros((chunk_size, rows, cols), dtype=np.float32)
+        chunk = np.empty((chunk_size, rows, cols), dtype=np.float32)
         
         for i, idx in enumerate(range(start_slice, end_slice)):
             ds = pydicom.dcmread(self._file_list[idx])
-            slope = getattr(ds, 'RescaleSlope', 1)
-            intercept = getattr(ds, 'RescaleIntercept', 0)
-            chunk[i, :, :] = ds.pixel_array * slope + intercept
+            slope = float(getattr(ds, 'RescaleSlope', 1))
+            intercept = float(getattr(ds, 'RescaleIntercept', 0))
+            arr = ds.pixel_array.astype(np.float32)
+            if slope != 1.0:
+                arr *= slope
+            if intercept != 0.0:
+                arr += intercept
+            chunk[i] = arr
         
         self._current_chunk = chunk
         self._current_chunk_range = (start_slice, end_slice)

@@ -52,7 +52,7 @@ class DummyLoader(BaseLoader):
         volume[:, :, -border:] = 1000
 
         # 5. Add realistic scanner noise
-        volume += np.random.normal(0, 50, (size, size, size))
+        volume += np.random.normal(0, 50, (size, size, size)).astype(np.float32)
         
         if callback: callback(100, "Generation complete.")
         return VolumeData(

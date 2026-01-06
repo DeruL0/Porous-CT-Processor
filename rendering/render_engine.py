@@ -3,10 +3,15 @@ Core rendering engine for volumetric data visualization.
 Provides reusable rendering methods independent of GUI framework.
 """
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import numpy as np
 import pyvista as pv
 from core import VolumeData
+
+# Memory thresholds for large volume handling
+# Volume rendering is more memory-intensive than isosurface
+MAX_VOXELS_FOR_VOLUME = 100_000_000  # 100M voxels (~400MB float32)
+MAX_VOXELS_FOR_ISO = 150_000_000     # 150M voxels
 
 
 class RenderEngine:
@@ -92,6 +97,70 @@ class RenderEngine:
         self.plotter.reset_camera()
         self.plotter.view_isometric()
 
+    def update_clim_fast(self, clim: Tuple[float, float]) -> bool:
+        """Fast update of scalar range without re-rendering volume.
+        
+        Args:
+            clim: Tuple of (min, max) scalar values.
+            
+        Returns:
+            True if update was successful, False if full re-render is needed.
+        """
+        if self.volume_actor is None:
+            return False
+        
+        try:
+            # Try to update mapper scalar range directly
+            if hasattr(self.volume_actor, 'mapper') and self.volume_actor.mapper:
+                self.volume_actor.mapper.scalar_range = clim
+                self.plotter.render()
+                return True
+        except Exception as e:
+            print(f"[RenderEngine] Fast clim update failed: {e}")
+        
+        return False
+
+    def _get_downsampled_grid(self, max_voxels: int) -> Optional[pv.ImageData]:
+        """Get grid with automatic downsampling if exceeds voxel threshold.
+        
+        Args:
+            max_voxels: Maximum allowed voxels before downsampling.
+            
+        Returns:
+            Original or downsampled grid.
+        """
+        if not self.grid:
+            return None
+        
+        n_cells = self.grid.n_cells
+        if n_cells <= max_voxels:
+            return self.grid
+        
+        # Calculate downsampling step (cubic root to reduce in all dimensions)
+        step = int(np.ceil((n_cells / max_voxels) ** (1/3)))
+        step = max(2, step)  # Minimum step of 2
+        dims = self.grid.dimensions
+        
+        try:
+            # Extract every Nth cell in each dimension using keyword args
+            downsampled = self.grid.extract_subset(
+                voi=(0, dims[0]-1, 0, dims[1]-1, 0, dims[2]-1),
+                rate=(step, step, step)
+            )
+            self.update_status(f"Auto-downsampled for memory: {n_cells:,} -> {downsampled.n_cells:,} cells (step={step})")
+            return downsampled
+        except Exception as e:
+            print(f"[RenderEngine] Downsampling failed: {e}")
+            return self.grid
+
+    def _get_grid_for_isosurface(self) -> Optional[pv.ImageData]:
+        """Get grid suitable for isosurface rendering."""
+        return self._get_downsampled_grid(MAX_VOXELS_FOR_ISO)
+    
+    def _get_grid_for_volume(self) -> Optional[pv.ImageData]:
+        """Get grid suitable for volume rendering."""
+        return self._get_downsampled_grid(MAX_VOXELS_FOR_VOLUME)
+
     def _update_clip_panel_state(self):
         """Enable/Disable clip panel based on active mode."""
         if not self.clip_panel:
@@ -164,10 +233,17 @@ class RenderEngine:
                 self.params_panel.set_mode('volume')
             self.plotter.enable_lightkit()
 
+            # Get potentially downsampled grid for memory safety
+            safe_grid = self._get_grid_for_volume()
+            if safe_grid is None:
+                self.update_status("No grid available for volume rendering")
+                return
+            
             # Cache the point data grid
-            if self._cached_vol_grid is None or self._cached_vol_grid_source != id(self.grid):
-                self._cached_vol_grid = self.grid.cell_data_to_point_data()
-                self._cached_vol_grid_source = id(self.grid)
+            grid_id = id(safe_grid)
+            if self._cached_vol_grid is None or self._cached_vol_grid_source != grid_id:
+                self._cached_vol_grid = safe_grid.cell_data_to_point_data()
+                self._cached_vol_grid_source = grid_id
 
             vol_grid = self._cached_vol_grid
             params = self.params_panel.get_current_values() if self.params_panel else {}
@@ -259,7 +335,13 @@ class RenderEngine:
             if threshold in self._iso_cache:
                 contours = self._iso_cache[threshold]
             else:
-                grid_points = self.grid.cell_data_to_point_data()
+                # Use potentially downsampled grid for large volumes
+                safe_grid = self._get_grid_for_isosurface()
+                if safe_grid is None:
+                    self.update_status("No grid available for isosurface")
+                    return
+                
+                grid_points = safe_grid.cell_data_to_point_data()
                 contours = grid_points.contour(isosurfaces=[threshold])
                 contours.compute_normals(inplace=True)
                 self._iso_cache[threshold] = contours

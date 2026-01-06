@@ -132,7 +132,7 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
             signal.connect(self.trigger_render)
 
         self.params_panel.opacity_changed.connect(lambda: self.render_volume(reset_view=False))
-        self.params_panel.clim_changed.connect(lambda: self.render_volume(reset_view=False))
+        self.params_panel.clim_changed.connect(self._on_clim_changed_fast)
         self.params_panel.colormap_changed.connect(self._on_colormap_changed)
         layout.addWidget(self.params_panel)
 
@@ -298,6 +298,17 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
         if self.active_view_mode == 'volume':
             self.render_volume(reset_view=False)
         else:
+            self.trigger_render()
+
+    def _on_clim_changed_fast(self):
+        """Fast colormap range update without full re-render."""
+        if self.active_view_mode == 'volume':
+            clim = self.params_panel.get_current_values().get('clim', [0, 1000])
+            # Try fast update first, fall back to full render if needed
+            if not self.render_engine.update_clim_fast(clim):
+                self.render_volume(reset_view=False)
+        elif self.active_view_mode == 'slices':
+            # Slices also use clim, trigger delayed render
             self.trigger_render()
 
     def _on_clip_toggled(self, enabled: bool):
