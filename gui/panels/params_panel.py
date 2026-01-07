@@ -34,6 +34,7 @@ class RenderingParametersPanel(QGroupBox):
     slice_position_changed = pyqtSignal()
     clim_changed = pyqtSignal()
     apply_clim_clip = pyqtSignal(list)  # Emits [min, max] for permanent clipping
+    invert_volume = pyqtSignal()        # Emits signal to invert volume values
 
     def __init__(self, title: str = "🎨 Rendering Parameters"):
         super().__init__()
@@ -122,6 +123,12 @@ class RenderingParametersPanel(QGroupBox):
         self.btn_apply_clim_clip.setToolTip("Permanently clip data to current min/max range")
         self.btn_apply_clim_clip.clicked.connect(self._on_apply_clim_clip)
         layout.addWidget(self.btn_apply_clim_clip)
+
+        # Invert Volume button
+        self.btn_invert_volume = QPushButton("🔄 Invert Volume")
+        self.btn_invert_volume.setToolTip("Invert volume values (extract pore surfaces instead of object surfaces)")
+        self.btn_invert_volume.clicked.connect(self.invert_volume.emit)
+        layout.addWidget(self.btn_invert_volume)
 
         # 6. Solid Color
         self.lbl_solid_color = QLabel("Solid Color:")
@@ -288,7 +295,7 @@ class RenderingParametersPanel(QGroupBox):
 
         visible([self.lbl_clim, self.lbl_clim_min, self.slider_clim_min, self.spinbox_clim_min,
                  self.lbl_clim_max, self.slider_clim_max, self.spinbox_clim_max,
-                 self.btn_apply_clim_clip], show_clim)
+                 self.btn_apply_clim_clip, self.btn_invert_volume], show_clim)
 
         visible([self.lbl_slice_x, self.slider_slice_x], is_slice)
         visible([self.lbl_slice_y, self.slider_slice_y], is_slice)

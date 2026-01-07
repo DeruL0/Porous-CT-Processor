@@ -6,7 +6,7 @@ Memory-optimized for large volumes using chunked processing.
 import numpy as np
 import scipy.ndimage as ndimage
 from skimage.filters import threshold_otsu
-from typing import Optional, Callable
+from typing import Optional, Callable, Tuple
 import gc
 
 from core import BaseProcessor, VolumeData
@@ -16,8 +16,40 @@ from config import (
     PROCESS_OTSU_SAMPLE_THRESHOLD
 )
 
+# Try to import cc3d for faster 3D labeling (10-50x speedup)
+try:
+    import cc3d
+    HAS_CC3D = True
+    print("[PoreProcessor] Using cc3d for fast 3D labeling")
+except ImportError:
+    HAS_CC3D = False
+    print("[PoreProcessor] cc3d not found, using scipy.ndimage.label (slower)")
+
 # Alias for backward compatibility
 CHUNK_THRESHOLD = PROCESS_CHUNK_THRESHOLD
+
+
+def fast_label(binary_mask: np.ndarray, connectivity: int = 26) -> Tuple[np.ndarray, int]:
+    """
+    Fast 3D connected component labeling.
+    Uses cc3d if available (10-50x faster), otherwise falls back to scipy.
+    
+    Args:
+        binary_mask: Binary 3D array (True = foreground)
+        connectivity: 6, 18, or 26 for 3D (only used by cc3d)
+        
+    Returns:
+        (labeled_array, num_features)
+    """
+    if HAS_CC3D:
+        # cc3d is MUCH faster for large 3D arrays
+        labeled = cc3d.connected_components(binary_mask, connectivity=connectivity)
+        num_features = int(labeled.max())
+        return labeled, num_features
+    else:
+        # Fallback to scipy (slower but always available)
+        structure = np.ones((3, 3, 3)) if connectivity == 26 else None
+        return ndimage.label(binary_mask, structure=structure)
 
 
 class PoreExtractionProcessor(BaseProcessor):
@@ -64,12 +96,53 @@ class PoreExtractionProcessor(BaseProcessor):
 
     def process(self, data: VolumeData, callback: Optional[Callable[[int, str], None]] = None,
                 threshold: int = -300) -> VolumeData:
+        """
+        Extract pores from volume data.
+        
+        Uses shared cache: if PNM already computed pores_mask, reuse it.
+        Also stores result in cache for PNM to reuse.
+        """
         if data.raw_data is None:
             raise ValueError("Input data must contain raw voxel data.")
 
+        from processors.segmentation_cache import get_segmentation_cache
+        
         def report(p: int, msg: str):
             print(f"[Processor] {msg}")
             if callback: callback(p, msg)
+
+        cache = get_segmentation_cache()
+        volume_id = f"{id(data.raw_data)}_{threshold}"
+        
+        # Check if we already have cached segmentation
+        cached_mask = cache.get_pores_mask(volume_id)
+        if cached_mask is not None:
+            report(0, "Cache hit! Reusing segmentation from previous run...")
+            pores_mask = cached_mask > 0  # Convert memmap to bool if needed
+            cached_meta = cache.get_metadata(volume_id) or {}
+            
+            report(70, "Labeling connected components (cc3d)..." if HAS_CC3D else "Labeling connected components...")
+            labeled_array, num_features = fast_label(pores_mask, connectivity=26)
+            del labeled_array
+            gc.collect()
+            
+            report(90, f"Found {num_features} pores. Generating output...")
+            processed_volume = np.zeros(data.raw_data.shape, dtype=np.float32)
+            processed_volume[pores_mask] = 1000
+            
+            porosity = cached_meta.get('porosity', 0)
+            
+            return VolumeData(
+                raw_data=processed_volume,
+                spacing=data.spacing,
+                origin=data.origin,
+                metadata={
+                    "Type": "Processed - Void Volume",
+                    "Porosity": f"{porosity:.2f}%",
+                    "PoreCount": int(num_features),
+                    "CacheHit": True
+                }
+            )
 
         report(0, f"Starting pore detection (Threshold < {threshold})...")
 
@@ -78,11 +151,12 @@ class PoreExtractionProcessor(BaseProcessor):
         
         # Check if we need chunked processing
         if volume_bytes > CHUNK_THRESHOLD:
-            return self._process_chunked(data, threshold, report)
+            return self._process_chunked(data, threshold, report, cache, volume_id)
         else:
-            return self._process_standard(data, threshold, report)
+            return self._process_standard(data, threshold, report, cache, volume_id)
 
-    def _process_standard(self, data: VolumeData, threshold: int, report) -> VolumeData:
+    def _process_standard(self, data: VolumeData, threshold: int, report, 
+                          cache=None, volume_id=None) -> VolumeData:
         """Standard processing for smaller volumes."""
         raw = data.raw_data
         
@@ -105,13 +179,17 @@ class PoreExtractionProcessor(BaseProcessor):
         total_voxels = raw.size
         porosity_pct = (pore_voxels / total_voxels) * 100.0
 
-        # Label connected components
-        report(70, "Labeling connected components...")
-        labeled_array, num_features = ndimage.label(pores_mask, structure=np.ones((3, 3, 3)))
+        # Label connected components (using cc3d if available for 10-50x speedup)
+        report(70, "Labeling connected components (cc3d)..." if HAS_CC3D else "Labeling connected components...")
+        labeled_array, num_features = fast_label(pores_mask, connectivity=26)
         del labeled_array
         gc.collect()
 
         report(90, f"Found {num_features} pores. Generating output volume...")
+
+        # Store in shared cache for PNM to reuse
+        if cache is not None and volume_id is not None:
+            cache.store_pores_mask(volume_id, pores_mask, metadata={'porosity': porosity_pct})
 
         # Create Output Volume
         processed_volume = np.zeros_like(raw)
@@ -132,7 +210,8 @@ class PoreExtractionProcessor(BaseProcessor):
             }
         )
 
-    def _process_chunked(self, data: VolumeData, threshold: int, report) -> VolumeData:
+    def _process_chunked(self, data: VolumeData, threshold: int, report,
+                          cache=None, volume_id=None) -> VolumeData:
         """Chunked processing for large volumes to avoid OOM."""
         raw = data.raw_data
         n_slices = raw.shape[0]
@@ -183,7 +262,7 @@ class PoreExtractionProcessor(BaseProcessor):
         mid_start = (n_slices // 2) - chunk_size // 2
         mid_end = mid_start + chunk_size
         mid_chunk = processed_volume[mid_start:mid_end] > 0
-        _, estimated_features = ndimage.label(mid_chunk, structure=np.ones((3, 3, 3)))
+        _, estimated_features = fast_label(mid_chunk, connectivity=26)
         # Extrapolate
         estimated_total = int(estimated_features * n_chunks / 2)
         del mid_chunk

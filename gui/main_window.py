@@ -135,6 +135,7 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
         self.params_panel.clim_changed.connect(self._on_clim_changed_fast)
         self.params_panel.colormap_changed.connect(self._on_colormap_changed)
         self.params_panel.apply_clim_clip.connect(self._on_apply_clim_clip)
+        self.params_panel.invert_volume.connect(self._on_invert_volume)
         layout.addWidget(self.params_panel)
 
         # Clip Panel
@@ -313,53 +314,170 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
             self.trigger_render()
 
     def _on_apply_clim_clip(self, clim: list):
-        """Apply colormap range as permanent data clip."""
+        """Apply colormap range as permanent data clip (memory-efficient, chunked)."""
         if not hasattr(self, '_data_manager') or not self._data_manager:
-            self._status("No data to clip")
+            self.update_status("No data to clip")
             return
         
         data = self._data_manager.active_data
         if data is None or data.raw_data is None:
-            self._status("No active data to clip")
+            self.update_status("No active data to clip")
             return
         
-        import numpy as np
         import gc
+        import traceback
         
-        min_val, max_val = clim[0], clim[1]
-        self._status(f"Clipping data to range [{min_val}, {max_val}]...")
+        min_val, max_val = float(clim[0]), float(clim[1])
+        current_step = "initialization"
         
-        # Create clipped copy
-        raw = data.raw_data
-        clipped = np.clip(raw, min_val, max_val)
+        try:
+            current_step = "Step 1: Clearing caches"
+            self.update_status(f"Clipping: {current_step}...")
+            self.plotter.clear()
+            if hasattr(self, 'render_engine'):
+                self.render_engine.data = None
+                self.render_engine.grid = None
+                self.render_engine._cached_vol_grid = None
+                self.render_engine._lod_pyramid = None
+                self.render_engine._iso_cache = {}
+                self.render_engine.volume_actor = None
+            gc.collect()
+            
+            current_step = "Step 2: Applying clip in chunks"
+            self.update_status(f"Clipping: {current_step}...")
+            raw = data.raw_data
+            chunk_size = 32
+            n_slices = raw.shape[0]
+            
+            for i in range(0, n_slices, chunk_size):
+                end = min(i + chunk_size, n_slices)
+                raw[i:end] = raw[i:end].clip(min_val, max_val)
+                gc.collect()
+            
+            current_step = "Step 3: Updating metadata"
+            self.update_status(f"Clipping: {current_step}...")
+            data.metadata["ClipRange"] = f"[{min_val:.0f}, {max_val:.0f}]"
+            if "(Clipped)" not in data.metadata.get("Type", ""):
+                data.metadata["Type"] = data.metadata.get("Type", "CT") + " (Clipped)"
+            
+            current_step = "Step 4: Updating params panel"
+            self.update_status(f"Clipping: {current_step}...")
+            self.params_panel.set_data_range(int(min_val), int(max_val))
+            
+            current_step = "Step 5: Recreating grid"
+            self.update_status(f"Clipping: {current_step}...")
+            self.render_engine.set_data(data)
+            
+            current_step = "Step 6: Rendering"
+            self.update_status(f"Clipping: {current_step}...")
+            if self.active_view_mode == 'volume':
+                self.render_volume(reset_view=True)
+            elif self.active_view_mode == 'slices':
+                self.render_slices(reset_view=True)
+            else:
+                self.render_volume(reset_view=True)
+            
+            self.update_status(f"Applied clip: [{min_val:.0f}, {max_val:.0f}]")
+            gc.collect()
+            
+        except MemoryError as e:
+            error_msg = f"Memory Error at {current_step}: {e}"
+            print(f"[RangeClip] {error_msg}")
+            print(traceback.format_exc())
+            self.update_status(f"Memory Error: {current_step}")
+            gc.collect()
+            
+        except Exception as e:
+            error_msg = f"Error at {current_step}: {type(e).__name__}: {e}"
+            print(f"[RangeClip] {error_msg}")
+            print(traceback.format_exc())
+            self.update_status(f"Error: {current_step} - {type(e).__name__}")
+
+    def _on_invert_volume(self):
+        """Invert volume values (for extracting pore surfaces instead of object surfaces)."""
+        if not hasattr(self, '_data_manager') or not self._data_manager:
+            self.update_status("No data to invert")
+            return
         
-        # Create new VolumeData
-        from core import VolumeData
-        clipped_data = VolumeData(
-            raw_data=clipped,
-            spacing=data.spacing,
-            origin=data.origin,
-            metadata={
-                **data.metadata,
-                "ClipRange": f"[{min_val}, {max_val}]",
-                "Type": data.metadata.get("Type", "CT") + " (Clipped)"
-            }
-        )
+        data = self._data_manager.active_data
+        if data is None or data.raw_data is None:
+            self.update_status("No active data to invert")
+            return
         
-        # Update data manager
-        self._data_manager.load_raw_data(clipped_data)
+        import gc
+        import traceback
         
-        # Update view
-        self.set_data(clipped_data)
-        
-        # Refresh render
-        if self.active_view_mode == 'volume':
-            self.render_volume(reset_view=True)
-        elif self.active_view_mode == 'slices':
-            self.render_slices(reset_view=True)
-        
-        self._status(f"Applied clip: [{min_val}, {max_val}]")
-        gc.collect()
+        try:
+            self.update_status("Inverting volume...")
+            
+            # Step 1: Clear caches
+            self.plotter.clear()
+            if hasattr(self, 'render_engine'):
+                self.render_engine.data = None
+                self.render_engine.grid = None
+                self.render_engine._cached_vol_grid = None
+                self.render_engine._lod_pyramid = None
+                self.render_engine._iso_cache = {}
+                self.render_engine.volume_actor = None
+            gc.collect()
+            
+            # Step 2: Get min/max for inversion
+            raw = data.raw_data
+            data_min = float(raw.min())
+            data_max = float(raw.max())
+            
+            # Step 3: Invert in chunks: new_val = max - (val - min) = max + min - val
+            chunk_size = 32
+            n_slices = raw.shape[0]
+            invert_offset = data_max + data_min
+            
+            for i in range(0, n_slices, chunk_size):
+                end = min(i + chunk_size, n_slices)
+                raw[i:end] = invert_offset - raw[i:end]
+                gc.collect()
+            
+            # Step 4: Update metadata
+            if "(Inverted)" not in data.metadata.get("Type", ""):
+                data.metadata["Type"] = data.metadata.get("Type", "CT") + " (Inverted)"
+            
+            # Step 5: Update params panel range AND invert the current clim values
+            # Get current clim values before updating range
+            current_clim = self.params_panel.get_current_values().get('clim', [data_min, data_max])
+            old_min_clim, old_max_clim = current_clim[0], current_clim[1]
+            
+            # Invert the clim values: new_clim = max + min - old_clim
+            new_min_clim = int(invert_offset - old_max_clim)
+            new_max_clim = int(invert_offset - old_min_clim)
+            
+            # Update range first
+            self.params_panel.set_data_range(int(data_min), int(data_max))
+            
+            # Then set the inverted clim values
+            self.params_panel.block_signals(True)
+            self.params_panel.slider_clim_min.setValue(new_min_clim)
+            self.params_panel.slider_clim_max.setValue(new_max_clim)
+            self.params_panel.spinbox_clim_min.setValue(new_min_clim)
+            self.params_panel.spinbox_clim_max.setValue(new_max_clim)
+            self.params_panel.block_signals(False)
+            
+            # Step 6: Recreate grid
+            self.render_engine.set_data(data)
+            
+            # Step 7: Render
+            if self.active_view_mode == 'volume':
+                self.render_volume(reset_view=True)
+            elif self.active_view_mode == 'slices':
+                self.render_slices(reset_view=True)
+            else:
+                self.render_volume(reset_view=True)
+            
+            self.update_status(f"Volume inverted. Clim: [{new_min_clim}, {new_max_clim}]")
+            gc.collect()
+            
+        except Exception as e:
+            print(f"[InvertVolume] Error: {type(e).__name__}: {e}")
+            print(traceback.format_exc())
+            self.update_status(f"Invert error: {type(e).__name__}")
 
     def _on_clip_toggled(self, enabled: bool):
         if enabled:

@@ -13,6 +13,7 @@ pyvistaqt>=0.9.0
 PyQt5>=5.15.0
 vtk>=9.1.0
 
-# Optional performance optimization
+# Performance optimization
 joblib>=1.2.0
 numba>=0.56.0
+connected-components-3d>=3.10.0  # Fast 3D labeling
