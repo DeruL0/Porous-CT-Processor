@@ -1,10 +1,12 @@
 """
 DICOM series loaders for CT/Micro-CT data.
 Optimized for uncompressed files with parallel reading and filename-based sorting.
+Includes Numba JIT acceleration for pixel processing when available.
 """
 
 import os
 import re
+import gc
 import numpy as np
 import pydicom
 import concurrent.futures
@@ -12,6 +14,35 @@ from glob import glob
 from typing import List, Tuple, Optional, Callable
 
 from core import BaseLoader, VolumeData
+
+# Try to import Numba for JIT acceleration
+try:
+    from numba import jit, prange
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+
+# Numba-accelerated rescale (if available)
+if NUMBA_AVAILABLE:
+    @jit(nopython=True, parallel=True, cache=True)
+    def _rescale_volume_numba(volume: np.ndarray, slopes: np.ndarray, intercepts: np.ndarray):
+        """Numba JIT accelerated volume rescaling."""
+        n_slices = volume.shape[0]
+        for i in prange(n_slices):
+            slope = slopes[i]
+            intercept = intercepts[i]
+            if slope != 1.0 or intercept != 0.0:
+                for j in range(volume.shape[1]):
+                    for k in range(volume.shape[2]):
+                        volume[i, j, k] = volume[i, j, k] * slope + intercept
+else:
+    def _rescale_volume_numba(volume, slopes, intercepts):
+        """Fallback: vectorized numpy rescale."""
+        for i in range(len(slopes)):
+            if slopes[i] != 1.0:
+                volume[i] *= slopes[i]
+            if intercepts[i] != 0.0:
+                volume[i] += intercepts[i]
 
 
 def _natural_sort_key(text: str):
@@ -175,23 +206,28 @@ class DicomSeriesLoader(BaseLoader):
         
         # Pre-allocate with np.empty (faster than zeros)
         volume = np.empty(img_shape, dtype=np.float32)
-
+        
+        # Collect rescale parameters for batch processing
         total = len(slices)
+        slopes = np.empty(total, dtype=np.float32)
+        intercepts = np.empty(total, dtype=np.float32)
+
+        # First pass: copy pixel data and collect rescale params
         for i, s in enumerate(slices):
             if callback and i % 20 == 0:
-                percent = 50 + int(50 * i / total)
-                callback(percent, f"Building volume {i+1}/{total}...")
+                percent = 50 + int(40 * i / total)
+                callback(percent, f"Reading slice {i+1}/{total}...")
             
-            slope = float(getattr(s, 'RescaleSlope', 1))
-            intercept = float(getattr(s, 'RescaleIntercept', 0))
-            
-            # Optimized: direct assignment with type conversion
-            arr = s.pixel_array.astype(np.float32)
-            if slope != 1.0:
-                arr *= slope
-            if intercept != 0.0:
-                arr += intercept
-            volume[i] = arr
+            slopes[i] = float(getattr(s, 'RescaleSlope', 1.0))
+            intercepts[i] = float(getattr(s, 'RescaleIntercept', 0.0))
+            volume[i] = s.pixel_array.astype(np.float32)
+        
+        # Second pass: apply rescale (Numba accelerated if available)
+        if callback: callback(92, "Applying rescale (Numba)..." if NUMBA_AVAILABLE else "Applying rescale...")
+        _rescale_volume_numba(volume, slopes, intercepts)
+        
+        if callback: callback(98, "Finalizing...")
+        gc.collect()
 
         return volume, spacing, origin
 

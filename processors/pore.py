@@ -10,10 +10,14 @@ from typing import Optional, Callable
 import gc
 
 from core import BaseProcessor, VolumeData
+from config import (
+    PROCESS_CHUNK_THRESHOLD,
+    PROCESS_CHUNK_SIZE,
+    PROCESS_OTSU_SAMPLE_THRESHOLD
+)
 
-
-# Memory threshold for chunked processing (in bytes)
-CHUNK_THRESHOLD = 500 * 1024 * 1024  # 500 MB
+# Alias for backward compatibility
+CHUNK_THRESHOLD = PROCESS_CHUNK_THRESHOLD
 
 
 class PoreExtractionProcessor(BaseProcessor):
@@ -24,7 +28,7 @@ class PoreExtractionProcessor(BaseProcessor):
     Memory-optimized: uses chunked processing for large volumes.
     """
 
-    def __init__(self, chunk_size: int = 32):
+    def __init__(self, chunk_size: int = PROCESS_CHUNK_SIZE):
         """
         Args:
             chunk_size: Number of slices to process at a time for large volumes.
@@ -39,7 +43,7 @@ class PoreExtractionProcessor(BaseProcessor):
         
         # Sample data for large volumes to save memory
         raw = data.raw_data
-        if raw.size > 100_000_000:  # > 100M voxels
+        if raw.size > PROCESS_OTSU_SAMPLE_THRESHOLD:
             # Sample every 4th voxel
             sample = raw[::4, ::4, ::4].flatten()
         else:

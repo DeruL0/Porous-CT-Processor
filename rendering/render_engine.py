@@ -9,12 +9,16 @@ import numpy as np
 import pyvista as pv
 from core import VolumeData
 from rendering.lod_manager import LODPyramid, LODRenderManager, check_gpu_volume_rendering
+from config import (
+    RENDER_MAX_VOXELS_VOLUME,
+    RENDER_MAX_VOXELS_ISO,
+    RENDER_MAX_MEMORY_MB
+)
 
-# Memory thresholds for large volume handling
-# Volume rendering is more memory-intensive than isosurface
-MAX_VOXELS_FOR_VOLUME = 100_000_000  # 100M voxels (~400MB float32)
-MAX_VOXELS_FOR_ISO = 150_000_000     # 150M voxels
-MAX_MEMORY_MB_RENDER = 500           # Max memory for render grid
+# Aliases for backward compatibility
+MAX_VOXELS_FOR_VOLUME = RENDER_MAX_VOXELS_VOLUME
+MAX_VOXELS_FOR_ISO = RENDER_MAX_VOXELS_ISO
+MAX_MEMORY_MB_RENDER = RENDER_MAX_MEMORY_MB
 
 
 class RenderEngine:
