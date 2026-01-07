@@ -134,6 +134,7 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
         self.params_panel.opacity_changed.connect(lambda: self.render_volume(reset_view=False))
         self.params_panel.clim_changed.connect(self._on_clim_changed_fast)
         self.params_panel.colormap_changed.connect(self._on_colormap_changed)
+        self.params_panel.apply_clim_clip.connect(self._on_apply_clim_clip)
         layout.addWidget(self.params_panel)
 
         # Clip Panel
@@ -310,6 +311,55 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
         elif self.active_view_mode == 'slices':
             # Slices also use clim, trigger delayed render
             self.trigger_render()
+
+    def _on_apply_clim_clip(self, clim: list):
+        """Apply colormap range as permanent data clip."""
+        if not hasattr(self, '_data_manager') or not self._data_manager:
+            self._status("No data to clip")
+            return
+        
+        data = self._data_manager.active_data
+        if data is None or data.raw_data is None:
+            self._status("No active data to clip")
+            return
+        
+        import numpy as np
+        import gc
+        
+        min_val, max_val = clim[0], clim[1]
+        self._status(f"Clipping data to range [{min_val}, {max_val}]...")
+        
+        # Create clipped copy
+        raw = data.raw_data
+        clipped = np.clip(raw, min_val, max_val)
+        
+        # Create new VolumeData
+        from core import VolumeData
+        clipped_data = VolumeData(
+            raw_data=clipped,
+            spacing=data.spacing,
+            origin=data.origin,
+            metadata={
+                **data.metadata,
+                "ClipRange": f"[{min_val}, {max_val}]",
+                "Type": data.metadata.get("Type", "CT") + " (Clipped)"
+            }
+        )
+        
+        # Update data manager
+        self._data_manager.load_raw_data(clipped_data)
+        
+        # Update view
+        self.set_data(clipped_data)
+        
+        # Refresh render
+        if self.active_view_mode == 'volume':
+            self.render_volume(reset_view=True)
+        elif self.active_view_mode == 'slices':
+            self.render_slices(reset_view=True)
+        
+        self._status(f"Applied clip: [{min_val}, {max_val}]")
+        gc.collect()
 
     def _on_clip_toggled(self, enabled: bool):
         if enabled:

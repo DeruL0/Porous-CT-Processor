@@ -1,17 +1,20 @@
 """
 Core rendering engine for volumetric data visualization.
 Provides reusable rendering methods independent of GUI framework.
+Includes LOD (Level of Detail) support for large volume handling.
 """
 
 from typing import Optional, Dict, Any, Tuple
 import numpy as np
 import pyvista as pv
 from core import VolumeData
+from rendering.lod_manager import LODPyramid, LODRenderManager, check_gpu_volume_rendering
 
 # Memory thresholds for large volume handling
 # Volume rendering is more memory-intensive than isosurface
 MAX_VOXELS_FOR_VOLUME = 100_000_000  # 100M voxels (~400MB float32)
 MAX_VOXELS_FOR_ISO = 150_000_000     # 150M voxels
+MAX_MEMORY_MB_RENDER = 500           # Max memory for render grid
 
 
 class RenderEngine:
@@ -47,6 +50,10 @@ class RenderEngine:
         self._iso_cache: Dict[int, pv.PolyData] = {}
         self._cached_vol_grid: Optional[pv.PolyData] = None
         self._cached_vol_grid_source: Optional[int] = None
+        self._lod_pyramid: Optional[LODPyramid] = None
+        
+        # GPU capability
+        self.gpu_available, self.gpu_info = check_gpu_volume_rendering()
         
         # Actors
         self.volume_actor = None
@@ -59,18 +66,35 @@ class RenderEngine:
             print(f"[RenderEngine] {message}")
 
     def set_data(self, data: VolumeData):
-        """Set volume data and prepare grid."""
-        self.data = data
+        """Set volume data and prepare grid. Clears previous data first."""
+        import gc
+        
+        # Clear previous data to free memory
+        if self.data is not None or self.grid is not None:
+            self.update_status("Clearing previous data...")
+        
+        self.data = None
         self.grid = None
         self.mesh = None
         self.volume_actor = None
         self._iso_cache = {}
         self._cached_vol_grid = None
+        self._lod_pyramid = None
+        
+        # Force garbage collection to free memory before loading new data
+        gc.collect()
+        
+        # Now set new data
+        self.data = data
 
         if data.has_mesh:
             self.mesh = data.mesh
         elif data.raw_data is not None:
             self._create_pyvista_grid()
+            # Create LOD pyramid for large volumes
+            if self.grid and self.grid.n_cells > MAX_VOXELS_FOR_VOLUME:
+                self._lod_pyramid = LODPyramid(self.grid, levels=3)
+                self.update_status(f"Created LOD pyramid: {self._lod_pyramid}")
 
     def _create_pyvista_grid(self):
         """Create PyVista ImageData grid from volume data."""
@@ -155,10 +179,19 @@ class RenderEngine:
 
     def _get_grid_for_isosurface(self) -> Optional[pv.ImageData]:
         """Get grid suitable for isosurface rendering."""
+        # Use LOD pyramid if available
+        if self._lod_pyramid and self._lod_pyramid.num_levels > 1:
+            return self._lod_pyramid.get_for_memory(MAX_MEMORY_MB_RENDER)
         return self._get_downsampled_grid(MAX_VOXELS_FOR_ISO)
     
     def _get_grid_for_volume(self) -> Optional[pv.ImageData]:
-        """Get grid suitable for volume rendering."""
+        """Get grid suitable for volume rendering using LOD if available."""
+        # Use LOD pyramid if available (pre-computed levels)
+        if self._lod_pyramid and self._lod_pyramid.num_levels > 1:
+            grid = self._lod_pyramid.get_for_memory(MAX_MEMORY_MB_RENDER)
+            if grid:
+                self.update_status(f"Using LOD level: {grid.n_cells:,} cells")
+                return grid
         return self._get_downsampled_grid(MAX_VOXELS_FOR_VOLUME)
 
     def _update_clip_panel_state(self):

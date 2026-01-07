@@ -4,7 +4,7 @@ Rendering Parameters Panel for controlling visualization settings.
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-    QGroupBox, QSlider, QComboBox, QSpinBox
+    QGroupBox, QSlider, QComboBox, QSpinBox, QPushButton
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 from typing import Dict, Any
@@ -33,6 +33,7 @@ class RenderingParametersPanel(QGroupBox):
     opacity_changed = pyqtSignal(str)
     slice_position_changed = pyqtSignal()
     clim_changed = pyqtSignal()
+    apply_clim_clip = pyqtSignal(list)  # Emits [min, max] for permanent clipping
 
     def __init__(self, title: str = "🎨 Rendering Parameters"):
         super().__init__()
@@ -115,6 +116,12 @@ class RenderingParametersPanel(QGroupBox):
         self.spinbox_clim_max.valueChanged.connect(self._on_clim_spinbox_change)
         max_layout.addWidget(self.spinbox_clim_max)
         layout.addWidget(max_container)
+
+        # Apply Clip button
+        self.btn_apply_clim_clip = QPushButton("✂️ Apply Range Clip")
+        self.btn_apply_clim_clip.setToolTip("Permanently clip data to current min/max range")
+        self.btn_apply_clim_clip.clicked.connect(self._on_apply_clim_clip)
+        layout.addWidget(self.btn_apply_clim_clip)
 
         # 6. Solid Color
         self.lbl_solid_color = QLabel("Solid Color:")
@@ -247,6 +254,11 @@ class RenderingParametersPanel(QGroupBox):
             self.spinbox_clim_max.setValue(self.spinbox_clim_min.value())
         self.clim_changed.emit()
 
+    def _on_apply_clim_clip(self):
+        """Emit signal to permanently clip data to current clim range."""
+        clim = [self.slider_clim_min.value(), self.slider_clim_max.value()]
+        self.apply_clim_clip.emit(clim)
+
     def _update_visibility(self):
         mode = self.active_mode
         is_iso = (mode == 'iso')
@@ -275,7 +287,8 @@ class RenderingParametersPanel(QGroupBox):
         visible([self.lbl_colormap, self.colormap_combo], show_cmap)
 
         visible([self.lbl_clim, self.lbl_clim_min, self.slider_clim_min, self.spinbox_clim_min,
-                 self.lbl_clim_max, self.slider_clim_max, self.spinbox_clim_max], show_clim)
+                 self.lbl_clim_max, self.slider_clim_max, self.spinbox_clim_max,
+                 self.btn_apply_clim_clip], show_clim)
 
         visible([self.lbl_slice_x, self.slider_slice_x], is_slice)
         visible([self.lbl_slice_y, self.slider_slice_y], is_slice)

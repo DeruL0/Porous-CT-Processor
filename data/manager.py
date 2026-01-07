@@ -35,11 +35,20 @@ class ScientificDataManager:
         return self.raw_ct_data
 
     def load_raw_data(self, data: VolumeData):
-        """Sets the raw input data."""
-        self.raw_ct_data = data
+        """Sets the raw input data. Clears previous data first."""
+        import gc
+        
+        # Clear all previous data to free memory
+        self.raw_ct_data = None
         self.segmented_volume = None
         self.pnm_model = None
         self.roi_data = None
+        
+        # Force garbage collection before loading new data
+        gc.collect()
+        
+        # Now set new data
+        self.raw_ct_data = data
 
     def set_segmented_data(self, data: VolumeData):
         """Stores the intermediate segmented void space."""
