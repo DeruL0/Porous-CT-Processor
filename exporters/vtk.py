@@ -10,21 +10,21 @@ from core import VolumeData
 
 class VTKExporter:
     """
-    负责将 VolumeData (体素或网格) 导出为 VTK 标准格式文件。
+    Responsible for exporting VolumeData (voxel or mesh) to VTK standard format files.
     Handles logic for .vti (Image Data) and .vtp (Poly Data).
     """
 
     @staticmethod
     def export(data: VolumeData, filepath: str) -> bool:
         """
-        根据数据类型自动选择导出策略。
+        Automatically selects export strategy based on data type.
 
         Args:
-            data: 包含 raw_data 或 mesh 的 VolumeData 对象。
-            filepath: 目标文件路径。
+            data: contains raw_data or VolumeData of mesh.
+            filepath: target path.
 
         Returns:
-            bool: 成功返回 True。
+            bool: return True once success.
         """
         if data is None:
             raise ValueError("No data to export.")
@@ -38,7 +38,7 @@ class VTKExporter:
 
     @staticmethod
     def _export_mesh(mesh: pv.PolyData, filepath: str) -> bool:
-        """导出 PNM 网格数据 (.vtp, .vtk)"""
+        """Export PNM mesh data (.vtp, .vtk)."""
         if "IsPore" in mesh.array_names:
             print(f"[Exporter] Detected 'IsPore' attribute. Pore=1, Throat=0.")
         else:
@@ -50,7 +50,7 @@ class VTKExporter:
 
     @staticmethod
     def _export_volume(data: VolumeData, filepath: str) -> bool:
-        """导出体素数据 (.vti)"""
+        """Export voxel data (.vti)."""
         grid = pv.ImageData()
         grid.dimensions = np.array(data.raw_data.shape) + 1
         grid.origin = data.origin

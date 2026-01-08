@@ -42,7 +42,7 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
         super().__init__()
         self._data_manager = None
 
-        self.setWindowTitle("Porous Media Analysis Suite")
+        self.setWindowTitle("Porous CT Analysis Suite")
         self.setGeometry(100, 100, 1400, 900)
         self._init_ui()
 
