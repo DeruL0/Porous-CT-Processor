@@ -228,9 +228,14 @@ class PoreToSphereProcessor(BaseProcessor):
         else:
             pores_mesh = pv.PolyData()
 
-        report(90, "Connecting pores...")
+        report(90, "Connecting pores (accurate throat measurement)...")
         connections = self._find_adjacency(segmented_regions)
-        throats_mesh, throat_radii = self._create_throat_mesh(connections, pore_centers, pore_radii, pore_ids)
+        throats_mesh, throat_radii = self._create_throat_mesh(
+            connections, pore_centers, pore_radii, pore_ids,
+            distance_map=distance_map, 
+            segmented_regions=segmented_regions,
+            spacing=data.spacing
+        )
 
         # Step 4: Enhanced Analysis
         report(93, "Calculating advanced metrics...")
@@ -424,12 +429,117 @@ class PoreToSphereProcessor(BaseProcessor):
         
         return adjacency
 
-    def _create_throat_mesh(self, connections, centers, radii, ids_list):
-        """Creates tubes connecting the pores."""
+    def _measure_throat_radius_fast(self, distance_map, segmented_regions, 
+                                     pore_a: int, pore_b: int, spacing: tuple,
+                                     slices_cache: dict = None) -> Tuple[float, Optional[np.ndarray]]:
+        """
+        OPTIMIZED: Measure throat radius using bounding box to limit computation.
+        
+        Instead of operating on the full volume, we only work on the union of
+        the two pores' bounding boxes - typically 1000x smaller region.
+        
+        Args:
+            distance_map: Distance transform of pore space
+            segmented_regions: Watershed segmentation labels
+            pore_a, pore_b: Labels of the two pores
+            spacing: Voxel spacing (sx, sy, sz)
+            slices_cache: Pre-computed bounding boxes from find_objects()
+            
+        Returns:
+            (throat_radius, throat_centroid) - radius in physical units, centroid coords
+        """
+        # Get bounding boxes if cache provided
+        if slices_cache is not None:
+            slice_a = slices_cache.get(pore_a)
+            slice_b = slices_cache.get(pore_b)
+        else:
+            return 0.0, None  # Need cache for fast operation
+        
+        if slice_a is None or slice_b is None:
+            return 0.0, None
+        
+        # Compute union bounding box (expand to include both pores + 1 pixel margin)
+        shape = segmented_regions.shape
+        z_min = max(0, min(slice_a[0].start, slice_b[0].start) - 1)
+        z_max = min(shape[0], max(slice_a[0].stop, slice_b[0].stop) + 1)
+        y_min = max(0, min(slice_a[1].start, slice_b[1].start) - 1)
+        y_max = min(shape[1], max(slice_a[1].stop, slice_b[1].stop) + 1)
+        x_min = max(0, min(slice_a[2].start, slice_b[2].start) - 1)
+        x_max = min(shape[2], max(slice_a[2].stop, slice_b[2].stop) + 1)
+        
+        # Extract local region (MUCH smaller than full volume)
+        local_labels = segmented_regions[z_min:z_max, y_min:y_max, x_min:x_max]
+        local_dist = distance_map[z_min:z_max, y_min:y_max, x_min:x_max]
+        
+        # Get local masks
+        mask_a = (local_labels == pore_a)
+        mask_b = (local_labels == pore_b)
+        
+        # Find boundary using dilation (now on small region - fast!)
+        dilated_a = ndimage.binary_dilation(mask_a)
+        dilated_b = ndimage.binary_dilation(mask_b)
+        
+        # Throat = intersection of dilated regions
+        throat_region = dilated_a & dilated_b
+        
+        if not np.any(throat_region):
+            return 0.0, None
+        
+        # Get distance values at throat
+        throat_distances = local_dist[throat_region]
+        
+        if len(throat_distances) == 0:
+            return 0.0, None
+        
+        # Throat radius = minimum distance at boundary
+        throat_radius_voxels = float(np.min(throat_distances))
+        
+        # Convert to physical units
+        avg_spacing = (spacing[0] + spacing[1] + spacing[2]) / 3.0
+        throat_radius = throat_radius_voxels * avg_spacing
+        
+        # Find throat centroid in global coordinates
+        throat_coords_local = np.argwhere(throat_region)
+        if len(throat_coords_local) > 0:
+            min_idx = np.argmin(local_dist[throat_region])
+            local_cent = throat_coords_local[min_idx]
+            # Convert to global coordinates
+            throat_centroid = np.array([
+                local_cent[0] + z_min,
+                local_cent[1] + y_min,
+                local_cent[2] + x_min
+            ])
+        else:
+            throat_centroid = None
+        
+        return throat_radius, throat_centroid
+
+    def _create_throat_mesh(self, connections, centers, radii, ids_list,
+                            distance_map=None, segmented_regions=None, spacing=None):
+        """
+        Creates tubes connecting the pores.
+        
+        If distance_map and segmented_regions are provided, uses accurate
+        throat radius measurement. Otherwise falls back to empirical formula.
+        """
         if not connections:
             return pv.PolyData(), np.array([])
 
         id_map = {uid: idx for idx, uid in enumerate(ids_list)}
+        
+        use_accurate = (distance_map is not None and 
+                        segmented_regions is not None and 
+                        spacing is not None)
+
+        # Pre-compute bounding boxes for fast throat measurement
+        slices_cache = None
+        if use_accurate:
+            slices_list = ndimage.find_objects(segmented_regions)
+            # Build label -> slice mapping (labels are 1-indexed)
+            slices_cache = {}
+            for label_idx, slice_obj in enumerate(slices_list, start=1):
+                if slice_obj is not None:
+                    slices_cache[label_idx] = slice_obj
 
         valid_connections = []
         for id_a, id_b in connections:
@@ -438,7 +548,19 @@ class PoreToSphereProcessor(BaseProcessor):
                 idx_b = id_map[id_b]
                 p1 = centers[idx_a]
                 p2 = centers[idx_b]
-                r_throat = min(radii[idx_a], radii[idx_b]) * 0.3
+                
+                if use_accurate and slices_cache:
+                    # FAST accurate measurement using bounding boxes
+                    r_throat, throat_center = self._measure_throat_radius_fast(
+                        distance_map, segmented_regions, id_a, id_b, spacing, slices_cache
+                    )
+                    # Fallback if measurement fails
+                    if r_throat <= 0:
+                        r_throat = min(radii[idx_a], radii[idx_b]) * 0.3
+                else:
+                    # Empirical formula fallback
+                    r_throat = min(radii[idx_a], radii[idx_b]) * 0.3
+                
                 valid_connections.append((p1, p2, r_throat))
 
         if not valid_connections:
