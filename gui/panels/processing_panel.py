@@ -21,6 +21,7 @@ class StructureProcessingPanel(QGroupBox):
     pnm_clicked = pyqtSignal()
     reset_clicked = pyqtSignal()
     export_clicked = pyqtSignal()
+    gpu_toggled = pyqtSignal(bool)
 
     def __init__(self, title: str = "🔧 Structure Processing"):
         super().__init__()
@@ -61,6 +62,21 @@ class StructureProcessingPanel(QGroupBox):
         thresh_layout.addWidget(auto_btn)
         layout.addLayout(thresh_layout)
         
+        # GPU Toggle
+        from PyQt5.QtWidgets import QCheckBox
+        from core.gpu_backend import is_gpu_available
+        
+        self.gpu_check = QCheckBox("Enable GPU Acceleration")
+        self.gpu_check.setToolTip("Use CuPy/CUDA for accelerated processing")
+        # Check if actually available (library installed + device present)
+        is_available = is_gpu_available()
+        self.gpu_check.setChecked(is_available)
+        self.gpu_check.setEnabled(is_available)
+        self.gpu_check.toggled.connect(self.gpu_toggled.emit)
+        
+        layout.addWidget(self.gpu_check)
+        
+        layout.addSpacing(5)
         self._add_button(layout, "🔬 Extract Pores", self.extract_pores_clicked)
         self._add_button(layout, "🌐 Generate PNM Model", self.pnm_clicked)
         

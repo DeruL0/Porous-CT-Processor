@@ -4,7 +4,7 @@ Info Panel components for displaying sample information and statistics.
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QGroupBox, 
-    QTableWidget, QTableWidgetItem, QSplitter
+    QTableWidget, QTableWidgetItem, QSplitter, QTabWidget
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
@@ -37,11 +37,19 @@ class StatisticsPanel(QWidget):
         # Splitter for resizing
         splitter = QSplitter(Qt.Vertical)
 
-        # Matplotlib Figure for Histogram
-        self.figure = Figure(figsize=(5, 3), dpi=80)
-        self.canvas = FigureCanvas(self.figure)
-        self.canvas.setMinimumHeight(100)
-        splitter.addWidget(self.canvas)
+        # Tab Widget for Charts
+        self.tabs = QTabWidget()
+        splitter.addWidget(self.tabs)
+        
+        # 1. Pore Size Chart
+        self.fig_pore = Figure(figsize=(5, 3), dpi=80)
+        self.canvas_pore = FigureCanvas(self.fig_pore)
+        self.tabs.addTab(self.canvas_pore, "Pore Sizes")
+        
+        # 2. Throat Size Chart
+        self.fig_throat = Figure(figsize=(5, 3), dpi=80)
+        self.canvas_throat = FigureCanvas(self.fig_throat)
+        self.tabs.addTab(self.canvas_throat, "Throat Sizes")
 
         # Statistics Table
         self.stats_table = QTableWidget()
@@ -71,32 +79,47 @@ class StatisticsPanel(QWidget):
 
     def update_statistics(self, metadata):
         """Update the panel with new statistics from VolumeData metadata."""
-        self.figure.clear()
+        self.fig_pore.clear()
+        self.fig_throat.clear()
         self.stats_table.setRowCount(0)
 
-        size_dist = metadata.get("PoreSizeDistribution", {})
+        pore_dist = metadata.get("PoreSizeDistribution", {})
+        throat_dist = metadata.get("ThroatSizeDistribution", {})
         largest_pore = metadata.get("LargestPoreRatio", "N/A")
         throat_stats = metadata.get("ThroatStats", {})
         pore_count = metadata.get("PoreCount", 0)
         connection_count = metadata.get("ConnectionCount", 0)
 
-        # Plot histogram
-        if size_dist.get("bins") and size_dist.get("counts"):
-            ax = self.figure.add_subplot(111)
-            bins = np.array(size_dist["bins"])
-            counts = size_dist["counts"]
-
+        # Plot Pore histogram
+        if pore_dist.get("bins") and pore_dist.get("counts"):
+            ax = self.fig_pore.add_subplot(111)
+            bins = np.array(pore_dist["bins"])
+            counts = pore_dist["counts"]
             bin_centers = (bins[:-1] + bins[1:]) / 2
             ax.bar(bin_centers, counts, width=np.diff(bins),
                    alpha=0.7, color='steelblue', edgecolor='black')
-
             ax.set_xlabel('Pore Radius (mm)')
             ax.set_ylabel('Count')
             ax.set_title('Pore Size Distribution')
             ax.grid(True, alpha=0.3)
-            self.figure.tight_layout()
+            self.fig_pore.tight_layout()
+            
+        # Plot Throat histogram
+        if throat_dist.get("bins") and throat_dist.get("counts"):
+            ax = self.fig_throat.add_subplot(111)
+            bins = np.array(throat_dist["bins"])
+            counts = throat_dist["counts"]
+            bin_centers = (bins[:-1] + bins[1:]) / 2
+            ax.bar(bin_centers, counts, width=np.diff(bins),
+                   alpha=0.7, color='indianred', edgecolor='black')
+            ax.set_xlabel('Throat Radius (mm)')
+            ax.set_ylabel('Count')
+            ax.set_title('Throat Size Distribution')
+            ax.grid(True, alpha=0.3)
+            self.fig_throat.tight_layout()
 
-        self.canvas.draw()
+        self.canvas_pore.draw()
+        self.canvas_throat.draw()
 
         # Stats table
         stats_data = [

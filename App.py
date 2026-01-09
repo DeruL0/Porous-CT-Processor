@@ -86,6 +86,10 @@ class AppController:
         self.panel.reset_clicked.connect(self._reset_to_original)
         self.panel.export_clicked.connect(self._export_vtk_dialog)
         self.panel.auto_threshold_clicked.connect(self._auto_detect_threshold)
+        
+        # GPU Control
+        from core.gpu_backend import get_gpu_backend
+        self.panel.gpu_toggled.connect(lambda checked: get_gpu_backend().set_enabled(checked))
 
         # Add to left side (controls)
         self.visualizer.add_custom_panel(self.panel, index=1, side='left')

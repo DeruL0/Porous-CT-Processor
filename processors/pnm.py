@@ -14,6 +14,7 @@ from typing import Tuple, Set, Optional, Callable
 import gc
 
 from core import BaseProcessor, VolumeData
+from processors import gpu_ops
 
 # cc3d for fast 3D connected component labeling
 try:
@@ -100,7 +101,7 @@ class PoreToSphereProcessor(BaseProcessor):
                 
                 # Step 1: Segmentation (only if no cache)
                 solid_mask = data.raw_data > threshold
-                filled_mask = ndimage.binary_fill_holes(solid_mask)
+                filled_mask = gpu_ops.binary_fill_holes(solid_mask)
                 pores_mask = filled_mask ^ solid_mask
                 
                 # Free intermediate arrays
@@ -139,7 +140,7 @@ class PoreToSphereProcessor(BaseProcessor):
                 # Process slice with some overlap for EDT continuity
                 start_ext = max(0, i - 10)
                 end_ext = min(shape[0], end + 10)
-                chunk_dist = ndimage.distance_transform_edt(pores_mask[start_ext:end_ext])
+                chunk_dist = gpu_ops.distance_transform_edt(pores_mask[start_ext:end_ext])
                 # Copy only the non-overlapping part
                 offset = i - start_ext
                 distance_map[i:end] = chunk_dist[offset:offset + (end - i)]
@@ -152,10 +153,10 @@ class PoreToSphereProcessor(BaseProcessor):
             report(40, "Distance map computed. Finding local maxima...")
     
             # Find peaks
-            local_maxi = peak_local_max(
+            local_maxi = gpu_ops.find_local_maxima(
                 distance_map,
-                labels=pores_mask,
-                min_distance=self.MIN_PEAK_DISTANCE
+                min_distance=self.MIN_PEAK_DISTANCE,
+                labels=pores_mask
             )
             
             # Free pores_mask early
@@ -243,6 +244,9 @@ class PoreToSphereProcessor(BaseProcessor):
         size_distribution = self._calculate_size_distribution(pore_radii)
         largest_pore_ratio = self._calculate_connectivity(segmented_regions, num_pores)
         
+        # Calculate throat size distribution
+        throat_distribution = self._calculate_size_distribution(throat_radii)
+        
         throat_stats = {}
         if len(throat_radii) > 0:
             throat_stats = {
@@ -295,6 +299,7 @@ class PoreToSphereProcessor(BaseProcessor):
                 "ConnectionCount": len(connections),
                 "MeshPoints": combined_mesh.n_points,
                 "PoreSizeDistribution": size_distribution,
+                "ThroatSizeDistribution": throat_distribution,
                 "LargestPoreRatio": f"{largest_pore_ratio:.2f}%",
                 "ThroatStats": throat_stats,
                 "PoreRadii": pore_radii.tolist(),
@@ -518,9 +523,7 @@ class PoreToSphereProcessor(BaseProcessor):
                             distance_map=None, segmented_regions=None, spacing=None):
         """
         Creates tubes connecting the pores.
-        
-        If distance_map and segmented_regions are provided, uses accurate
-        throat radius measurement. Otherwise falls back to empirical formula.
+        Uses batch GPU throat measurement for all connections at once.
         """
         if not connections:
             return pv.PolyData(), np.array([])
@@ -531,64 +534,51 @@ class PoreToSphereProcessor(BaseProcessor):
                         segmented_regions is not None and 
                         spacing is not None)
 
-        # Pre-compute bounding boxes for fast throat measurement
-        slices_cache = None
+        # Batch compute all throat radii on GPU
+        throat_radii_map = {}
         if use_accurate:
-            slices_list = ndimage.find_objects(segmented_regions)
-            # Build label -> slice mapping (labels are 1-indexed)
-            slices_cache = {}
-            for label_idx, slice_obj in enumerate(slices_list, start=1):
-                if slice_obj is not None:
-                    slices_cache[label_idx] = slice_obj
+            throat_radii_map = gpu_ops.compute_all_throat_radii(
+                segmented_regions, distance_map, connections, spacing
+            )
 
+        # Build valid connections with measured or estimated radii
         valid_connections = []
         for id_a, id_b in connections:
-            if id_a in id_map and id_b in id_map:
-                idx_a = id_map[id_a]
-                idx_b = id_map[id_b]
-                p1 = centers[idx_a]
-                p2 = centers[idx_b]
+            if id_a not in id_map or id_b not in id_map:
+                continue
                 
-                if use_accurate and slices_cache:
-                    # FAST accurate measurement using bounding boxes
-                    r_throat, throat_center = self._measure_throat_radius_fast(
-                        distance_map, segmented_regions, id_a, id_b, spacing, slices_cache
-                    )
-                    # Fallback if measurement fails
-                    if r_throat <= 0:
-                        r_throat = min(radii[idx_a], radii[idx_b]) * 0.3
-                else:
-                    # Empirical formula fallback
-                    r_throat = min(radii[idx_a], radii[idx_b]) * 0.3
-                
-                valid_connections.append((p1, p2, r_throat))
+            idx_a = id_map[id_a]
+            idx_b = id_map[id_b]
+            p1 = centers[idx_a]
+            p2 = centers[idx_b]
+            
+            # Use measured radius or fallback to empirical
+            key = (id_a, id_b) if id_a < id_b else (id_b, id_a)
+            r_throat = throat_radii_map.get(key, 0.0)
+            
+            if r_throat <= 0:
+                r_throat = min(radii[idx_a], radii[idx_b]) * 0.3
+            
+            valid_connections.append((p1, p2, r_throat))
 
         if not valid_connections:
             return pv.PolyData(), np.array([])
 
-        def create_single_tube(conn):
-            p1, p2, r_throat = conn
-            line = pv.Line(p1, p2)
-            return line.tube(radius=r_throat), r_throat
+        # Extract throat radii for return value
+        throat_radii = np.array([c[2] for c in valid_connections])
 
-        if JOBLIB_AVAILABLE and len(valid_connections) > 20:
-            results = Parallel(n_jobs=-1, prefer="threads")(
-                delayed(create_single_tube)(conn) for conn in valid_connections
-            )
-            lines = [r[0] for r in results]
-            throat_radii = [r[1] for r in results]
-        else:
-            lines = []
-            throat_radii = []
-            for conn in valid_connections:
-                tube, r_throat = create_single_tube(conn)
-                lines.append(tube)
-                throat_radii.append(r_throat)
-
-        throats = lines[0].merge(lines[1:]) if len(lines) > 1 else lines[0]
+        # GPU-accelerated tube mesh generation
+        from processors import gpu_mesh
+        vertices, faces = gpu_mesh.generate_tubes_mesh(valid_connections, n_sides=6)
+        
+        if len(vertices) == 0:
+            return pv.PolyData(), throat_radii
+        
+        # Create PyVista mesh from vertices and faces
+        throats = pv.PolyData(vertices, faces)
         throats["IsPore"] = np.zeros(throats.n_points, dtype=int)
 
-        return throats, np.array(throat_radii)
+        return throats, throat_radii
 
     def _calculate_size_distribution(self, pore_radii):
         """Calculate pore size distribution histogram."""

@@ -104,3 +104,8 @@ MIN_PEAK_DISTANCE = 6
 DEBOUNCE_INTERVAL = 100
 CLIP_UPDATE_INTERVAL = 200
 
+# ==========================================
+# GPU Acceleration Settings
+# ==========================================
+GPU_ENABLED = True    # Set False to disable GPU acceleration
+GPU_MIN_SIZE_MB = 10  # Minimum data size (MB) to use GPU (smaller uses CPU)

@@ -354,7 +354,7 @@ class RenderEngine:
             self.reset_camera()
 
     def render_isosurface(self, threshold=300, reset_view=True):
-        """Render isosurface at specified threshold."""
+        """Render isosurface at specified threshold using optimized VTK algorithm."""
         if not self.grid:
             return
 
@@ -371,7 +371,11 @@ class RenderEngine:
             # Check cache
             if threshold in self._iso_cache:
                 contours = self._iso_cache[threshold]
+                self.update_status("Using cached isosurface")
             else:
+                import time
+                start = time.time()
+                
                 # Use potentially downsampled grid for large volumes
                 safe_grid = self._get_grid_for_isosurface()
                 if safe_grid is None:
@@ -379,8 +383,28 @@ class RenderEngine:
                     return
                 
                 grid_points = safe_grid.cell_data_to_point_data()
-                contours = grid_points.contour(isosurfaces=[threshold])
-                contours.compute_normals(inplace=True)
+                
+                # Use VTK Flying Edges algorithm (faster than marching cubes)
+                # flying_edges is 2-10x faster and is the default in VTK 9.0+
+                try:
+                    # Flying Edges via VTK directly
+                    import vtk
+                    contour_filter = vtk.vtkFlyingEdges3D()
+                    contour_filter.SetInputData(grid_points)
+                    contour_filter.SetValue(0, threshold)
+                    contour_filter.ComputeNormalsOn()
+                    contour_filter.Update()
+                    contours = pv.wrap(contour_filter.GetOutput())
+                    elapsed = time.time() - start
+                    print(f"[Render] Isosurface (FlyingEdges): {elapsed:.2f}s, {contours.n_points} points")
+                except Exception as e:
+                    # Fallback to PyVista contour
+                    print(f"[Render] FlyingEdges failed ({e}), using PyVista contour")
+                    contours = grid_points.contour(isosurfaces=[threshold])
+                    contours.compute_normals(inplace=True)
+                    elapsed = time.time() - start
+                    print(f"[Render] Isosurface (contour): {elapsed:.2f}s, {contours.n_points} points")
+                
                 self._iso_cache[threshold] = contours
 
             style_map = {'Surface': 'surface', 'Wireframe': 'wireframe', 'Wireframe + Surface': 'surface'}
