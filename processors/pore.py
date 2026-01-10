@@ -10,7 +10,7 @@ from typing import Optional, Callable, Tuple
 import gc
 
 from core import BaseProcessor, VolumeData
-from processors import gpu_ops
+from processors.utils import binary_fill_holes
 from config import (
     PROCESS_CHUNK_THRESHOLD,
     PROCESS_CHUNK_SIZE,
@@ -106,7 +106,7 @@ class PoreExtractionProcessor(BaseProcessor):
         if data.raw_data is None:
             raise ValueError("Input data must contain raw voxel data.")
 
-        from processors.segmentation_cache import get_segmentation_cache
+        from data.disk_cache import get_segmentation_cache
         
         def report(p: int, msg: str):
             print(f"[Processor] {msg}")
@@ -166,7 +166,7 @@ class PoreExtractionProcessor(BaseProcessor):
         report(20, "Binarization complete. Filling holes...")
 
         # 2. Morphology
-        filled_volume = gpu_ops.binary_fill_holes(solid_mask)
+        filled_volume = binary_fill_holes(solid_mask)
         pores_mask = filled_volume ^ solid_mask
         
         # Free intermediate arrays
@@ -240,7 +240,7 @@ class PoreExtractionProcessor(BaseProcessor):
             # Fill holes (2D per slice for memory efficiency)
             pores_mask = np.zeros_like(solid_mask)
             for j in range(solid_mask.shape[0]):
-                filled = gpu_ops.binary_fill_holes(solid_mask[j])
+                filled = binary_fill_holes(solid_mask[j])
                 pores_mask[j] = filled ^ solid_mask[j]
             
             # Count pores

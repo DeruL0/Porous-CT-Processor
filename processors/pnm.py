@@ -14,7 +14,7 @@ from typing import Tuple, Set, Optional, Callable
 import gc
 
 from core import BaseProcessor, VolumeData
-from processors import gpu_ops
+from processors.utils import binary_fill_holes, distance_transform_edt, find_local_maxima, watershed_gpu
 
 # cc3d for fast 3D connected component labeling
 try:
@@ -67,7 +67,7 @@ class PoreToSphereProcessor(BaseProcessor):
             if callback: callback(p, msg)
 
         import gc
-        from processors.segmentation_cache import get_segmentation_cache
+        from data.disk_cache import get_segmentation_cache
         
         # Use shared cache for segmentation
         seg_cache = get_segmentation_cache()
@@ -101,7 +101,7 @@ class PoreToSphereProcessor(BaseProcessor):
                 
                 # Step 1: Segmentation (only if no cache)
                 solid_mask = data.raw_data > threshold
-                filled_mask = gpu_ops.binary_fill_holes(solid_mask)
+                filled_mask = binary_fill_holes(solid_mask)
                 pores_mask = filled_mask ^ solid_mask
                 
                 # Free intermediate arrays
@@ -140,7 +140,7 @@ class PoreToSphereProcessor(BaseProcessor):
                 # Process slice with some overlap for EDT continuity
                 start_ext = max(0, i - 10)
                 end_ext = min(shape[0], end + 10)
-                chunk_dist = gpu_ops.distance_transform_edt(pores_mask[start_ext:end_ext])
+                chunk_dist = distance_transform_edt(pores_mask[start_ext:end_ext])
                 # Copy only the non-overlapping part
                 offset = i - start_ext
                 distance_map[i:end] = chunk_dist[offset:offset + (end - i)]
@@ -153,7 +153,7 @@ class PoreToSphereProcessor(BaseProcessor):
             report(40, "Distance map computed. Finding local maxima...")
     
             # Find peaks
-            local_maxi = gpu_ops.find_local_maxima(
+            local_maxi = find_local_maxima(
                 distance_map,
                 min_distance=self.MIN_PEAK_DISTANCE,
                 labels=pores_mask
@@ -537,7 +537,7 @@ class PoreToSphereProcessor(BaseProcessor):
         # Batch compute all throat radii on GPU
         throat_radii_map = {}
         if use_accurate:
-            throat_radii_map = gpu_ops.compute_all_throat_radii(
+            throat_radii_map = compute_all_throat_radii(
                 segmented_regions, distance_map, connections, spacing
             )
 
