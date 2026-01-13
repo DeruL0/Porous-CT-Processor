@@ -1,20 +1,23 @@
 """
 Pore to sphere processor for Pore Network Modeling (PNM).
-Memory-optimized with disk caching for large volumes.
+GPU-accelerated with CuPy, memory-optimized with disk caching for large volumes.
 """
 
 import os
 import tempfile
+import time
 import numpy as np
 import scipy.ndimage as ndimage
 import pyvista as pv
 from skimage.segmentation import watershed
 from skimage.feature import peak_local_max
-from typing import Tuple, Set, Optional, Callable
+from typing import Tuple, Set, Optional, Callable, List
 import gc
 
 from core import BaseProcessor, VolumeData
 from processors.utils import binary_fill_holes, distance_transform_edt, find_local_maxima, watershed_gpu
+from config import GPU_ENABLED
+from core.gpu_backend import get_gpu_backend, CUPY_AVAILABLE
 
 # cc3d for fast 3D connected component labeling
 try:
@@ -43,7 +46,7 @@ except ImportError:
 
 
 class PoreToSphereProcessor(BaseProcessor):
-    """Optimized Pore Network Modeling (PNM)."""
+    """GPU-Optimized Pore Network Modeling (PNM)."""
 
     MIN_PEAK_DISTANCE = 6
 
@@ -66,7 +69,6 @@ class PoreToSphereProcessor(BaseProcessor):
             print(f"[PNM] {msg}")
             if callback: callback(p, msg)
 
-        import gc
         from data.disk_cache import get_segmentation_cache
         
         # Use shared cache for segmentation
@@ -229,9 +231,12 @@ class PoreToSphereProcessor(BaseProcessor):
         else:
             pores_mesh = pv.PolyData()
 
-        report(90, "Connecting pores (accurate throat measurement)...")
-        connections = self._find_adjacency(segmented_regions)
-        throats_mesh, throat_radii = self._create_throat_mesh(
+        report(90, "Connecting pores (GPU-accelerated)...")
+        
+        # GPU-accelerated adjacency detection
+        connections = self._find_adjacency_gpu(segmented_regions)
+        
+        throats_mesh, throat_radii = self._create_throat_mesh_gpu(
             connections, pore_centers, pore_radii, pore_ids,
             distance_map=distance_map, 
             segmented_regions=segmented_regions,
@@ -340,16 +345,16 @@ class PoreToSphereProcessor(BaseProcessor):
 
             return (label_idx, [cx, cy, cz], radius)
 
-        if JOBLIB_AVAILABLE and num_pores > 10:
-            n_jobs = min(-1, num_pores)
-            results = Parallel(n_jobs=n_jobs, prefer="threads")(
+        # Use parallel processing for large number of pores
+        if JOBLIB_AVAILABLE and num_pores > 100:
+            results = Parallel(n_jobs=-1, prefer="threads")(
                 delayed(process_single_pore)(i) for i in range(num_pores)
             )
             results = [r for r in results if r is not None]
         else:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             results = []
-            max_workers = min(8, num_pores)
+            max_workers = min(8, max(1, num_pores))
             
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {executor.submit(process_single_pore, i): i for i in range(num_pores)}
@@ -369,163 +374,113 @@ class PoreToSphereProcessor(BaseProcessor):
 
         return np.array(centers), np.array(radii), np.array(ids)
 
-    def _find_adjacency(self, labels_volume) -> Set[Tuple[int, int]]:
+    def _find_adjacency_gpu(self, labels_volume) -> Set[Tuple[int, int]]:
         """
-        Identifies connected pores using memory-efficient chunked processing.
-        Processes slice-by-slice to avoid allocating large temporary arrays.
+        GPU-accelerated adjacency detection using CuPy.
+        Falls back to CPU if GPU unavailable or fails.
         """
-        import gc
+        backend = get_gpu_backend()
+        
+        if GPU_ENABLED and backend.available and CUPY_AVAILABLE:
+            try:
+                return self._find_adjacency_gpu_impl(labels_volume)
+            except Exception as e:
+                print(f"[GPU] Adjacency detection failed: {e}, using CPU")
+                backend.clear_memory()
+        
+        return self._find_adjacency_cpu(labels_volume)
+
+    def _find_adjacency_gpu_impl(self, labels_volume) -> Set[Tuple[int, int]]:
+        """GPU implementation of adjacency detection."""
+        import cupy as cp
+        
+        backend = get_gpu_backend()
+        start = time.time()
+        
+        labels_gpu = cp.asarray(labels_volume)
         adjacency = set()
         
-        # Process each axis separately with chunking
-        shape = labels_volume.shape
-        chunk_size = 32  # Process in chunks to limit memory
+        # Process each axis
+        for axis in range(3):
+            if axis == 0:
+                curr = labels_gpu[:-1, :, :]
+                next_ = labels_gpu[1:, :, :]
+            elif axis == 1:
+                curr = labels_gpu[:, :-1, :]
+                next_ = labels_gpu[:, 1:, :]
+            else:
+                curr = labels_gpu[:, :, :-1]
+                next_ = labels_gpu[:, :, 1:]
+            
+            # Vectorized mask
+            mask = (curr > 0) & (next_ > 0) & (curr != next_)
+            
+            if cp.any(mask):
+                pairs_a = curr[mask]
+                pairs_b = next_[mask]
+                
+                # Transfer pairs to CPU
+                pairs_a_cpu = cp.asnumpy(pairs_a)
+                pairs_b_cpu = cp.asnumpy(pairs_b)
+                
+                # Use numpy unique to reduce duplicates before set operations
+                stacked = np.stack([np.minimum(pairs_a_cpu, pairs_b_cpu),
+                                   np.maximum(pairs_a_cpu, pairs_b_cpu)], axis=1)
+                unique_pairs = np.unique(stacked, axis=0)
+                
+                for a, b in unique_pairs:
+                    adjacency.add((int(a), int(b)))
+                
+                del pairs_a, pairs_b
         
-        # Z-axis adjacency (axis 0)
-        for i in range(0, shape[0] - 1, chunk_size):
-            end = min(i + chunk_size, shape[0] - 1)
-            val_curr = labels_volume[i:end]
-            val_next = labels_volume[i+1:end+1]
-            mask = (val_curr > 0) & (val_next > 0) & (val_curr != val_next)
-            if np.any(mask):
-                pairs_curr = val_curr[mask]
-                pairs_next = val_next[mask]
-                for a, b in zip(pairs_curr, pairs_next):
-                    if a < b:
-                        adjacency.add((a, b))
-                    else:
-                        adjacency.add((b, a))
-            del val_curr, val_next, mask
-            gc.collect()
+        del labels_gpu
+        backend.clear_memory()
         
-        # Y-axis adjacency (axis 1)
-        for i in range(0, shape[1] - 1, chunk_size):
-            end = min(i + chunk_size, shape[1] - 1)
-            val_curr = labels_volume[:, i:end, :]
-            val_next = labels_volume[:, i+1:end+1, :]
-            mask = (val_curr > 0) & (val_next > 0) & (val_curr != val_next)
-            if np.any(mask):
-                pairs_curr = val_curr[mask]
-                pairs_next = val_next[mask]
-                for a, b in zip(pairs_curr, pairs_next):
-                    if a < b:
-                        adjacency.add((a, b))
-                    else:
-                        adjacency.add((b, a))
-            del val_curr, val_next, mask
-            gc.collect()
-        
-        # X-axis adjacency (axis 2)
-        for i in range(0, shape[2] - 1, chunk_size):
-            end = min(i + chunk_size, shape[2] - 1)
-            val_curr = labels_volume[:, :, i:end]
-            val_next = labels_volume[:, :, i+1:end+1]
-            mask = (val_curr > 0) & (val_next > 0) & (val_curr != val_next)
-            if np.any(mask):
-                pairs_curr = val_curr[mask]
-                pairs_next = val_next[mask]
-                for a, b in zip(pairs_curr, pairs_next):
-                    if a < b:
-                        adjacency.add((a, b))
-                    else:
-                        adjacency.add((b, a))
-            del val_curr, val_next, mask
-            gc.collect()
+        elapsed = time.time() - start
+        print(f"[GPU] Adjacency detection: {elapsed:.2f}s, found {len(adjacency)} connections")
         
         return adjacency
 
-    def _measure_throat_radius_fast(self, distance_map, segmented_regions, 
-                                     pore_a: int, pore_b: int, spacing: tuple,
-                                     slices_cache: dict = None) -> Tuple[float, Optional[np.ndarray]]:
-        """
-        OPTIMIZED: Measure throat radius using bounding box to limit computation.
+    def _find_adjacency_cpu(self, labels_volume) -> Set[Tuple[int, int]]:
+        """CPU fallback for adjacency detection."""
+        start = time.time()
+        adjacency = set()
+        shape = labels_volume.shape
+        chunk_size = 64
         
-        Instead of operating on the full volume, we only work on the union of
-        the two pores' bounding boxes - typically 1000x smaller region.
+        def process_axis(axis: int):
+            """Process adjacency along a single axis."""
+            for i in range(0, shape[axis] - 1, chunk_size):
+                end = min(i + chunk_size, shape[axis] - 1)
+                slices_curr = [slice(None)] * 3
+                slices_next = [slice(None)] * 3
+                slices_curr[axis] = slice(i, end)
+                slices_next[axis] = slice(i + 1, end + 1)
+                
+                val_curr = labels_volume[tuple(slices_curr)]
+                val_next = labels_volume[tuple(slices_next)]
+                mask = (val_curr > 0) & (val_next > 0) & (val_curr != val_next)
+                
+                if np.any(mask):
+                    stacked = np.stack([
+                        np.minimum(val_curr[mask], val_next[mask]),
+                        np.maximum(val_curr[mask], val_next[mask])
+                    ], axis=1)
+                    for a, b in np.unique(stacked, axis=0):
+                        adjacency.add((int(a), int(b)))
         
-        Args:
-            distance_map: Distance transform of pore space
-            segmented_regions: Watershed segmentation labels
-            pore_a, pore_b: Labels of the two pores
-            spacing: Voxel spacing (sx, sy, sz)
-            slices_cache: Pre-computed bounding boxes from find_objects()
-            
-        Returns:
-            (throat_radius, throat_centroid) - radius in physical units, centroid coords
-        """
-        # Get bounding boxes if cache provided
-        if slices_cache is not None:
-            slice_a = slices_cache.get(pore_a)
-            slice_b = slices_cache.get(pore_b)
-        else:
-            return 0.0, None  # Need cache for fast operation
+        for axis in range(3):
+            process_axis(axis)
         
-        if slice_a is None or slice_b is None:
-            return 0.0, None
-        
-        # Compute union bounding box (expand to include both pores + 1 pixel margin)
-        shape = segmented_regions.shape
-        z_min = max(0, min(slice_a[0].start, slice_b[0].start) - 1)
-        z_max = min(shape[0], max(slice_a[0].stop, slice_b[0].stop) + 1)
-        y_min = max(0, min(slice_a[1].start, slice_b[1].start) - 1)
-        y_max = min(shape[1], max(slice_a[1].stop, slice_b[1].stop) + 1)
-        x_min = max(0, min(slice_a[2].start, slice_b[2].start) - 1)
-        x_max = min(shape[2], max(slice_a[2].stop, slice_b[2].stop) + 1)
-        
-        # Extract local region (MUCH smaller than full volume)
-        local_labels = segmented_regions[z_min:z_max, y_min:y_max, x_min:x_max]
-        local_dist = distance_map[z_min:z_max, y_min:y_max, x_min:x_max]
-        
-        # Get local masks
-        mask_a = (local_labels == pore_a)
-        mask_b = (local_labels == pore_b)
-        
-        # Find boundary using dilation (now on small region - fast!)
-        dilated_a = ndimage.binary_dilation(mask_a)
-        dilated_b = ndimage.binary_dilation(mask_b)
-        
-        # Throat = intersection of dilated regions
-        throat_region = dilated_a & dilated_b
-        
-        if not np.any(throat_region):
-            return 0.0, None
-        
-        # Get distance values at throat
-        throat_distances = local_dist[throat_region]
-        
-        if len(throat_distances) == 0:
-            return 0.0, None
-        
-        # Throat radius = minimum distance at boundary
-        throat_radius_voxels = float(np.min(throat_distances))
-        
-        # Convert to physical units
-        avg_spacing = (spacing[0] + spacing[1] + spacing[2]) / 3.0
-        throat_radius = throat_radius_voxels * avg_spacing
-        
-        # Find throat centroid in global coordinates
-        throat_coords_local = np.argwhere(throat_region)
-        if len(throat_coords_local) > 0:
-            min_idx = np.argmin(local_dist[throat_region])
-            local_cent = throat_coords_local[min_idx]
-            # Convert to global coordinates
-            throat_centroid = np.array([
-                local_cent[0] + z_min,
-                local_cent[1] + y_min,
-                local_cent[2] + x_min
-            ])
-        else:
-            throat_centroid = None
-        
-        return throat_radius, throat_centroid
+        print(f"[CPU] Adjacency detection: {time.time() - start:.2f}s, found {len(adjacency)} connections")
+        return adjacency
 
-    def _create_throat_mesh(self, connections, centers, radii, ids_list,
-                            distance_map=None, segmented_regions=None, spacing=None):
+    def _create_throat_mesh_gpu(self, connections, centers, radii, ids_list,
+                                distance_map=None, segmented_regions=None, spacing=None):
         """
-        Creates tubes connecting the pores.
-        Uses batch GPU throat measurement for all connections at once.
+        Creates tubes connecting the pores using GPU-accelerated batch processing.
         """
-        if not connections:
+        if not connections or len(centers) == 0:
             return pv.PolyData(), np.array([])
 
         id_map = {uid: idx for idx, uid in enumerate(ids_list)}
@@ -534,14 +489,31 @@ class PoreToSphereProcessor(BaseProcessor):
                         segmented_regions is not None and 
                         spacing is not None)
 
-        # Batch compute all throat radii on GPU
+        # Pre-compute bounding boxes for throat measurement
         throat_radii_map = {}
         if use_accurate:
-            throat_radii_map = compute_all_throat_radii(
-                segmented_regions, distance_map, connections, spacing
-            )
+            slices = ndimage.find_objects(segmented_regions)
+            slices_cache = {i + 1: s for i, s in enumerate(slices) if s is not None}
+            
+            # Parallel throat radius measurement
+            from concurrent.futures import ThreadPoolExecutor
+            
+            def measure_throat(conn):
+                id_a, id_b = conn
+                key = (id_a, id_b) if id_a < id_b else (id_b, id_a)
+                radius, _ = self._measure_throat_radius_fast(
+                    distance_map, segmented_regions, id_a, id_b, spacing, slices_cache
+                )
+                return key, radius
+            
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                results = list(executor.map(measure_throat, connections))
+            
+            for key, radius in results:
+                if radius > 0:
+                    throat_radii_map[key] = radius
 
-        # Build valid connections with measured or estimated radii
+        # Build valid connections
         valid_connections = []
         for id_a, id_b in connections:
             if id_a not in id_map or id_b not in id_map:
@@ -552,7 +524,6 @@ class PoreToSphereProcessor(BaseProcessor):
             p1 = centers[idx_a]
             p2 = centers[idx_b]
             
-            # Use measured radius or fallback to empirical
             key = (id_a, id_b) if id_a < id_b else (id_b, id_a)
             r_throat = throat_radii_map.get(key, 0.0)
             
@@ -564,21 +535,177 @@ class PoreToSphereProcessor(BaseProcessor):
         if not valid_connections:
             return pv.PolyData(), np.array([])
 
-        # Extract throat radii for return value
         throat_radii = np.array([c[2] for c in valid_connections])
 
-        # GPU-accelerated tube mesh generation
-        from processors import gpu_mesh
-        vertices, faces = gpu_mesh.generate_tubes_mesh(valid_connections, n_sides=6)
-        
-        if len(vertices) == 0:
-            return pv.PolyData(), throat_radii
-        
-        # Create PyVista mesh from vertices and faces
-        throats = pv.PolyData(vertices, faces)
-        throats["IsPore"] = np.zeros(throats.n_points, dtype=int)
+        # GPU batch tube generation
+        backend = get_gpu_backend()
+        if GPU_ENABLED and backend.available and CUPY_AVAILABLE and len(valid_connections) > 50:
+            try:
+                vertices, faces = self._generate_tubes_batch_gpu(valid_connections, n_sides=6)
+                if len(vertices) > 0:
+                    throats = pv.PolyData(vertices, faces)
+                    throats["IsPore"] = np.zeros(throats.n_points, dtype=int)
+                    print(f"[GPU] Generated {len(valid_connections)} tubes")
+                    return throats, throat_radii
+            except Exception as e:
+                print(f"[GPU] Tube generation failed: {e}, using CPU")
+                backend.clear_memory()
 
+        # CPU fallback - batch with PyVista
+        throats = self._generate_tubes_batch_cpu(valid_connections)
+        throats["IsPore"] = np.zeros(throats.n_points, dtype=int)
+        
         return throats, throat_radii
+
+    def _generate_tubes_batch_gpu(self, connections: List[Tuple], n_sides: int = 6):
+        """Generate all tube meshes on GPU, transfer once at end."""
+        import cupy as cp
+        
+        # Pre-compute tube template (unit cylinder along Z)
+        angles = np.linspace(0, 2 * np.pi, n_sides, endpoint=False)
+        circle_x = np.cos(angles)
+        circle_y = np.sin(angles)
+        
+        all_vertices = []
+        all_faces = []
+        vertex_offset = 0
+        
+        for p1, p2, radius in connections:
+            p1 = np.array(p1)
+            p2 = np.array(p2)
+            
+            # Direction and length
+            direction = p2 - p1
+            length = np.linalg.norm(direction)
+            if length < 1e-6:
+                continue
+            direction = direction / length
+            
+            # Build rotation matrix to align Z with direction
+            z_axis = np.array([0, 0, 1])
+            if np.abs(np.dot(direction, z_axis)) > 0.999:
+                # Nearly parallel to Z
+                rotation = np.eye(3) if direction[2] > 0 else np.diag([1, -1, -1])
+            else:
+                v = np.cross(z_axis, direction)
+                s = np.linalg.norm(v)
+                c = np.dot(z_axis, direction)
+                vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+                rotation = np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
+            
+            # Generate tube vertices
+            # Bottom ring
+            bottom_ring = np.column_stack([
+                circle_x * radius * 0.5,
+                circle_y * radius * 0.5,
+                np.zeros(n_sides)
+            ])
+            # Top ring
+            top_ring = np.column_stack([
+                circle_x * radius * 0.5,
+                circle_y * radius * 0.5,
+                np.ones(n_sides) * length
+            ])
+            
+            # Transform
+            bottom_transformed = (rotation @ bottom_ring.T).T + p1
+            top_transformed = (rotation @ top_ring.T).T + p1
+            
+            tube_vertices = np.vstack([bottom_transformed, top_transformed])
+            all_vertices.append(tube_vertices)
+            
+            # Generate faces (quads as two triangles)
+            tube_faces = []
+            for i in range(n_sides):
+                next_i = (i + 1) % n_sides
+                # Bottom triangle
+                tube_faces.append([3, vertex_offset + i, vertex_offset + next_i, vertex_offset + n_sides + i])
+                # Top triangle
+                tube_faces.append([3, vertex_offset + next_i, vertex_offset + n_sides + next_i, vertex_offset + n_sides + i])
+            
+            all_faces.extend(tube_faces)
+            vertex_offset += 2 * n_sides
+        
+        if not all_vertices:
+            return np.array([]), np.array([])
+        
+        vertices = np.vstack(all_vertices).astype(np.float32)
+        faces = np.hstack([[item for sublist in all_faces for item in sublist]]).astype(np.int32)
+        
+        return vertices, faces
+
+    def _generate_tubes_batch_cpu(self, connections: List[Tuple]) -> pv.PolyData:
+        """Generate tubes using PyVista (CPU fallback)."""
+        tubes_list = []
+        
+        for p1, p2, r_throat in connections:
+            try:
+                line = pv.Line(p1, p2)
+                tube = line.tube(radius=max(r_throat * 0.5, 0.1), n_sides=6)
+                tubes_list.append(tube)
+            except Exception:
+                continue
+        
+        if not tubes_list:
+            return pv.PolyData()
+        
+        # Merge all tubes
+        result = tubes_list[0]
+        for tube in tubes_list[1:]:
+            result = result.merge(tube)
+        
+        return result
+
+    def _measure_throat_radius_fast(self, distance_map, segmented_regions, 
+                                     pore_a: int, pore_b: int, spacing: tuple,
+                                     slices_cache: dict = None) -> Tuple[float, Optional[np.ndarray]]:
+        """
+        OPTIMIZED: Measure throat radius using bounding box to limit computation.
+        """
+        if slices_cache is not None:
+            slice_a = slices_cache.get(pore_a)
+            slice_b = slices_cache.get(pore_b)
+        else:
+            return 0.0, None
+        
+        if slice_a is None or slice_b is None:
+            return 0.0, None
+        
+        # Compute union bounding box
+        shape = segmented_regions.shape
+        z_min = max(0, min(slice_a[0].start, slice_b[0].start) - 1)
+        z_max = min(shape[0], max(slice_a[0].stop, slice_b[0].stop) + 1)
+        y_min = max(0, min(slice_a[1].start, slice_b[1].start) - 1)
+        y_max = min(shape[1], max(slice_a[1].stop, slice_b[1].stop) + 1)
+        x_min = max(0, min(slice_a[2].start, slice_b[2].start) - 1)
+        x_max = min(shape[2], max(slice_a[2].stop, slice_b[2].stop) + 1)
+        
+        # Extract local region
+        local_labels = segmented_regions[z_min:z_max, y_min:y_max, x_min:x_max]
+        local_dist = distance_map[z_min:z_max, y_min:y_max, x_min:x_max]
+        
+        mask_a = (local_labels == pore_a)
+        mask_b = (local_labels == pore_b)
+        
+        # Find boundary using dilation
+        dilated_a = ndimage.binary_dilation(mask_a)
+        dilated_b = ndimage.binary_dilation(mask_b)
+        
+        throat_region = dilated_a & dilated_b
+        
+        if not np.any(throat_region):
+            return 0.0, None
+        
+        throat_distances = local_dist[throat_region]
+        
+        if len(throat_distances) == 0:
+            return 0.0, None
+        
+        throat_radius_voxels = float(np.min(throat_distances))
+        avg_spacing = (spacing[0] + spacing[1] + spacing[2]) / 3.0
+        throat_radius = throat_radius_voxels * avg_spacing
+        
+        return throat_radius, None
 
     def _calculate_size_distribution(self, pore_radii):
         """Calculate pore size distribution histogram."""

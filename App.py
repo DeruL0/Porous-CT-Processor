@@ -121,23 +121,25 @@ class AppController:
         return callback
 
     def _auto_detect_threshold(self):
-        """Calculate and set optimal threshold using Otsu's method."""
+        """Calculate and set optimal threshold using selected algorithm."""
         current_data = self.data_manager.active_data
         if current_data is None or current_data.raw_data is None:
             QMessageBox.warning(self.visualizer, "No Data", "Please load a sample first.")
             return
-            
-        self.visualizer.update_status("Calculating optimal threshold (Otsu)...")
+        
+        algorithm = self.panel.get_algorithm()
+        self.visualizer.update_status(f"Calculating threshold ({algorithm})...")
         self.app.processEvents()
         
         try:
-            suggested = PoreExtractionProcessor.suggest_threshold(current_data)
+            suggested = PoreExtractionProcessor.suggest_threshold(current_data, algorithm)
             self.panel.set_threshold(suggested)
             
-            self.visualizer.update_status(f"Threshold set to {suggested} HU (Otsu)")
-            self._show_msg("Auto Threshold", f"Optimal threshold: {suggested} HU\n(Otsu's Binarization)")
+            algo_display = algorithm.capitalize() if algorithm != 'auto' else 'Auto'
+            self.visualizer.update_status(f"Threshold set to {suggested} HU ({algo_display})")
+            self._show_msg("Threshold Detection", f"Threshold: {suggested} HU\nAlgorithm: {algo_display}")
         except Exception as e:
-            self._show_err("Auto Threshold Failed", e)
+            self._show_err("Threshold Detection Failed", e)
 
     # ==========================================
     # Loading Methods

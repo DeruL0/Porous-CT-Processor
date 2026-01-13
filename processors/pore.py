@@ -69,15 +69,35 @@ class PoreExtractionProcessor(BaseProcessor):
         self.chunk_size = chunk_size
 
     @staticmethod
-    def suggest_threshold(data: VolumeData) -> int:
-        """Calculate optimal threshold using Otsu's method."""
+    def suggest_threshold(data: VolumeData, algorithm: str = 'auto') -> int:
+        """
+        Calculate optimal threshold using specified algorithm.
+        
+        Args:
+            data: Volume data to analyze
+            algorithm: One of 'auto', 'otsu', 'li', 'yen', 'triangle', 'minimum'
+                - auto: Smart selection based on histogram bimodality
+                - otsu: Classic bimodal thresholding
+                - li: Minimum cross-entropy (good for noisy data)
+                - yen: Maximum correlation
+                - triangle: Good for CT 'peak+tail' histograms
+                - minimum: Valley between peaks
+                
+        Returns:
+            Suggested threshold value (int)
+        """
+        from skimage.filters import (
+            threshold_otsu, threshold_li, threshold_yen, threshold_triangle,
+            threshold_minimum
+        )
+        
         if data.raw_data is None:
             return -300
         
-        # Sample data for large volumes to save memory
         raw = data.raw_data
+        
+        # Sample data for large volumes
         if raw.size > PROCESS_OTSU_SAMPLE_THRESHOLD:
-            # Sample every 4th voxel
             sample = raw[::4, ::4, ::4].flatten()
         else:
             sample = raw.flatten()
@@ -85,15 +105,124 @@ class PoreExtractionProcessor(BaseProcessor):
         clean_data = sample[np.isfinite(sample)]
         if clean_data.size == 0:
             return -300
-            
+        
         try:
-            thresh = threshold_otsu(clean_data)
+            # Compute histogram for analysis
+            hist, bin_edges = np.histogram(clean_data, bins=256)
+            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+            
+            # Normalize histogram
+            hist_norm = hist.astype(float) / hist.sum()
+            
+            # Calculate bimodality coefficient
+            # Values > 0.555 indicate bimodal distribution
+            n = len(clean_data)
+            mean = np.mean(clean_data)
+            std = np.std(clean_data)
+            if std > 0:
+                skewness = np.mean(((clean_data - mean) / std) ** 3)
+                kurtosis = np.mean(((clean_data - mean) / std) ** 4) - 3
+                bimodality = (skewness ** 2 + 1) / (kurtosis + 3 * (n - 1) ** 2 / ((n - 2) * (n - 3)))
+            else:
+                bimodality = 0
+            
+            # Calculate thresholds using multiple methods
+            threshold_methods = {
+                'otsu': threshold_otsu,
+                'li': threshold_li,
+                'yen': threshold_yen,
+                'triangle': threshold_triangle,
+                'minimum': threshold_minimum
+            }
+            
+            valid_thresholds = {}
+            for name, func in threshold_methods.items():
+                try:
+                    valid_thresholds[name] = func(clean_data)
+                except Exception:
+                    pass  # Skip failed methods
+            
+            if not valid_thresholds:
+                return -300
+            
+            # If specific algorithm requested, use it directly
+            if algorithm != 'auto' and algorithm in valid_thresholds:
+                selected_thresh = valid_thresholds[algorithm]
+                print(f"[Threshold] Using {algorithm} = {int(selected_thresh)}")
+                del sample, clean_data
+                gc.collect()
+                return int(selected_thresh)
+            elif algorithm != 'auto':
+                # Requested algorithm failed, fall back to auto
+                print(f"[Threshold] {algorithm} failed, falling back to auto")
+            
+            # AUTO MODE: Select best threshold based on histogram characteristics
+            best_method = 'otsu'
+            
+            if bimodality > 0.6:
+                # Strongly bimodal: prefer minimum or otsu
+                if 'minimum' in valid_thresholds:
+                    best_method = 'minimum'
+                elif 'otsu' in valid_thresholds:
+                    best_method = 'otsu'
+            elif bimodality > 0.4:
+                # Moderately bimodal: prefer Li (minimum cross-entropy)
+                if 'li' in valid_thresholds:
+                    best_method = 'li'
+                elif 'otsu' in valid_thresholds:
+                    best_method = 'otsu'
+            else:
+                # Weak bimodality or unimodal: prefer triangle for CT
+                # Triangle works well for "peak + tail" distribution common in CT
+                if 'triangle' in valid_thresholds:
+                    best_method = 'triangle'
+                elif 'yen' in valid_thresholds:
+                    best_method = 'yen'
+                elif 'li' in valid_thresholds:
+                    best_method = 'li'
+            
+            # Validate threshold is reasonable
+            data_min, data_max = clean_data.min(), clean_data.max()
+            data_range = data_max - data_min
+            
+            selected_thresh = valid_thresholds[best_method]
+            
+            # Ensure threshold is not at extreme edges (likely failure)
+            if selected_thresh < data_min + 0.05 * data_range:
+                # Too low, try other methods
+                for method in ['li', 'yen', 'otsu']:
+                    if method in valid_thresholds:
+                        alt = valid_thresholds[method]
+                        if alt > data_min + 0.05 * data_range:
+                            selected_thresh = alt
+                            best_method = method
+                            break
+            
+            if selected_thresh > data_max - 0.05 * data_range:
+                # Too high, try other methods
+                for method in ['triangle', 'li', 'otsu']:
+                    if method in valid_thresholds:
+                        alt = valid_thresholds[method]
+                        if alt < data_max - 0.05 * data_range:
+                            selected_thresh = alt
+                            best_method = method
+                            break
+            
+            print(f"[AutoThreshold] Bimodality: {bimodality:.3f}, Selected: {best_method} = {int(selected_thresh)}")
+            print(f"[AutoThreshold] All: {', '.join(f'{k}={int(v)}' for k,v in valid_thresholds.items())}")
+            
             del sample, clean_data
             gc.collect()
-            return int(thresh)
+            
+            return int(selected_thresh)
+            
         except Exception as e:
-            print(f"Otsu failed: {e}")
-            return -300
+            print(f"Advanced threshold failed: {e}, falling back to median")
+            # Ultimate fallback: use median
+            median_val = np.median(clean_data)
+            del sample, clean_data
+            gc.collect()
+            return int(median_val)
 
     def process(self, data: VolumeData, callback: Optional[Callable[[int, str], None]] = None,
                 threshold: int = -300) -> VolumeData:

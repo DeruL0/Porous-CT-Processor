@@ -24,6 +24,8 @@ from gui.panels import (
     ROIPanel
 )
 from rendering import RenderEngine
+from rendering.roi_handler import ROIHandler
+from rendering.clip_handler import ClipHandler
 
 
 # Resolve Metaclass conflict between PyQt5 and ABC
@@ -54,6 +56,25 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
             clip_panel=self.clip_panel,
             status_callback=self.update_status
         )
+        
+        # Initialize ROIHandler
+        self.roi_handler = ROIHandler(
+            plotter=self.plotter,
+            roi_panel=self.roi_panel,
+            data_manager=self._data_manager,
+            status_callback=self.update_status
+        )
+        
+        # Initialize ClipHandler
+        self.clip_handler = ClipHandler(
+            plotter=self.plotter,
+            clip_panel=self.clip_panel,
+            render_engine=self.render_engine
+        )
+        
+        # Connect signals to handlers
+        self._connect_roi_signals()
+        self._connect_clip_signals()
 
         # Debounce timer for expensive renders
         self.update_timer = QTimer()
@@ -62,6 +83,22 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
         self.update_timer.timeout.connect(self._perform_delayed_render)
 
         self._setup_mouse_probe()
+    
+    def _connect_roi_signals(self):
+        """Connect ROI panel signals to ROIHandler."""
+        self.roi_panel.roi_toggled.connect(self.roi_handler.on_toggled)
+        self.roi_panel.apply_roi.connect(lambda: self.roi_handler.on_apply(self.set_data))
+        self.roi_panel.reset_roi.connect(lambda: self.roi_handler.on_reset(self.set_data))
+        self.roi_panel.shape_changed.connect(self.roi_handler.on_shape_changed)
+    
+    def _connect_clip_signals(self):
+        """Connect Clip panel signals to ClipHandler."""
+        self.clip_panel.clip_toggled.connect(self.clip_handler.on_clip_toggled)
+        self.clip_update_timer = QTimer()
+        self.clip_update_timer.setInterval(200)
+        self.clip_update_timer.setSingleShot(True)
+        self.clip_update_timer.timeout.connect(self.clip_handler.apply_clip_planes)
+        self.clip_panel.clip_changed.connect(lambda: self.clip_update_timer.start())
 
     def _init_ui(self):
         main_widget = QWidget()
@@ -138,21 +175,12 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
         self.params_panel.invert_volume.connect(self._on_invert_volume)
         layout.addWidget(self.params_panel)
 
-        # Clip Panel
+        # Clip Panel - signals connected later in __init__ after clip_handler is created
         self.clip_panel = ClipPlanePanel()
-        self.clip_panel.clip_toggled.connect(self._on_clip_toggled)
-        self.clip_update_timer = QTimer()
-        self.clip_update_timer.setInterval(200)
-        self.clip_update_timer.setSingleShot(True)
-        self.clip_update_timer.timeout.connect(self._apply_clip_planes)
-        self.clip_panel.clip_changed.connect(lambda: self.clip_update_timer.start())
         layout.addWidget(self.clip_panel)
 
-        # ROI Panel
+        # ROI Panel - signals connected later in __init__ after roi_handler is created
         self.roi_panel = ROIPanel()
-        self.roi_panel.roi_toggled.connect(self._on_roi_toggled)
-        self.roi_panel.apply_roi.connect(self._on_apply_roi)
-        self.roi_panel.reset_roi.connect(self._on_reset_roi)
         layout.addWidget(self.roi_panel)
 
         layout.addStretch()
@@ -215,6 +243,11 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
     def set_data(self, data: VolumeData):
         """Set data and delegate to RenderEngine."""
         self.render_engine.set_data(data)
+        
+        # Sync with ROIHandler
+        if hasattr(self, 'roi_handler'):
+            self.roi_handler.set_data(data, self.render_engine.grid)
+        
         d_type = data.metadata.get('Type', 'Unknown')
 
         if data.has_mesh:
@@ -229,6 +262,9 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
             idx = self.params_panel.solid_color_combo.findText(default_color)
             if idx >= 0:
                 self.params_panel.solid_color_combo.setCurrentIndex(idx)
+            
+            # Update Histogram
+            self._update_histogram(data.raw_data)
 
             min_val = np.nanmin(data.raw_data)
             max_val = np.nanmax(data.raw_data)
@@ -240,6 +276,26 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
 
             self.render_volume(reset_view=True)
             self.info_panel.update_info(d_type, data.dimensions, data.spacing, data.metadata)
+
+    def _update_histogram(self, data_array: np.ndarray):
+        """Calculate and update histogram in params panel."""
+        if data_array is None:
+            return
+            
+        try:
+            # Downsample for performance if needed
+            if data_array.size > 10**6:
+                sample = data_array[::4, ::4, ::4].flatten() # Stride 4 -> ~1.5% of data
+            else:
+                sample = data_array.flatten()
+                
+            # Remove 0s if they are just background padding? No, show everything.
+            # Calculate histogram
+            hist, bins = np.histogram(sample, bins=100)
+            self.params_panel.set_histogram_data(hist, bins)
+            
+        except Exception as e:
+            print(f"Histogram error: {e}")
 
     @property
     def data(self) -> Optional[VolumeData]:
@@ -368,6 +424,9 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
             self.update_status(f"Clipping: {current_step}...")
             self.render_engine.set_data(data)
             
+            # Update histogram with clipped data
+            self._update_histogram(data.raw_data)
+            
             current_step = "Step 6: Rendering"
             self.update_status(f"Clipping: {current_step}...")
             if self.active_view_mode == 'volume':
@@ -463,6 +522,9 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
             # Step 6: Recreate grid
             self.render_engine.set_data(data)
             
+            # Update histogram with inverted data
+            self._update_histogram(data.raw_data)
+            
             # Step 7: Render
             if self.active_view_mode == 'volume':
                 self.render_volume(reset_view=True)
@@ -479,177 +541,6 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
             print(traceback.format_exc())
             self.update_status(f"Invert error: {type(e).__name__}")
 
-    def _on_clip_toggled(self, enabled: bool):
-        if enabled:
-            self._apply_clip_planes()
-        else:
-            mode = self.active_view_mode
-            if mode == 'volume':
-                self.render_volume(reset_view=True)
-            elif mode == 'slices':
-                self.render_slices(reset_view=True)
-            elif mode == 'iso':
-                self.render_isosurface_auto(reset_view=True)
-            elif mode == 'mesh':
-                self.render_mesh(reset_view=True)
-
-    def _apply_clip_planes(self):
-        if not hasattr(self, 'clip_panel'):
-            return
-
-        clip_vals = self.clip_panel.get_clip_values()
-        if not clip_vals['enabled']:
-            return
-
-        EPS = 0.005
-        for axis in ['x', 'y', 'z']:
-            if not clip_vals[f'invert_{axis}']:
-                clip_vals[axis] = max(EPS, clip_vals[axis])
-            else:
-                clip_vals[axis] = min(1.0 - EPS, clip_vals[axis])
-
-        try:
-            data_source = None
-            mode = self.active_view_mode
-            if mode == 'volume':
-                data_source = self.grid
-            elif mode == 'mesh':
-                data_source = self.mesh
-            elif mode == 'iso':
-                params = self.params_panel.get_current_values()
-                thresh = params['threshold']
-                data_source = self.render_engine._iso_cache.get(thresh)
-                if not data_source and self.grid:
-                    data_source = self.grid.cell_data_to_point_data().contour([thresh])
-
-            if data_source is None:
-                return
-
-            bounds = data_source.bounds
-            x_min, x_max = bounds[0], bounds[0] + (bounds[1] - bounds[0]) * clip_vals['x']
-            y_min, y_max = bounds[2], bounds[2] + (bounds[3] - bounds[2]) * clip_vals['y']
-            z_min, z_max = bounds[4], bounds[4] + (bounds[5] - bounds[4]) * clip_vals['z']
-
-            if clip_vals['invert_x']:
-                x_min, x_max = x_max, bounds[1]
-            if clip_vals['invert_y']:
-                y_min, y_max = y_max, bounds[3]
-            if clip_vals['invert_z']:
-                z_min, z_max = z_max, bounds[5]
-
-            clip_bounds = [x_min, x_max, y_min, y_max, z_min, z_max]
-
-            self.plotter.clear()
-            self.plotter.add_axes()
-            params = self.params_panel.get_current_values()
-
-            if mode == 'volume' and self.grid:
-                clipped = self.grid.clip_box(clip_bounds, invert=False)
-                if clipped.n_cells > 0:
-                    self.plotter.add_mesh(clipped, scalars="values", cmap=params['colormap'],
-                                          clim=params['clim'], show_scalar_bar=True, opacity=0.5)
-
-            elif mode == 'mesh' and self.mesh:
-                clipped = self.mesh.clip_box(clip_bounds, invert=False)
-                if clipped.n_points > 0:
-                    scalars = "IsPore" if "IsPore" in clipped.array_names else None
-                    cmap = ["gray", "red"] if scalars else params['colormap']
-                    self.plotter.add_mesh(clipped, scalars=scalars, cmap=cmap, smooth_shading=True)
-
-            elif mode == 'iso' and data_source:
-                clipped = data_source.clip_box(clip_bounds, invert=False)
-                style_map = {'Surface': 'surface', 'Wireframe': 'wireframe', 'Wireframe + Surface': 'surface'}
-                render_style = style_map.get(params['render_style'], 'surface')
-                self.plotter.add_mesh(clipped, color=params['solid_color'], style=render_style, smooth_shading=True)
-
-            self.render_engine._apply_custom_lighting(params)
-            self.plotter.render()
-
-        except Exception as e:
-            print(f"[Clip] Error: {e}")
-            self._on_clip_toggled(False)
-
-    # ==========================================
-    # ROI Methods
-    # ==========================================
-
-    def _on_roi_toggled(self, enabled: bool):
-        if enabled:
-            if self.grid is None:
-                self.roi_panel.enable_checkbox.setChecked(False)
-                return
-            bounds = self.grid.bounds
-            self.plotter.add_box_widget(
-                callback=self._on_roi_bounds_changed,
-                bounds=bounds, factor=1.0, rotation_enabled=False, color='cyan', use_planes=False
-            )
-            self.update_status("ROI mode: Drag the box to select region")
-        else:
-            self.plotter.clear_box_widgets()
-            self.roi_panel.update_bounds(None)
-            self.update_status("ROI mode disabled")
-
-    def _on_roi_bounds_changed(self, bounds):
-        actual_bounds = bounds.bounds if hasattr(bounds, 'bounds') else bounds
-        self.roi_panel.update_bounds(actual_bounds)
-
-    def _on_apply_roi(self):
-        roi_bounds = self.roi_panel.get_bounds()
-        if roi_bounds is None or self.data is None:
-            return
-
-        try:
-            extracted = self._extract_roi_subvolume(roi_bounds)
-            if extracted is not None:
-                if self._data_manager is not None:
-                    self._data_manager.set_roi_data(extracted)
-                self.set_data(extracted)
-                self.update_status(f"ROI applied: {extracted.raw_data.shape}")
-                self.roi_panel.enable_checkbox.setChecked(False)
-                self.plotter.clear_box_widgets()
-        except Exception as e:
-            print(f"[ROI] Error: {e}")
-            self.update_status("ROI extraction failed")
-
-    def _on_reset_roi(self):
-        self.plotter.clear_box_widgets()
-        if self._data_manager is not None:
-            self._data_manager.clear_roi()
-            if self._data_manager.raw_ct_data is not None:
-                self.set_data(self._data_manager.raw_ct_data)
-        self.update_status("ROI reset")
-
-    def _extract_roi_subvolume(self, bounds) -> Optional[VolumeData]:
-        if self.data is None or self.data.raw_data is None:
-            return None
-
-        raw = self.data.raw_data
-        spacing = self.data.spacing
-        origin = self.data.origin
-
-        i_start = max(0, int((bounds[0] - origin[0]) / spacing[0]))
-        i_end = min(raw.shape[0], int((bounds[1] - origin[0]) / spacing[0]))
-        j_start = max(0, int((bounds[2] - origin[1]) / spacing[1]))
-        j_end = min(raw.shape[1], int((bounds[3] - origin[1]) / spacing[1]))
-        k_start = max(0, int((bounds[4] - origin[2]) / spacing[2]))
-        k_end = min(raw.shape[2], int((bounds[5] - origin[2]) / spacing[2]))
-
-        sub_data = raw[i_start:i_end, j_start:j_end, k_start:k_end]
-
-        if sub_data.size == 0:
-            return None
-
-        new_origin = (
-            origin[0] + i_start * spacing[0],
-            origin[1] + j_start * spacing[1],
-            origin[2] + k_start * spacing[2]
-        )
-
-        new_metadata = dict(self.data.metadata)
-        new_metadata['Type'] = f"ROI Extract ({sub_data.shape})"
-        new_metadata['ROI_Bounds'] = bounds
-
-        return VolumeData(raw_data=sub_data, spacing=spacing, origin=new_origin, metadata=new_metadata)
 
     # ==========================================
     # Mouse Probe

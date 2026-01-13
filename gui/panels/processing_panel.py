@@ -51,16 +51,35 @@ class StructureProcessingPanel(QGroupBox):
         self.threshold_spin.setValue(-300)  # Default for air
         self.threshold_spin.setSingleStep(50)
         
-        # Auto Button
-        auto_btn = QPushButton("Auto")
-        auto_btn.setFixedWidth(50)
-        auto_btn.setToolTip("Auto-detect using Otsu's method")
-        auto_btn.clicked.connect(self.auto_threshold_clicked.emit)
-        
         thresh_layout.addWidget(thresh_lbl)
         thresh_layout.addWidget(self.threshold_spin)
-        thresh_layout.addWidget(auto_btn)
         layout.addLayout(thresh_layout)
+        
+        # Algorithm Selection + Auto Button
+        from PyQt5.QtWidgets import QComboBox
+        algo_layout = QHBoxLayout()
+        algo_lbl = QLabel("Algorithm:")
+        self.algo_combo = QComboBox()
+        self.algo_combo.addItems(["Auto", "Otsu", "Li", "Yen", "Triangle", "Minimum"])
+        self.algo_combo.setToolTip(
+            "Auto: Smart selection based on histogram\n"
+            "Otsu: Classic bimodal thresholding\n"
+            "Li: Minimum cross-entropy (noisy data)\n"
+            "Yen: Maximum correlation\n"
+            "Triangle: Good for CT 'peak+tail'\n"
+            "Minimum: Valley between peaks"
+        )
+        
+        # Auto Button
+        auto_btn = QPushButton("Detect")
+        auto_btn.setFixedWidth(55)
+        auto_btn.setToolTip("Calculate threshold using selected algorithm")
+        auto_btn.clicked.connect(self.auto_threshold_clicked.emit)
+        
+        algo_layout.addWidget(algo_lbl)
+        algo_layout.addWidget(self.algo_combo)
+        algo_layout.addWidget(auto_btn)
+        layout.addLayout(algo_layout)
         
         # GPU Toggle
         from PyQt5.QtWidgets import QCheckBox
@@ -98,3 +117,7 @@ class StructureProcessingPanel(QGroupBox):
 
     def set_threshold(self, value: int):
         self.threshold_spin.setValue(value)
+
+    def get_algorithm(self) -> str:
+        """Get selected threshold algorithm (auto, otsu, li, yen, triangle, minimum)."""
+        return self.algo_combo.currentText().lower()
