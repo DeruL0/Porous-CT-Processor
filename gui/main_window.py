@@ -264,7 +264,7 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
                 self.params_panel.solid_color_combo.setCurrentIndex(idx)
             
             # Update Histogram
-            self._update_histogram(data.raw_data)
+            self._update_histogram()
 
             min_val = np.nanmin(data.raw_data)
             max_val = np.nanmax(data.raw_data)
@@ -277,23 +277,15 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
             self.render_volume(reset_view=True)
             self.info_panel.update_info(d_type, data.dimensions, data.spacing, data.metadata)
 
-    def _update_histogram(self, data_array: np.ndarray):
-        """Calculate and update histogram in params panel."""
-        if data_array is None:
+    def _update_histogram(self):
+        """Calculate and update histogram in params panel using DataManager."""
+        if not self._data_manager:
             return
             
         try:
-            # Downsample for performance if needed
-            if data_array.size > 10**6:
-                sample = data_array[::4, ::4, ::4].flatten() # Stride 4 -> ~1.5% of data
-            else:
-                sample = data_array.flatten()
-                
-            # Remove 0s if they are just background padding? No, show everything.
-            # Calculate histogram
-            hist, bins = np.histogram(sample, bins=100)
-            self.params_panel.set_histogram_data(hist, bins)
-            
+            hist, bins = self._data_manager.calculate_histogram(bins=100, sample_step=4)
+            if hist.size > 0:
+                self.params_panel.set_histogram_data(hist, bins)
         except Exception as e:
             print(f"Histogram error: {e}")
 
@@ -322,6 +314,39 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
 
     def set_data_manager(self, data_manager):
         self._data_manager = data_manager
+        # Update ROIHandler's data manager reference
+        if hasattr(self, 'roi_handler'):
+            self.roi_handler._data_manager = data_manager
+
+    # ==========================================
+    # Helper Methods for Data Operations
+    # ==========================================
+    
+    def _clear_render_caches(self):
+        """Clear all render engine caches. Called before data modification."""
+        import gc
+        self.plotter.clear()
+        if hasattr(self, 'render_engine'):
+            self.render_engine.data = None
+            self.render_engine.grid = None
+            self.render_engine._cached_vol_grid = None
+            self.render_engine._lod_pyramid = None
+            self.render_engine._iso_cache = {}
+            self.render_engine.volume_actor = None
+        gc.collect()
+    
+    def _refresh_view(self):
+        """Re-render current view mode."""
+        if self.active_view_mode == 'volume':
+            self.render_volume(reset_view=True)
+        elif self.active_view_mode == 'slices':
+            self.render_slices(reset_view=True)
+        elif self.active_view_mode == 'iso':
+            self.render_isosurface_auto(reset_view=True)
+        elif self.active_view_mode == 'mesh':
+            self.render_mesh(reset_view=True)
+        else:
+            self.render_volume(reset_view=True)
 
     # ==========================================
     # Rendering Delegation
@@ -370,148 +395,88 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
             self.trigger_render()
 
     def _on_apply_clim_clip(self, clim: list):
-        """Apply colormap range as permanent data clip (memory-efficient, chunked)."""
+        """Apply colormap range as permanent data clip (delegates to DataManager)."""
         if not hasattr(self, '_data_manager') or not self._data_manager:
             self.update_status("No data to clip")
-            return
-        
-        data = self._data_manager.active_data
-        if data is None or data.raw_data is None:
-            self.update_status("No active data to clip")
             return
         
         import gc
         import traceback
         
         min_val, max_val = float(clim[0]), float(clim[1])
-        current_step = "initialization"
         
         try:
-            current_step = "Step 1: Clearing caches"
-            self.update_status(f"Clipping: {current_step}...")
-            self.plotter.clear()
-            if hasattr(self, 'render_engine'):
-                self.render_engine.data = None
-                self.render_engine.grid = None
-                self.render_engine._cached_vol_grid = None
-                self.render_engine._lod_pyramid = None
-                self.render_engine._iso_cache = {}
-                self.render_engine.volume_actor = None
-            gc.collect()
+            # Step 1: Clear render caches
+            self.update_status("Clipping: Clearing caches...")
+            self._clear_render_caches()
             
-            current_step = "Step 2: Applying clip in chunks"
-            self.update_status(f"Clipping: {current_step}...")
-            raw = data.raw_data
-            chunk_size = 32
-            n_slices = raw.shape[0]
+            # Step 2: Delegate data manipulation to DataManager
+            def progress_cb(percent, msg):
+                self.update_status(f"Clipping: {msg}")
             
-            for i in range(0, n_slices, chunk_size):
-                end = min(i + chunk_size, n_slices)
-                raw[i:end] = raw[i:end].clip(min_val, max_val)
-                gc.collect()
+            self._data_manager.clip_data(min_val, max_val, progress_callback=progress_cb)
             
-            current_step = "Step 3: Updating metadata"
-            self.update_status(f"Clipping: {current_step}...")
-            data.metadata["ClipRange"] = f"[{min_val:.0f}, {max_val:.0f}]"
-            if "(Clipped)" not in data.metadata.get("Type", ""):
-                data.metadata["Type"] = data.metadata.get("Type", "CT") + " (Clipped)"
-            
-            current_step = "Step 4: Updating params panel"
-            self.update_status(f"Clipping: {current_step}...")
+            # Step 3: Update UI
+            self.update_status("Clipping: Updating UI...")
             self.params_panel.set_data_range(int(min_val), int(max_val))
             
-            current_step = "Step 5: Recreating grid"
-            self.update_status(f"Clipping: {current_step}...")
-            self.render_engine.set_data(data)
+            # Step 4: Recreate rendering grid
+            self.update_status("Clipping: Recreating grid...")
+            self.render_engine.set_data(self._data_manager.active_data)
             
-            # Update histogram with clipped data
-            self._update_histogram(data.raw_data)
+            # Step 5: Update histogram
+            self._update_histogram()
             
-            current_step = "Step 6: Rendering"
-            self.update_status(f"Clipping: {current_step}...")
-            if self.active_view_mode == 'volume':
-                self.render_volume(reset_view=True)
-            elif self.active_view_mode == 'slices':
-                self.render_slices(reset_view=True)
-            else:
-                self.render_volume(reset_view=True)
+            # Step 6: Re-render
+            self._refresh_view()
             
             self.update_status(f"Applied clip: [{min_val:.0f}, {max_val:.0f}]")
             gc.collect()
             
+        except ValueError as e:
+            self.update_status(str(e))
         except MemoryError as e:
-            error_msg = f"Memory Error at {current_step}: {e}"
-            print(f"[RangeClip] {error_msg}")
+            print(f"[RangeClip] Memory Error: {e}")
             print(traceback.format_exc())
-            self.update_status(f"Memory Error: {current_step}")
+            self.update_status("Memory Error during clip")
             gc.collect()
-            
         except Exception as e:
-            error_msg = f"Error at {current_step}: {type(e).__name__}: {e}"
-            print(f"[RangeClip] {error_msg}")
+            print(f"[RangeClip] Error: {type(e).__name__}: {e}")
             print(traceback.format_exc())
-            self.update_status(f"Error: {current_step} - {type(e).__name__}")
+            self.update_status(f"Clip error: {type(e).__name__}")
 
     def _on_invert_volume(self):
-        """Invert volume values (for extracting pore surfaces instead of object surfaces)."""
+        """Invert volume values (delegates to DataManager)."""
         if not hasattr(self, '_data_manager') or not self._data_manager:
             self.update_status("No data to invert")
-            return
-        
-        data = self._data_manager.active_data
-        if data is None or data.raw_data is None:
-            self.update_status("No active data to invert")
             return
         
         import gc
         import traceback
         
         try:
-            self.update_status("Inverting volume...")
+            # Step 1: Clear render caches
+            self.update_status("Inverting: Clearing caches...")
+            self._clear_render_caches()
             
-            # Step 1: Clear caches
-            self.plotter.clear()
-            if hasattr(self, 'render_engine'):
-                self.render_engine.data = None
-                self.render_engine.grid = None
-                self.render_engine._cached_vol_grid = None
-                self.render_engine._lod_pyramid = None
-                self.render_engine._iso_cache = {}
-                self.render_engine.volume_actor = None
-            gc.collect()
-            
-            # Step 2: Get min/max for inversion
-            raw = data.raw_data
-            data_min = float(raw.min())
-            data_max = float(raw.max())
-            
-            # Step 3: Invert in chunks: new_val = max - (val - min) = max + min - val
-            chunk_size = 32
-            n_slices = raw.shape[0]
-            invert_offset = data_max + data_min
-            
-            for i in range(0, n_slices, chunk_size):
-                end = min(i + chunk_size, n_slices)
-                raw[i:end] = invert_offset - raw[i:end]
-                gc.collect()
-            
-            # Step 4: Update metadata
-            if "(Inverted)" not in data.metadata.get("Type", ""):
-                data.metadata["Type"] = data.metadata.get("Type", "CT") + " (Inverted)"
-            
-            # Step 5: Update params panel range AND invert the current clim values
-            # Get current clim values before updating range
-            current_clim = self.params_panel.get_current_values().get('clim', [data_min, data_max])
+            # Step 2: Get current clim before inversion (for UI update)
+            data = self._data_manager.active_data
+            current_clim = self.params_panel.get_current_values().get('clim', [0, 1000])
             old_min_clim, old_max_clim = current_clim[0], current_clim[1]
             
-            # Invert the clim values: new_clim = max + min - old_clim
+            # Step 3: Delegate data inversion to DataManager
+            def progress_cb(percent, msg):
+                self.update_status(f"Inverting: {msg}")
+            
+            data_min, data_max, invert_offset = self._data_manager.invert_data(progress_callback=progress_cb)
+            
+            # Step 4: Calculate inverted clim values for UI
             new_min_clim = int(invert_offset - old_max_clim)
             new_max_clim = int(invert_offset - old_min_clim)
             
-            # Update range first
+            # Step 5: Update params panel
+            self.update_status("Inverting: Updating UI...")
             self.params_panel.set_data_range(int(data_min), int(data_max))
-            
-            # Then set the inverted clim values
             self.params_panel.block_signals(True)
             self.params_panel.slider_clim_min.setValue(new_min_clim)
             self.params_panel.slider_clim_max.setValue(new_max_clim)
@@ -519,23 +484,21 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
             self.params_panel.spinbox_clim_max.setValue(new_max_clim)
             self.params_panel.block_signals(False)
             
-            # Step 6: Recreate grid
-            self.render_engine.set_data(data)
+            # Step 6: Recreate rendering grid
+            self.update_status("Inverting: Recreating grid...")
+            self.render_engine.set_data(self._data_manager.active_data)
             
-            # Update histogram with inverted data
-            self._update_histogram(data.raw_data)
+            # Step 7: Update histogram
+            self._update_histogram()
             
-            # Step 7: Render
-            if self.active_view_mode == 'volume':
-                self.render_volume(reset_view=True)
-            elif self.active_view_mode == 'slices':
-                self.render_slices(reset_view=True)
-            else:
-                self.render_volume(reset_view=True)
+            # Step 8: Re-render
+            self._refresh_view()
             
             self.update_status(f"Volume inverted. Clim: [{new_min_clim}, {new_max_clim}]")
             gc.collect()
             
+        except ValueError as e:
+            self.update_status(str(e))
         except Exception as e:
             print(f"[InvertVolume] Error: {type(e).__name__}: {e}")
             print(traceback.format_exc())
