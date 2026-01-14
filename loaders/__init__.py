@@ -6,10 +6,11 @@ from loaders.dicom import (
     DicomSeriesLoader,
     FastDicomLoader,
     MemoryMappedDicomLoader,
-    ChunkedDicomLoader
+    ChunkedDicomLoader,
+    SmartDicomLoader,
+    LoadStrategy
 )
 from loaders.dummy import DummyLoader
-from loaders.smart_loader import SmartDicomLoader, LoadStrategy
 
 __all__ = [
     'DicomSeriesLoader',
