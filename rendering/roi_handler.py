@@ -7,6 +7,7 @@ from typing import Optional, Callable, Tuple
 import numpy as np
 import pyvista as pv
 from core import VolumeData
+from rendering.roi_extractor import extract_box, extract_ellipsoid, extract_cylinder
 
 
 class ROIHandler:
@@ -389,176 +390,12 @@ class ROIHandler:
 
     def _extract_box(self, bounds: tuple) -> Optional[VolumeData]:
         """Extract box-shaped sub-volume."""
-        if self.data is None or self.data.raw_data is None:
-            return None
-
-        raw = self.data.raw_data
-        spacing = self.data.spacing
-        origin = self.data.origin
-        
-        i_start, i_end, j_start, j_end, k_start, k_end = self._bounds_to_voxel_indices(bounds)
-        sub_data = raw[i_start:i_end, j_start:j_end, k_start:k_end].copy()
-        
-        if sub_data.size == 0:
-            return None
-
-        new_origin = (
-            origin[0] + i_start * spacing[0],
-            origin[1] + j_start * spacing[1],
-            origin[2] + k_start * spacing[2]
-        )
-        
-        new_metadata = dict(self.data.metadata)
-        new_metadata['Type'] = f"ROI Box ({sub_data.shape})"
-        new_metadata['ROI_Bounds'] = bounds
-
-        return VolumeData(raw_data=sub_data, spacing=spacing, origin=new_origin, metadata=new_metadata)
+        return extract_box(self.data, bounds)
 
     def _extract_ellipsoid(self, bounds: tuple) -> Optional[VolumeData]:
         """Extract ellipsoid sub-volume inscribed in box bounds."""
-        if self.data is None or self.data.raw_data is None:
-            return None
-
-        raw = self.data.raw_data
-        spacing = self.data.spacing
-        origin = self.data.origin
-        
-        i_start, i_end, j_start, j_end, k_start, k_end = self._bounds_to_voxel_indices(bounds)
-        
-        # Calculate center and radii
-        rx = (bounds[1] - bounds[0]) / 2
-        ry = (bounds[3] - bounds[2]) / 2
-        rz = (bounds[5] - bounds[4]) / 2
-        
-        ci = ((bounds[0] + bounds[1]) / 2 - origin[0]) / spacing[0]
-        cj = ((bounds[2] + bounds[3]) / 2 - origin[1]) / spacing[1]
-        ck = ((bounds[4] + bounds[5]) / 2 - origin[2]) / spacing[2]
-        
-        # Create ellipsoid mask
-        ii, jj, kk = np.meshgrid(
-            np.arange(i_start, i_end),
-            np.arange(j_start, j_end),
-            np.arange(k_start, k_end),
-            indexing='ij'
-        )
-        
-        dist = np.sqrt(
-            ((ii - ci) * spacing[0] / rx) ** 2 +
-            ((jj - cj) * spacing[1] / ry) ** 2 +
-            ((kk - ck) * spacing[2] / rz) ** 2
-        )
-        mask = dist <= 1.0
-        
-        sub_data = raw[i_start:i_end, j_start:j_end, k_start:k_end].copy()
-        sub_data[~mask] = sub_data.min()
-        
-        if sub_data.size == 0:
-            return None
-
-        new_origin = (
-            origin[0] + i_start * spacing[0],
-            origin[1] + j_start * spacing[1],
-            origin[2] + k_start * spacing[2]
-        )
-        
-        new_metadata = dict(self.data.metadata)
-        new_metadata['Type'] = f"ROI Ellipsoid ({sub_data.shape})"
-        new_metadata['ROI_Bounds'] = bounds
-        new_metadata['ROI_Radii'] = (rx, ry, rz)
-
-        return VolumeData(raw_data=sub_data, spacing=spacing, origin=new_origin, metadata=new_metadata)
+        return extract_ellipsoid(self.data, bounds)
 
     def _extract_cylinder(self, bounds: tuple) -> Optional[VolumeData]:
         """Extract elliptical cylinder inscribed in box bounds (supports rotation)."""
-        if self.data is None or self.data.raw_data is None:
-            return None
-
-        raw = self.data.raw_data
-        spacing = self.data.spacing
-        origin = self.data.origin
-        
-        i_start, i_end, j_start, j_end, k_start, k_end = self._bounds_to_voxel_indices(bounds)
-        
-        # Use stored size if available (rotation-invariant)
-        if self._current_size:
-            size_x, size_y, size_z = self._current_size
-        else:
-            size_x = bounds[1] - bounds[0]
-            size_y = bounds[3] - bounds[2]
-            size_z = bounds[5] - bounds[4]
-        
-        # Radii for elliptical cross-section
-        rx = size_x / 2  # Cylinder length axis
-        ry = size_y / 2
-        rz = size_z / 2
-        
-        # Center in world coordinates (from AABB)
-        center = np.array([
-            (bounds[0] + bounds[1]) / 2,
-            (bounds[2] + bounds[3]) / 2,
-            (bounds[4] + bounds[5]) / 2
-        ])
-        
-        # Create voxel coordinate grids
-        ii, jj, kk = np.meshgrid(
-            np.arange(i_start, i_end),
-            np.arange(j_start, j_end),
-            np.arange(k_start, k_end),
-            indexing='ij'
-        )
-        
-        # Convert to world coordinates
-        world_x = origin[0] + ii * spacing[0]
-        world_y = origin[1] + jj * spacing[1]
-        world_z = origin[2] + kk * spacing[2]
-        
-        # Get relative position to center
-        rel_x = world_x - center[0]
-        rel_y = world_y - center[1]
-        rel_z = world_z - center[2]
-        
-        # Apply inverse rotation if transform exists
-        if self._transform is not None:
-            # Extract rotation matrix and normalize (remove scale)
-            rotation = self._transform[:3, :3].copy()
-            for i in range(3):
-                col_norm = np.linalg.norm(rotation[:, i])
-                if col_norm > 1e-6:
-                    rotation[:, i] /= col_norm
-            
-            # Inverse rotation = transpose for orthogonal matrix
-            inv_rotation = rotation.T
-            
-            # Transform relative coordinates to local space
-            local_x = inv_rotation[0, 0] * rel_x + inv_rotation[0, 1] * rel_y + inv_rotation[0, 2] * rel_z
-            local_y = inv_rotation[1, 0] * rel_x + inv_rotation[1, 1] * rel_y + inv_rotation[1, 2] * rel_z
-            local_z = inv_rotation[2, 0] * rel_x + inv_rotation[2, 1] * rel_y + inv_rotation[2, 2] * rel_z
-        else:
-            local_x = rel_x
-            local_y = rel_y
-            local_z = rel_z
-        
-        # Cylinder mask: inside if (y/ry)^2 + (z/rz)^2 <= 1 AND abs(x) <= rx
-        dist_2d = np.sqrt((local_y / ry) ** 2 + (local_z / rz) ** 2)
-        mask = (dist_2d <= 1.0) & (np.abs(local_x) <= rx)
-        
-        sub_data = raw[i_start:i_end, j_start:j_end, k_start:k_end].copy()
-        sub_data[~mask] = sub_data.min()
-        
-        if sub_data.size == 0:
-            return None
-
-        new_origin = (
-            origin[0] + i_start * spacing[0],
-            origin[1] + j_start * spacing[1],
-            origin[2] + k_start * spacing[2]
-        )
-        
-        new_metadata = dict(self.data.metadata)
-        new_metadata['Type'] = f"ROI Elliptical Cylinder ({sub_data.shape})"
-        new_metadata['ROI_Bounds'] = bounds
-        new_metadata['ROI_Radii_YZ'] = (ry, rz)
-        if self._transform is not None:
-            new_metadata['ROI_Rotated'] = True
-
-        return VolumeData(raw_data=sub_data, spacing=spacing, origin=new_origin, metadata=new_metadata)
+        return extract_cylinder(self.data, bounds, self._current_size, self._transform)

@@ -37,7 +37,7 @@ class RenderingParametersPanel(QGroupBox):
     clim_changed = pyqtSignal()
     apply_clim_clip = pyqtSignal(list)  # Emits [min, max] for permanent clipping
     invert_volume = pyqtSignal()        # Emits signal to invert volume values
-    curve_changed = pyqtSignal(float, float)  # Emits (curve_low, curve_high) for transfer function
+    invert_volume = pyqtSignal()        # Emits signal to invert volume values
 
     def __init__(self, title: str = "🎨 Rendering Parameters"):
         super().__init__()
@@ -106,36 +106,12 @@ class RenderingParametersPanel(QGroupBox):
         
         self.hist_data_bounds = (0, 100)
         self.hist_peak = 1.0
-        self.curve_low = 0.5   # 0-1, controls left side curvature
-        self.curve_high = 0.5  # 0-1, controls right side curvature
+        self.hist_data_bounds = (0, 100)
+        self.hist_peak = 1.0
         
         layout.addWidget(self.hist_widget)
         
-        # Curve Low Slider (left side curvature)
-        low_container = QWidget()
-        low_layout = QHBoxLayout(low_container)
-        low_layout.setContentsMargins(0, 0, 0, 0)
-        self.lbl_curve_low = QLabel("Low:")
-        low_layout.addWidget(self.lbl_curve_low)
-        self.slider_curve_low = QSlider(Qt.Horizontal)
-        self.slider_curve_low.setRange(0, 100)
-        self.slider_curve_low.setValue(50)
-        self.slider_curve_low.valueChanged.connect(self._on_curve_changed)
-        low_layout.addWidget(self.slider_curve_low, stretch=1)
-        layout.addWidget(low_container)
-        
-        # Curve High Slider (right side curvature)
-        high_container = QWidget()
-        high_layout = QHBoxLayout(high_container)
-        high_layout.setContentsMargins(0, 0, 0, 0)
-        self.lbl_curve_high = QLabel("High:")
-        high_layout.addWidget(self.lbl_curve_high)
-        self.slider_curve_high = QSlider(Qt.Horizontal)
-        self.slider_curve_high.setRange(0, 100)
-        self.slider_curve_high.setValue(50)
-        self.slider_curve_high.valueChanged.connect(self._on_curve_changed)
-        high_layout.addWidget(self.slider_curve_high, stretch=1)
-        layout.addWidget(high_container)
+
 
         # Min row
 
@@ -300,7 +276,7 @@ class RenderingParametersPanel(QGroupBox):
         self._update_mapping_curve()
 
     def _update_mapping_curve(self):
-        """Update the visual ramp curve based on current region and curvature."""
+        """Update the visual ramp curve based on current region."""
         if not hasattr(self, 'mapping_curve'):
             return
             
@@ -308,47 +284,13 @@ class RenderingParametersPanel(QGroupBox):
         d_min, d_max = self.hist_data_bounds
         peak = self.hist_peak
         
-        # Generate cubic bezier curve
-        # Control points: P0=(mn,0), P1=(mn + low*(mx-mn), 0), P2=(mx - (1-high)*(mx-mn), peak), P3=(mx, peak)
-        n_points = 50
-        x_vals = []
-        y_vals = []
-        
-        # Flat region before mn
-        x_vals.append(d_min)
-        y_vals.append(0)
-        x_vals.append(mn)
-        y_vals.append(0)
-        
-        # Bezier curve from mn to mx
-        if mx > mn:
-            # Control points for cubic bezier
-            p0 = (mn, 0)
-            p1 = (mn + self.curve_low * (mx - mn), 0)           # Left control
-            p2 = (mx - (1 - self.curve_high) * (mx - mn), peak) # Right control
-            p3 = (mx, peak)
-            
-            for i in range(n_points + 1):
-                t = i / n_points
-                # Cubic bezier formula
-                x = (1-t)**3 * p0[0] + 3*(1-t)**2*t * p1[0] + 3*(1-t)*t**2 * p2[0] + t**3 * p3[0]
-                y = (1-t)**3 * p0[1] + 3*(1-t)**2*t * p1[1] + 3*(1-t)*t**2 * p2[1] + t**3 * p3[1]
-                x_vals.append(x)
-                y_vals.append(y)
-        
-        # Flat region after mx
-        x_vals.append(mx)
-        y_vals.append(peak)
-        x_vals.append(d_max)
-        y_vals.append(peak)
+        # Simple linear ramp from mn to mx
+        x_vals = [d_min, mn, mx, d_max]
+        y_vals = [0, 0, peak, peak]
         
         self.mapping_curve.setData(x_vals, y_vals)
     
-    def _on_curve_changed(self, value=None):
-        """Handle curve slider change."""
-        self.curve_low = self.slider_curve_low.value() / 100.0
-        self.curve_high = self.slider_curve_high.value() / 100.0
-        self._update_mapping_curve()
+
 
     def block_signals(self, block: bool):
         self.slider_slice_x.blockSignals(block)
@@ -371,9 +313,7 @@ class RenderingParametersPanel(QGroupBox):
             'slice_x': self.slider_slice_x.value(),
             'slice_y': self.slider_slice_y.value(),
             'slice_z': self.slider_slice_z.value(),
-            'clim': [self.slider_clim_min.value(), self.slider_clim_max.value()],
-            'curve_low': self.curve_low,
-            'curve_high': self.curve_high
+            'clim': [self.slider_clim_min.value(), self.slider_clim_max.value()]
         }
 
     def _on_threshold_change(self, value):
@@ -462,8 +402,6 @@ class RenderingParametersPanel(QGroupBox):
         visible([self.lbl_colormap, self.colormap_combo], show_cmap)
 
         visible([self.lbl_clim, self.hist_widget, 
-                 self.lbl_curve_low, self.slider_curve_low,
-                 self.lbl_curve_high, self.slider_curve_high,
                  self.lbl_clim_min, self.slider_clim_min, self.spinbox_clim_min,
                  self.lbl_clim_max, self.slider_clim_max, self.spinbox_clim_max,
                  self.btn_apply_clim_clip, self.btn_invert_volume], show_clim)

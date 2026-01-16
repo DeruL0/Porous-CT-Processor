@@ -5,9 +5,12 @@ Provides memory-mapped arrays for out-of-core processing of large datasets.
 
 import os
 import tempfile
+import logging
 import numpy as np
 from typing import Optional, Tuple, Dict, Any
 import gc
+
+logger = logging.getLogger(__name__)
 
 
 class DiskCacheManager:
@@ -65,8 +68,8 @@ class DiskCacheManager:
         if name in self._cache_files:
             try:
                 os.remove(self._cache_files[name])
-            except:
-                pass
+            except OSError as e:
+                logger.warning(f"Failed to remove cache file {self._cache_files[name]}: {e}")
             del self._cache_files[name]
     
     def release_all(self):
@@ -88,8 +91,9 @@ class DiskCacheManager:
         """Clean up on deletion."""
         try:
             self.release_all()
-        except:
-            pass
+        except Exception as e:
+            # Log but don't raise in destructor - may be called during interpreter shutdown
+            logger.debug(f"Cache cleanup during destruction failed: {e}")
 
 
 class ChunkedProcessor:
@@ -284,8 +288,8 @@ class SegmentationCache:
                 if entry.get('disk') and 'filename' in entry:
                     try:
                         os.remove(entry['filename'])
-                    except:
-                        pass
+                    except OSError as e:
+                        logger.warning(f"Failed to remove segmentation cache file: {e}")
                 del self._cache[volume_id]
         else:
             # Clear all
@@ -293,8 +297,8 @@ class SegmentationCache:
                 if entry.get('disk') and 'filename' in entry:
                     try:
                         os.remove(entry['filename'])
-                    except:
-                        pass
+                    except OSError as e:
+                        logger.warning(f"Failed to remove segmentation cache file {entry['filename']}: {e}")
             self._cache.clear()
             self._memmap_files.clear()
         gc.collect()
@@ -303,8 +307,9 @@ class SegmentationCache:
     def __del__(self):
         try:
             self.clear()
-        except:
-            pass
+        except Exception as e:
+            # Log but don't raise in destructor
+            logger.debug(f"SegmentationCache cleanup during destruction failed: {e}")
 
 
 # Global singleton instance for segmentation cache

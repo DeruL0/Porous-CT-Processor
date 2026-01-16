@@ -184,7 +184,7 @@ class AppController:
     def _load_data(self, folder_path: str, strategy: Optional[LoadStrategy] = None):
         """
         Load DICOM data with SmartDicomLoader.
-        
+
         Args:
             folder_path: Path to DICOM folder.
             strategy: Loading strategy (None = auto-select).

@@ -85,8 +85,9 @@ class LODPyramid:
                             voi=(0, dims[0]-1, 0, dims[1]-1, 0, dims[2]-1),
                             rate=(2, 2, 2)
                         )
-                    except:
-                        break  # Can't downsample further
+                    except (ValueError, RuntimeError):
+                        # Can't downsample further
+                        break
                 else:
                     break
     
