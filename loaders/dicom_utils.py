@@ -44,6 +44,47 @@ else:
                 volume[i] += intercepts[i]
 
 
+def rescale_volume_gpu(volume_gpu, slopes: np.ndarray, intercepts: np.ndarray):
+    """
+    GPU-accelerated unique rescaling using CuPy ElementwiseKernel.
+    
+    Args:
+        volume_gpu: CuPy array (modified in-place)
+        slopes: NumPy array of slopes
+        intercepts: NumPy array of intercepts
+    """
+    import cupy as cp
+    
+    # Transfer parameters to GPU
+    slopes_gpu = cp.asarray(slopes, dtype=cp.float32)
+    intercepts_gpu = cp.asarray(intercepts, dtype=cp.float32)
+    
+    # Create custom kernel for z-stack processing
+    # efficient broadcasting: volume is (z, y, x), params are (z,)
+    kernel = cp.ElementwiseKernel(
+        'float32 vol, raw float32 slopes, raw float32 intercepts',
+        'float32 out',
+        '''
+        // Calculate z-index from flat index
+        // dimension 0 is Z (slowest changing in C-order)
+        // We need to map flat index i back to z,y,x, but since params only depend on z:
+        int z = i / (_ind.shape()[1] * _ind.shape()[2]);
+        
+        float s = slopes[z];
+        float b = intercepts[z];
+        
+        if (s != 1.0 || b != 0.0) {
+            out = vol * s + b;
+        } else {
+            out = vol;
+        }
+        ''',
+        'rescale_volume_kernel'
+    )
+    
+    kernel(volume_gpu, slopes_gpu, intercepts_gpu, volume_gpu)
+
+
 def natural_sort_key(text: str):
     """
     Natural sorting key for filenames like img_1, img_2, ..., img_10.

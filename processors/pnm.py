@@ -23,7 +23,8 @@ from core import BaseProcessor, VolumeData
 from processors.utils import binary_fill_holes, distance_transform_edt, find_local_maxima
 from processors.pnm_adjacency import find_adjacency
 from processors.pnm_throat import create_throat_mesh
-from config import GPU_ENABLED
+from config import GPU_ENABLED, GPU_MIN_SIZE_MB
+from core.gpu_backend import CUPY_AVAILABLE, get_gpu_backend
 
 # Optional high-performance libraries
 try:
@@ -198,10 +199,31 @@ class PoreToSphereProcessor(BaseProcessor):
         if np.sum(pores_mask) == 0:
             return None, None, 0
 
-        # Step 2: Distance Transform
+        # Check if we can use unified GPU pipeline (keeps data on GPU)
         shape = pores_mask.shape
-        use_disk = pores_mask.nbytes > 200 * 1024 * 1024  # > 200MB
+        size_mb = pores_mask.nbytes / (1024 * 1024)
+        use_disk = size_mb > 200  # > 200MB
         
+        if GPU_ENABLED and CUPY_AVAILABLE and not use_disk:
+            backend = get_gpu_backend()
+            free_mb = backend.get_free_memory_mb()
+            required_mb = size_mb * 6  # Pipeline needs ~6x memory
+            
+            if required_mb < free_mb * 0.8:
+                report(30, "Using unified GPU pipeline...")
+                try:
+                    from processors.gpu_pipeline import run_segmentation_pipeline_gpu
+                    distance_map, segmented_regions, num_pores = run_segmentation_pipeline_gpu(
+                        pores_mask, min_peak_distance=self.MIN_PEAK_DISTANCE
+                    )
+                    del pores_mask
+                    gc.collect()
+                    report(70, f"GPU pipeline complete. Found {num_pores} pores.")
+                    return distance_map, segmented_regions, num_pores
+                except Exception as e:
+                    report(30, f"GPU pipeline failed: {e}, falling back to chunked...")
+        
+        # Fallback: chunked processing for large volumes or when GPU unavailable
         if use_disk:
             report(25, "Using disk-backed arrays for large volume...")
             cache_dir = tempfile.gettempdir()

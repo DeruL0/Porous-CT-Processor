@@ -193,7 +193,9 @@ def _find_local_maxima_gpu_impl(image: np.ndarray,
     # Get candidate coordinates and their values
     candidates = cp.argwhere(is_peak)
     
-    if len(candidates) == 0:
+    # Check empty using shape (still syncs but more explicit)
+    n_candidates = candidates.shape[0]
+    if n_candidates == 0:
         del image_gpu, max_filtered, is_peak
         backend.clear_memory()
         return np.array([]).reshape(0, image.ndim)
@@ -326,100 +328,382 @@ def _watershed_gpu_impl(image: np.ndarray,
                         mask: Optional[np.ndarray],
                         max_iterations: int) -> np.ndarray:
     """
-    GPU implementation of watershed using priority-based label propagation.
+    Optimized GPU watershed using a single custom RawKernel for propagation.
     
-    Algorithm:
-    1. Initialize labels from markers
-    2. Track the "priority" (image value) at which each pixel was labeled
-    3. For each unlabeled pixel adjacent to a labeled pixel:
-       - Assign the label of the neighbor with the smallest image value
-       - Record the priority as the neighbor's image value
-    4. Repeat until no changes or max_iterations
+    This replaces the Python loop (which launched ~15 kernels per iteration)
+    with a single kernel launch per iteration + one reduction for convergence check.
     
-    This more closely matches CPU watershed by respecting image value ordering.
+    Algorithm: Priority-Flood (Iterative)
     """
     import cupy as cp
-    import cupyx.scipy.ndimage as gpu_ndimage
     
     backend = get_gpu_backend()
     start = time.time()
     
-    # Transfer to GPU
-    image_gpu = cp.asarray(image.astype(np.float32))
-    labels_gpu = cp.asarray(markers.astype(np.int32))
+    # Pre-compile kernel
+    # Use extern "C" to ensure function name is preserved
+    watershed_kernel = cp.RawKernel(r'''
+    extern "C" __global__
+    void watershed_kernel(
+        const float* image,         // 0
+        const int* labels_in,       // 1
+        int* labels_out,            // 2
+        const bool* mask,           // 3
+        const int* shape,           // 4
+        int* changed_flag           // 5
+    ) {
+        int idx = blockDim.x * blockIdx.x + threadIdx.x;
+        int total_pixels = shape[0] * shape[1] * shape[2];
+        
+        if (idx >= total_pixels) return;
+        
+        // If not in mask or already labeled, just copy and return
+        bool is_masked = mask ? mask[idx] : true;
+        int current_label = labels_in[idx];
+        
+        if (!is_masked) {
+            labels_out[idx] = 0;
+            return;
+        }
+        
+        if (current_label > 0) {
+            labels_out[idx] = current_label;
+            return;
+        }
+        
+        // Coordinate calculation
+        int d = shape[0];
+        int h = shape[1];
+        int w = shape[2];
+        
+        int z = idx / (h * w);
+        int rem = idx % (h * w);
+        int y = rem / w;
+        int x = rem % w;
+        
+        // Check 6-neighbors
+        float my_val = image[idx];
+        int best_label = 0;
+        float best_neighbor_val = 1e30; // Infinity
+        
+        // Offsets for 6-connectivity: z-1, z+1, y-1, y+1, x-1, x+1
+        int dz[] = {-1, 1, 0, 0, 0, 0};
+        int dy[] = {0, 0, -1, 1, 0, 0};
+        int dx[] = {0, 0, 0, 0, -1, 1};
+        
+        for (int i = 0; i < 6; i++) {
+            int nz = z + dz[i];
+            int ny = y + dy[i];
+            int nx = x + dx[i];
+            
+            if (nz >= 0 && nz < d && ny >= 0 && ny < h && nx >= 0 && nx < w) {
+                int n_idx = nz * h * w + ny * w + nx;
+                int n_label = labels_in[n_idx];
+                
+                if (n_label > 0) {
+                    float n_val = image[n_idx];
+                    
+                    // We want the neighbor with the SMALLEST image value 
+                    // (since input is -distance_map, smallest = effectively highest distance)
+                    // Or if values are equal, pick consistently (e.g. smallest label) to avoid flickering
+                    if (n_val < best_neighbor_val) {
+                        best_neighbor_val = n_val;
+                        best_label = n_label;
+                    } else if (n_val == best_neighbor_val) {
+                         if (best_label == 0 || n_label < best_label) {
+                             best_label = n_label;
+                         }
+                    }
+                }
+            }
+        }
+        
+        // If we found a valid neighbor
+        if (best_label > 0) {
+            labels_out[idx] = best_label;
+            // Atomic add to signal change (just need > 0)
+            atomicAdd(changed_flag, 1);
+        } else {
+            labels_out[idx] = 0;
+        }
+    }
+    ''', 'watershed_kernel')
+    
+    # Data Transfer
+    # Ensure float32 for consistency
+    image_gpu = cp.asarray(image, dtype=cp.float32)
+    labels_curr = cp.asarray(markers, dtype=cp.int32)
+    labels_next = cp.empty_like(labels_curr)
     
     if mask is not None:
-        mask_gpu = cp.asarray(mask.astype(np.bool_))
+        mask_gpu = cp.asarray(mask, dtype=cp.bool_)
     else:
+        mask_gpu = None  # Kernel handles null check via raw pointer logic (trickier in Python) but we'll pass None or array
+        # Easier to pass array of ones if None, to keep kernel signature simple
         mask_gpu = cp.ones(image.shape, dtype=cp.bool_)
+
+    shape_gpu = cp.array(image.shape, dtype=cp.int32)
     
-    # Track the priority (image value) at which each pixel was assigned
-    # Initialize with image values for marker pixels, inf for unlabeled
-    priority_gpu = cp.where(labels_gpu > 0, image_gpu, cp.inf)
+    # Kernel config
+    total_pixels = image.size
+    threads_per_block = 256
+    blocks = (total_pixels + threads_per_block - 1) // threads_per_block
     
-    # Create structure for 6-connectivity (3D cross)
-    struct = cp.zeros((3, 3, 3), dtype=cp.bool_)
-    struct[1, 1, :] = True
-    struct[1, :, 1] = True
-    struct[:, 1, 1] = True
+    # Iteration loop
+    changed = cp.zeros(1, dtype=cp.int32)
     
-    # Iterative label propagation
+    iteration = 0
     for iteration in range(max_iterations):
-        # Find boundary of labeled regions (where labels touch unlabeled)
-        labeled_mask = labels_gpu > 0
+        # Launch kernel
+        watershed_kernel(
+            (blocks,), (threads_per_block,),
+            (image_gpu, labels_curr, labels_next, mask_gpu, shape_gpu, changed)
+        )
         
-        # Dilate labeled region to find neighbors
-        dilated = gpu_ndimage.binary_dilation(labeled_mask, structure=struct)
+        # Swap buffers
+        labels_curr, labels_next = labels_next, labels_curr
         
-        # Unlabeled pixels that are neighbors of labeled pixels
-        propagation_mask = dilated & ~labeled_mask & mask_gpu
-        
-        if not cp.any(propagation_mask):
-            # No more pixels to label
-            break
-        
-        # For each unlabeled pixel, find the best neighbor label
-        # "Best" = neighbor with minimum image value (for -distance transform)
-        new_labels = labels_gpu.copy()
-        new_priority = priority_gpu.copy()
-        
-        # Track the best (minimum) neighbor image value for each propagation pixel
-        best_neighbor_value = cp.full(image_gpu.shape, cp.inf, dtype=cp.float32)
-        
-        # Check all 6 neighbors
-        for axis in range(3):
-            for direction in [-1, 1]:
-                # Shift labels and image to get neighbor values
-                shifted_labels = cp.roll(labels_gpu, direction, axis=axis)
-                shifted_image = cp.roll(image_gpu, direction, axis=axis)
-                
-                # Only consider where we have unlabeled pixels and labeled neighbors
-                valid = propagation_mask & (shifted_labels > 0)
-                
-                if cp.any(valid):
-                    # Update if this neighbor has smaller image value than current best
-                    better = valid & (shifted_image < best_neighbor_value)
-                    new_labels = cp.where(better, shifted_labels, new_labels)
-                    new_priority = cp.where(better, shifted_image, new_priority)
-                    best_neighbor_value = cp.where(better, shifted_image, best_neighbor_value)
-        
-        # Count changes
-        changes = cp.sum(new_labels != labels_gpu)
-        labels_gpu = new_labels
-        priority_gpu = new_priority
-        
-        if iteration % 50 == 0 and iteration > 0:
-            print(f"[GPU] watershed iteration {iteration}, changes: {int(changes)}")
-        
-        if changes == 0:
-            break
+        # Check convergence every 10 iterations to reduce sync overhead (P2 fix)
+        if iteration % 10 == 9:
+            n_changed = changed.item()
+            if n_changed == 0:
+                break
+            changed.fill(0)
+            if iteration % 100 == 99:
+                print(f"[GPU] watershed iter {iteration+1}, changed: {n_changed}")
     
     elapsed = time.time() - start
-    print(f"[GPU] watershed: {elapsed:.2f}s, {iteration+1} iterations")
+    print(f"[GPU] unique kernel watershed: {elapsed:.2f}s, {iteration+1} iterations")
     
-    result = backend.to_cpu(labels_gpu)
+    result = backend.to_cpu(labels_curr)
     
-    del image_gpu, labels_gpu, mask_gpu, struct, priority_gpu
+    del image_gpu, labels_curr, labels_next, mask_gpu, shape_gpu, changed
     backend.clear_memory()
     
+    return result
+
+
+# =============================================================================
+# GPU-Accelerated Threshold Computation Functions
+# =============================================================================
+
+def compute_histogram_gpu(data: np.ndarray, bins: int = 256, 
+                          range_: Optional[tuple] = None) -> tuple:
+    """
+    GPU-accelerated histogram computation.
+    
+    Args:
+        data: 1D or flattened array of values
+        bins: Number of histogram bins
+        range_: Optional (min, max) range for histogram
+        
+    Returns:
+        (hist, bin_edges) tuple, same as np.histogram
+    """
+    if not GPU_ENABLED:
+        return np.histogram(data, bins=bins, range=range_)
+    
+    backend = get_gpu_backend()
+    size_mb = data.nbytes / (1024 * 1024)
+    
+    if backend.available and size_mb >= GPU_MIN_SIZE_MB and CUPY_AVAILABLE:
+        try:
+            import cupy as cp
+            
+            start = time.time()
+            
+            # Transfer to GPU
+            data_gpu = cp.asarray(data)
+            
+            # Compute histogram on GPU
+            if range_ is not None:
+                hist_gpu, bin_edges_gpu = cp.histogram(data_gpu, bins=bins, range=range_)
+            else:
+                hist_gpu, bin_edges_gpu = cp.histogram(data_gpu, bins=bins)
+            
+            # Transfer back to CPU
+            hist = cp.asnumpy(hist_gpu)
+            bin_edges = cp.asnumpy(bin_edges_gpu)
+            
+            del data_gpu, hist_gpu, bin_edges_gpu
+            backend.clear_memory()
+            
+            print(f"[GPU] histogram: {time.time() - start:.3f}s, {bins} bins")
+            return hist, bin_edges
+            
+        except Exception as e:
+            print(f"[GPU] histogram failed: {e}, using CPU")
+            backend.clear_memory()
+    
+    # CPU fallback
+    start = time.time()
+    result = np.histogram(data, bins=bins, range=range_)
+    print(f"[CPU] histogram: {time.time() - start:.3f}s")
+    return result
+
+
+def compute_statistics_gpu(data: np.ndarray) -> dict:
+    """
+    GPU-accelerated statistical computation: mean, std, skewness, kurtosis.
+    
+    Args:
+        data: 1D or flattened array of values
+        
+    Returns:
+        Dictionary with 'mean', 'std', 'skewness', 'kurtosis', 'min', 'max'
+    """
+    if not GPU_ENABLED:
+        return _compute_statistics_cpu(data)
+    
+    backend = get_gpu_backend()
+    size_mb = data.nbytes / (1024 * 1024)
+    
+    if backend.available and size_mb >= GPU_MIN_SIZE_MB and CUPY_AVAILABLE:
+        try:
+            import cupy as cp
+            
+            start = time.time()
+            
+            data_gpu = cp.asarray(data)
+            
+            n = data_gpu.size
+            mean = float(cp.mean(data_gpu).item())
+            std = float(cp.std(data_gpu).item())
+            data_min = float(cp.min(data_gpu).item())
+            data_max = float(cp.max(data_gpu).item())
+            
+            if std > 0:
+                # Standardized data
+                standardized = (data_gpu - mean) / std
+                skewness = float(cp.mean(standardized ** 3).item())
+                kurtosis = float(cp.mean(standardized ** 4).item()) - 3
+                del standardized
+            else:
+                skewness = 0.0
+                kurtosis = 0.0
+            
+            del data_gpu
+            backend.clear_memory()
+            
+            print(f"[GPU] statistics: {time.time() - start:.3f}s")
+            
+            return {
+                'mean': mean,
+                'std': std,
+                'skewness': skewness,
+                'kurtosis': kurtosis,
+                'min': data_min,
+                'max': data_max,
+                'n': n
+            }
+            
+        except Exception as e:
+            print(f"[GPU] statistics failed: {e}, using CPU")
+            backend.clear_memory()
+    
+    return _compute_statistics_cpu(data)
+
+
+def _compute_statistics_cpu(data: np.ndarray) -> dict:
+    """CPU implementation of statistics computation."""
+    start = time.time()
+    
+    n = len(data)
+    mean = float(np.mean(data))
+    std = float(np.std(data))
+    data_min = float(np.min(data))
+    data_max = float(np.max(data))
+    
+    if std > 0:
+        standardized = (data - mean) / std
+        skewness = float(np.mean(standardized ** 3))
+        kurtosis = float(np.mean(standardized ** 4)) - 3
+    else:
+        skewness = 0.0
+        kurtosis = 0.0
+    
+    print(f"[CPU] statistics: {time.time() - start:.3f}s")
+    
+    return {
+        'mean': mean,
+        'std': std,
+        'skewness': skewness,
+        'kurtosis': kurtosis,
+        'min': data_min,
+        'max': data_max,
+        'n': n
+    }
+
+
+def threshold_otsu_gpu(data: np.ndarray, nbins: int = 256) -> float:
+    """
+    GPU-accelerated Otsu threshold computation.
+    
+    Implements Otsu's method to find optimal threshold that minimizes
+    intra-class variance (or equivalently maximizes inter-class variance).
+    
+    Args:
+        data: 1D array of pixel values
+        nbins: Number of histogram bins
+        
+    Returns:
+        Optimal threshold value
+    """
+    if not GPU_ENABLED:
+        from skimage.filters import threshold_otsu
+        return threshold_otsu(data)
+    
+    backend = get_gpu_backend()
+    size_mb = data.nbytes / (1024 * 1024)
+    
+    if backend.available and size_mb >= GPU_MIN_SIZE_MB and CUPY_AVAILABLE:
+        try:
+            import cupy as cp
+            
+            start = time.time()
+            
+            data_gpu = cp.asarray(data)
+            
+            # Compute histogram
+            hist, bin_edges = cp.histogram(data_gpu, bins=nbins)
+            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+            
+            # Normalize histogram to get probabilities
+            hist = hist.astype(cp.float64)
+            hist_norm = hist / hist.sum()
+            
+            # Cumulative sums
+            weight1 = cp.cumsum(hist_norm)
+            weight2 = 1.0 - weight1
+            
+            # Cumulative means
+            mean1_cumsum = cp.cumsum(hist_norm * bin_centers)
+            mean1 = mean1_cumsum / (weight1 + 1e-10)
+            
+            total_mean = float((hist_norm * bin_centers).sum().item())
+            mean2 = (total_mean - mean1_cumsum) / (weight2 + 1e-10)
+            
+            # Inter-class variance
+            variance_between = weight1 * weight2 * (mean1 - mean2) ** 2
+            
+            # Find threshold that maximizes variance
+            idx = int(cp.argmax(variance_between).item())
+            threshold = float(bin_centers[idx].item())
+            
+            del data_gpu, hist, bin_edges, bin_centers, hist_norm
+            del weight1, weight2, mean1_cumsum, mean1, mean2, variance_between
+            backend.clear_memory()
+            
+            print(f"[GPU] Otsu threshold: {time.time() - start:.3f}s, value={threshold:.1f}")
+            return threshold
+            
+        except Exception as e:
+            print(f"[GPU] Otsu failed: {e}, using CPU")
+            backend.clear_memory()
+    
+    # CPU fallback
+    from skimage.filters import threshold_otsu
+    start = time.time()
+    result = threshold_otsu(data)
+    print(f"[CPU] Otsu threshold: {time.time() - start:.3f}s")
     return result

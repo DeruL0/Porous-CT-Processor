@@ -26,6 +26,7 @@ from config import (
 from loaders.dicom_utils import (
     NUMBA_AVAILABLE,
     rescale_volume_numba as _rescale_volume_numba,
+    rescale_volume_gpu as _rescale_volume_gpu,
     natural_sort_key as _natural_sort_key,
     validate_path as _validate_path,
     find_dicom_files as _find_dicom_files,
@@ -34,6 +35,8 @@ from loaders.dicom_utils import (
     sort_slices_by_position as _sort_slices_by_position,
     extract_metadata as _extract_metadata
 )
+from config import GPU_ENABLED
+from core.gpu_backend import get_gpu_backend, CUPY_AVAILABLE
 
 
 
@@ -174,9 +177,23 @@ class DicomSeriesLoader(BaseLoader):
             intercepts[i] = float(getattr(s, 'RescaleIntercept', 0.0))
             volume[i] = s.pixel_array.astype(np.float32)
         
-        # Second pass: apply rescale (Numba accelerated if available)
-        if callback: callback(92, "Applying rescale (Numba)..." if NUMBA_AVAILABLE else "Applying rescale...")
-        _rescale_volume_numba(volume, slopes, intercepts)
+        # Second pass: apply rescale (GPU > Numba > NumPy fallback)
+        if GPU_ENABLED and CUPY_AVAILABLE:
+            import cupy as cp
+            backend = get_gpu_backend()
+            if callback: callback(92, "Applying rescale (GPU)...")
+            try:
+                volume_gpu = cp.asarray(volume)
+                _rescale_volume_gpu(volume_gpu, slopes, intercepts)
+                volume = cp.asnumpy(volume_gpu)
+                del volume_gpu
+                backend.clear_memory()
+            except Exception as e:
+                print(f"[Loader] GPU rescale failed: {e}, falling back to Numba")
+                _rescale_volume_numba(volume, slopes, intercepts)
+        else:
+            if callback: callback(92, "Applying rescale (Numba)..." if NUMBA_AVAILABLE else "Applying rescale...")
+            _rescale_volume_numba(volume, slopes, intercepts)
         
         if callback: callback(98, "Finalizing...")
         gc.collect()

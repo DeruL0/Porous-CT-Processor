@@ -10,7 +10,12 @@ from typing import Optional, Callable, Tuple
 import gc
 
 from core import BaseProcessor, VolumeData
-from processors.utils import binary_fill_holes
+from processors.utils import (
+    binary_fill_holes, 
+    compute_histogram_gpu, 
+    compute_statistics_gpu,
+    threshold_otsu_gpu
+)
 from config import (
     PROCESS_CHUNK_THRESHOLD,
     PROCESS_CHUNK_SIZE,
@@ -86,9 +91,9 @@ class PoreExtractionProcessor(BaseProcessor):
         Returns:
             Suggested threshold value (int)
         """
+        # Import skimage algorithms for non-Otsu methods (CPU, but operates on tiny histogram data)
         from skimage.filters import (
-            threshold_otsu, threshold_li, threshold_yen, threshold_triangle,
-            threshold_minimum
+            threshold_li, threshold_yen, threshold_triangle, threshold_minimum
         )
         
         if data.raw_data is None:
@@ -107,36 +112,44 @@ class PoreExtractionProcessor(BaseProcessor):
             return -300
         
         try:
-            # Compute histogram for analysis
-            hist, bin_edges = np.histogram(clean_data, bins=256)
+            # GPU-accelerated histogram computation
+            hist, bin_edges = compute_histogram_gpu(clean_data, bins=256)
             bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
             
             # Normalize histogram
             hist_norm = hist.astype(float) / hist.sum()
             
+            # GPU-accelerated statistics computation
+            stats = compute_statistics_gpu(clean_data)
+            n = stats['n']
+            skewness = stats['skewness']
+            kurtosis = stats['kurtosis']
+            
             # Calculate bimodality coefficient
             # Values > 0.555 indicate bimodal distribution
-            n = len(clean_data)
-            mean = np.mean(clean_data)
-            std = np.std(clean_data)
-            if std > 0:
-                skewness = np.mean(((clean_data - mean) / std) ** 3)
-                kurtosis = np.mean(((clean_data - mean) / std) ** 4) - 3
+            if kurtosis + 3 * (n - 1) ** 2 / ((n - 2) * (n - 3)) > 0:
                 bimodality = (skewness ** 2 + 1) / (kurtosis + 3 * (n - 1) ** 2 / ((n - 2) * (n - 3)))
             else:
                 bimodality = 0
             
             # Calculate thresholds using multiple methods
-            threshold_methods = {
-                'otsu': threshold_otsu,
+            # Otsu uses GPU-accelerated version, others use skimage (CPU but tiny data)
+            valid_thresholds = {}
+            
+            # GPU-accelerated Otsu
+            try:
+                valid_thresholds['otsu'] = threshold_otsu_gpu(clean_data)
+            except Exception:
+                pass
+            
+            # CPU-based methods (operate on histogram, very fast)
+            cpu_methods = {
                 'li': threshold_li,
                 'yen': threshold_yen,
                 'triangle': threshold_triangle,
                 'minimum': threshold_minimum
             }
-            
-            valid_thresholds = {}
-            for name, func in threshold_methods.items():
+            for name, func in cpu_methods.items():
                 try:
                     valid_thresholds[name] = func(clean_data)
                 except Exception:
@@ -181,8 +194,8 @@ class PoreExtractionProcessor(BaseProcessor):
                 elif 'li' in valid_thresholds:
                     best_method = 'li'
             
-            # Validate threshold is reasonable
-            data_min, data_max = clean_data.min(), clean_data.max()
+            # Validate threshold is reasonable (use cached stats)
+            data_min, data_max = stats['min'], stats['max']
             data_range = data_max - data_min
             
             selected_thresh = valid_thresholds[best_method]

@@ -60,7 +60,9 @@ def _find_adjacency_gpu(labels_volume: np.ndarray) -> Set[Tuple[int, int]]:
         # Vectorized mask
         mask = (curr > 0) & (next_ > 0) & (curr != next_)
         
-        if cp.any(mask):
+        # Explicit GPU->CPU sync with .item()
+        has_adjacency = bool(cp.any(mask).item())
+        if has_adjacency:
             pairs_a = curr[mask]
             pairs_b = next_[mask]
             
