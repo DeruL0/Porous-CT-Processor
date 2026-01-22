@@ -188,33 +188,44 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
         return scroll_area
 
     def _create_info_panel(self) -> QWidget:
+        """Create right sidebar with global scroll area."""
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
 
         panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(4, 4, 4, 4)
-
+        self.info_panel_layout = QVBoxLayout(panel)
+        layout = self.info_panel_layout
+        layout.setSpacing(10)
+        
+        # Title
         title = QLabel("Information")
         title.setFont(QFont("Arial", 16, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
-
-        self.right_splitter = QSplitter(Qt.Vertical)
+        layout.addWidget(self._create_separator())
+        
+        # Default Info Panel
         self.info_panel = InfoPanel()
-        self.right_splitter.addWidget(self.info_panel)
-        layout.addWidget(self.right_splitter)
-
+        layout.addWidget(self.info_panel)
+        
+        layout.addStretch()
         scroll_area.setWidget(panel)
+        
         return scroll_area
 
     def add_custom_panel(self, panel: QWidget, index: int = 2, side: str = 'left'):
+        """Add a custom panel to either the left or right sidebar."""
         if side == 'left' and hasattr(self, 'control_panel_layout'):
             self.control_panel_layout.insertWidget(index, panel)
-        elif side == 'right' and hasattr(self, 'right_splitter'):
-            self.right_splitter.addWidget(panel)
-            self.right_splitter.setStretchFactor(0, 1)
-            self.right_splitter.setStretchFactor(1, 1)
+        elif side == 'right' and hasattr(self, 'info_panel_layout'):
+            # Insert before the stretch (last item)
+            count = self.info_panel_layout.count()
+            # If there is a stretch, insert before it. 
+            # The stretch is usually the last item.
+            if count > 0:
+                self.info_panel_layout.insertWidget(count - 1, panel)
+            else:
+                self.info_panel_layout.addWidget(panel)
 
     def _create_separator(self):
         line = QFrame()
@@ -240,7 +251,7 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
     # BaseVisualizer Interface
     # ==========================================
 
-    def set_data(self, data: VolumeData):
+    def set_data(self, data: VolumeData, reset_camera: bool = False):
         """Set data and delegate to RenderEngine."""
         self.render_engine.set_data(data)
         
@@ -252,7 +263,7 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
 
         if data.has_mesh:
             self.update_status(f"Loaded Mesh: {d_type}")
-            self.render_mesh(reset_view=True)
+            self.render_mesh(reset_view=reset_camera)
             self.info_panel.update_info(d_type, (0, 0, 0), data.spacing, data.metadata)
         elif data.raw_data is not None:
             self.update_status(f"Loaded Volume: {d_type}")
@@ -274,7 +285,7 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
             self.params_panel.set_slice_limits(dims[0] - 1, dims[1] - 1, dims[2] - 1)
             self.params_panel.set_slice_defaults(dims[0] // 2, dims[1] // 2, dims[2] // 2)
 
-            self.render_volume(reset_view=True)
+            self.render_volume(reset_view=reset_camera)
             self.info_panel.update_info(d_type, data.dimensions, data.spacing, data.metadata)
 
     def _update_histogram(self):

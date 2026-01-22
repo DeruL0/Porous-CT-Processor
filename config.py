@@ -109,3 +109,11 @@ CLIP_UPDATE_INTERVAL = 200
 # ==========================================
 GPU_ENABLED = True    # Set False to disable GPU acceleration
 GPU_MIN_SIZE_MB = 10  # Minimum data size (MB) to use GPU (smaller uses CPU)
+
+# ==========================================
+# 4D CT Tracking Settings
+# ==========================================
+TRACKING_IOU_THRESHOLD = 0.1           # Min IoU to consider pores matched
+TRACKING_COMPRESSION_THRESHOLD = 0.01  # Volume ratio below which pore is "compressed"
+TRACKING_ANIMATION_FPS = 5             # Animation playback speed
+

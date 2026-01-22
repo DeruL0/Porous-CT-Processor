@@ -8,6 +8,7 @@ from gui.panels.params_panel import RenderingParametersPanel
 from gui.panels.clip_panel import ClipPlanePanel
 from gui.panels.roi_panel import ROIPanel
 from gui.panels.processing_panel import StructureProcessingPanel
+from gui.panels.timeseries_panel import TimeSeriesPanel
 
 __all__ = [
     'InfoPanel',
@@ -17,4 +18,5 @@ __all__ = [
     'ClipPlanePanel',
     'ROIPanel',
     'StructureProcessingPanel',
+    'TimeSeriesPanel',
 ]

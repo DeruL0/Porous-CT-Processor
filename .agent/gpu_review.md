@@ -165,3 +165,106 @@ else:
 1. **Short-term (P2 fixes)**: Integrate `rescale_volume_gpu` and reduce sync frequency in watershed.
 2. **Medium-term (P1)**: Create a unified `processors/gpu_pipeline.py` that keeps data on GPU across fill_holes → EDT → watershed.
 3. **Long-term (P3)**: Implement pinned memory for DICOM loading to maximize PCIe bandwidth.
+
+---
+
+## Threshold Computation Review
+
+### Files Analyzed
+
+- [processors/utils.py](file:///d:/Projects/6.Food%20CT/Porous/processors/utils.py): `compute_histogram_gpu`, `compute_statistics_gpu`, `threshold_otsu_gpu`
+- [processors/pore.py](file:///d:/Projects/6.Food%20CT/Porous/processors/pore.py): `suggest_threshold`
+
+### Current Workflow
+
+```
+suggest_threshold()
+├── compute_histogram_gpu(clean_data)     # Upload data → histogram → Download
+├── compute_statistics_gpu(clean_data)    # Upload data → stats → Download  
+└── threshold_otsu_gpu(clean_data)        # Upload data → Otsu → Download
+```
+
+### Issues Identified
+
+| Issue | Severity | Description |
+| ----- | -------- | ----------- |
+| **Multiple Uploads** | P1 | Same `clean_data` uploaded to GPU 3 times |
+| **Separate Downloads** | P2 | Results downloaded separately instead of in batch |
+| **No Data Reuse** | P1 | `threshold_otsu_gpu` recomputes histogram internally |
+
+### Detailed Analysis
+
+#### P1: Data Locality Violation
+
+The `suggest_threshold` function in `pore.py` calls three GPU functions sequentially:
+
+1. `compute_histogram_gpu(clean_data)` - uploads `clean_data`
+2. `compute_statistics_gpu(clean_data)` - uploads `clean_data` again
+3. `threshold_otsu_gpu(clean_data)` - uploads `clean_data` a third time
+
+**Impact**: 3x unnecessary PCIe transfers for the same data.
+
+#### P1: Redundant Histogram Computation
+
+`threshold_otsu_gpu` computes its own histogram internally (line 668):
+
+```python
+hist, bin_edges = cp.histogram(data_gpu, bins=nbins)
+```
+
+But `compute_histogram_gpu` already computed a histogram, which is used only for UI purposes in `suggest_threshold`.
+
+### Recommendations
+
+#### Option A: Unified Threshold Pipeline (Recommended)
+
+Create `compute_threshold_stats_gpu()` that does everything in one GPU pass:
+
+```python
+def compute_threshold_stats_gpu(data: np.ndarray) -> dict:
+    """Single GPU pass for histogram, statistics, and Otsu threshold."""
+    import cupy as cp
+    
+    # Single upload
+    data_gpu = cp.asarray(data)
+    
+    # Compute histogram (reused for Otsu)
+    hist, bin_edges = cp.histogram(data_gpu, bins=256)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    
+    # Compute statistics
+    mean = float(cp.mean(data_gpu).item())
+    std = float(cp.std(data_gpu).item())
+    # ... skewness, kurtosis ...
+    
+    # Compute Otsu using already-computed histogram
+    # ... Otsu calculation ...
+    
+    # Single download
+    return {
+        'histogram': (cp.asnumpy(hist), cp.asnumpy(bin_edges)),
+        'stats': {'mean': mean, 'std': std, ...},
+        'otsu_threshold': threshold
+    }
+```
+
+#### Option B: Keep GPU Data Alive
+
+Modify functions to optionally accept/return GPU arrays:
+
+```python
+def compute_histogram_gpu(data, bins=256, keep_on_gpu=False):
+    data_gpu = cp.asarray(data) if isinstance(data, np.ndarray) else data
+    hist_gpu, edges_gpu = cp.histogram(data_gpu, bins=bins)
+    if keep_on_gpu:
+        return hist_gpu, edges_gpu, data_gpu  # Return GPU data for reuse
+    return cp.asnumpy(hist_gpu), cp.asnumpy(edges_gpu)
+```
+
+### Priority Summary
+
+| Priority | Fix | Effort |
+| -------- | --- | ------ |
+| P1 | Create unified `compute_threshold_stats_gpu` | Medium |
+| P1 | Reuse histogram in Otsu calculation | Low |
+| P2 | Batch result downloads | Low |

@@ -11,6 +11,7 @@ from loaders.dicom import (
     LoadStrategy
 )
 from loaders.dummy import DummyLoader
+from loaders.time_series import TimeSeriesDicomLoader, load_time_series
 
 __all__ = [
     'DicomSeriesLoader',
@@ -19,5 +20,7 @@ __all__ = [
     'ChunkedDicomLoader',
     'DummyLoader',
     'SmartDicomLoader',
-    'LoadStrategy'
+    'LoadStrategy',
+    'TimeSeriesDicomLoader',
+    'load_time_series',
 ]

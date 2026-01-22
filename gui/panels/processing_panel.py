@@ -22,6 +22,9 @@ class StructureProcessingPanel(QGroupBox):
     reset_clicked = pyqtSignal()
     export_clicked = pyqtSignal()
     gpu_toggled = pyqtSignal(bool)
+    # 4D CT signals
+    load_4dct_clicked = pyqtSignal()
+    track_4dct_clicked = pyqtSignal()
 
     def __init__(self, title: str = "🔧 Structure Processing"):
         super().__init__()
@@ -35,7 +38,29 @@ class StructureProcessingPanel(QGroupBox):
         title_lbl.setStyleSheet(PANEL_TITLE_STYLE)
         layout.addWidget(title_lbl)
         
-        # Data Loading Section
+        # === 4D CT Section (TOP) ===
+        layout.addWidget(QLabel("─── 4D CT Analysis ───"))
+        self._add_button(layout, "📁 Load 4D CT Series", self.load_4dct_clicked, min_height=35)
+        
+        # Sorting mode selection
+        from PyQt5.QtWidgets import QComboBox
+        sort_layout = QHBoxLayout()
+        sort_lbl = QLabel("Order:")
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItems(["Alphabetical", "Numeric", "Date Modified", "Manual"])
+        self.sort_combo.setToolTip(
+            "Alphabetical: Sort by folder name A-Z\n"
+            "Numeric: Extract numbers from names (t1, t2, t10...)\n"
+            "Date Modified: Sort by file modification time\n"
+            "Manual: Select and reorder in dialog"
+        )
+        sort_layout.addWidget(sort_lbl)
+        sort_layout.addWidget(self.sort_combo, stretch=1)
+        layout.addLayout(sort_layout)
+        layout.addSpacing(10)
+        
+        # === Data Loading Section ===
+        layout.addWidget(QLabel("─── Single Volume ───"))
         self._add_button(layout, "📂 Load DICOM Series", self.load_clicked)
         self._add_button(layout, "⚡ Fast Load (2x Downsample)", self.fast_load_clicked)
         self._add_button(layout, "🧪 Generate Synthetic Sample", self.dummy_clicked)
@@ -56,7 +81,6 @@ class StructureProcessingPanel(QGroupBox):
         layout.addLayout(thresh_layout)
         
         # Algorithm Selection + Auto Button
-        from PyQt5.QtWidgets import QComboBox
         algo_layout = QHBoxLayout()
         algo_lbl = QLabel("Algorithm:")
         self.algo_combo = QComboBox()
@@ -98,6 +122,7 @@ class StructureProcessingPanel(QGroupBox):
         layout.addSpacing(5)
         self._add_button(layout, "🔬 Extract Pores", self.extract_pores_clicked)
         self._add_button(layout, "🌐 Generate PNM Model", self.pnm_clicked)
+        self._add_button(layout, "🔄 Track 4D Pores", self.track_4dct_clicked, min_height=35)
         
         # Reset Section
         layout.addSpacing(10)
@@ -105,6 +130,10 @@ class StructureProcessingPanel(QGroupBox):
         self._add_button(layout, "💾 Export VTK", self.export_clicked, min_height=35)
         
         self.setLayout(layout)
+    
+    def get_sort_mode(self) -> str:
+        """Get selected sorting mode for 4D CT folders."""
+        return self.sort_combo.currentText().lower()
 
     def _add_button(self, layout, text, signal, min_height=40):
         btn = QPushButton(text)

@@ -217,13 +217,25 @@ class RenderEngine:
         """Render PNM mesh with PoreRadius colormap."""
         if not self.mesh:
             return
-        if reset_view or self.active_view_mode != 'mesh':
-            self.clear_view()
-            self.active_view_mode = 'mesh'
-            self._update_clip_panel_state()
-            if self.params_panel:
-                self.params_panel.set_mode('mesh')
-            self.plotter.enable_lightkit()
+        
+        # Save camera state before clearing (for smooth time step transitions)
+        saved_camera = None
+        if not reset_view:
+            try:
+                saved_camera = self.plotter.camera.copy()
+            except Exception:
+                pass
+            
+        # Clean up previous actors before adding new ones
+        self.plotter.clear()
+        self.plotter.add_axes()
+        self.volume_actor = None
+        
+        self.active_view_mode = 'mesh'
+        self._update_clip_panel_state()
+        if self.params_panel:
+            self.params_panel.set_mode('mesh')
+        self.plotter.enable_lightkit()
 
         params = self.params_panel.get_current_values() if self.params_panel else {}
 
@@ -252,6 +264,13 @@ class RenderEngine:
 
         if reset_view:
             self.reset_camera()
+        elif saved_camera:
+            # Restore previous camera state
+            try:
+                self.plotter.camera = saved_camera
+                self.plotter.render()
+            except Exception:
+                pass
 
     def render_volume(self, reset_view=True):
         """

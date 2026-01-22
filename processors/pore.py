@@ -112,15 +112,19 @@ class PoreExtractionProcessor(BaseProcessor):
             return -300
         
         try:
-            # GPU-accelerated histogram computation
-            hist, bin_edges = compute_histogram_gpu(clean_data, bins=256)
+            # Use unified GPU threshold computation (single GPU pass)
+            from processors.threshold_gpu import compute_threshold_stats_gpu
+            
+            result = compute_threshold_stats_gpu(clean_data, nbins=256)
+            
+            hist, bin_edges = result['histogram']
             bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
             
             # Normalize histogram
             hist_norm = hist.astype(float) / hist.sum()
             
-            # GPU-accelerated statistics computation
-            stats = compute_statistics_gpu(clean_data)
+            # Get pre-computed statistics
+            stats = result['stats']
             n = stats['n']
             skewness = stats['skewness']
             kurtosis = stats['kurtosis']
@@ -132,15 +136,8 @@ class PoreExtractionProcessor(BaseProcessor):
             else:
                 bimodality = 0
             
-            # Calculate thresholds using multiple methods
-            # Otsu uses GPU-accelerated version, others use skimage (CPU but tiny data)
-            valid_thresholds = {}
-            
-            # GPU-accelerated Otsu
-            try:
-                valid_thresholds['otsu'] = threshold_otsu_gpu(clean_data)
-            except Exception:
-                pass
+            # Pre-computed Otsu from unified function
+            valid_thresholds = {'otsu': result['otsu_threshold']}
             
             # CPU-based methods (operate on histogram, very fast)
             cpu_methods = {
