@@ -5,65 +5,79 @@ A scientific computing application for analyzing porous materials (rocks, cerami
 ## Overview
 
 This application provides a comprehensive workflow for Digital Rock Physics (DRP):
-1.  **Ingestion**: Load industrial DICOM series or generate synthetic test data.
-2.  **Visualization**: Interactive 3D rendering with orthogonal slices and isosurfaces.
-3.  **Quantification**: Extract porosity and segment void space.
-4.  **Modeling**: Generate Pore Network Models (PNM) using watershed segmentation.
-5.  **Export**: Save results to VTK standards (.vtp/.vti) for simulation software.
+
+1. **Ingestion**: Load industrial DICOM series, 4D CT time-series, or generate synthetic test data.
+2. **Visualization**: Interactive 3D rendering with orthogonal slices, isosurfaces, and time-step navigation.
+3. **Quantification**: Extract porosity, segment void space, and track pore evolution over time.
+4. **Modeling**: Generate Pore Network Models (PNM) using watershed segmentation.
+5. **Export**: Save results to VTK standards (.vtp/.vti) for simulation software.
 
 ## Project Structure
 
 ```
 Porous/
-├── app.py              # Application entry point
+├── App.py              # Application Controller (MVC Entry Point)
 ├── config.py           # Configuration settings
-├── core/               # Base classes (VolumeData, BaseLoader, BaseProcessor)
+├── core/               # Core Logic
+│   ├── base.py         # Abstract Base Classes
+│   ├── gpu_backend.py  # GPU Acceleration Backend
+│   └── time_series.py  # 4DCT Time Series Logic
 ├── loaders/            # Data loading strategies
 │   ├── dicom.py        # DICOM series loaders
 │   └── dummy.py        # Synthetic data generator
-├── processors/         # Analysis algorithms
-│   ├── pore.py         # Void space extraction
-│   └── pnm.py          # Pore Network Modeling (PNM)
-├── exporters/          # Data export handlers
-│   └── vtk.py          # VTK format exporter
-├── data/               # Data management
-│   └── manager.py      # Scientific workflow state
-├── gui/                # User interface
-│   ├── main_window.py  # Main application window
-│   └── panels/         # Reusable UI panels
-└── rendering/          # 3D rendering engine
-    ├── render_engine.py
-    ├── clip_handler.py
-    └── roi_handler.py
+├── processors/         # Analysis algorithms & Logic
+│   ├── pore.py         # Void extraction
+│   ├── pnm.py          # Pore Network Modeling
+│   ├── pnm_tracker.py  # 4D Pore Tracking
+│   └── gpu_pipeline.py # GPU processing pipelines
+├── exporters/          # Data export handlers (VTK)
+├── data/               # Data Layer
+│   └── manager.py      # Central Data Manager
+├── gui/                # User Interface
+│   ├── main_window.py  # Main Visualizer Window
+│   ├── panels/         # Reusable UI Panels (ROI, Processing, TimeSeries)
+│   └── handlers/       # UI Logic Handlers (Workflow, TimeSeries)
+├── rendering/          # 3D Rendering Engine
+│   └── render_engine.py
+└── web_intro/          # Web Introduction / Landing Page material
 ```
 
 ## Features
 
 ### Visualization Modes
+
 * **📊 Volume Rendering**: Full 3D density rendering with adjustable opacity transfer functions.
-* **🔳 Orthogonal Slices**: Interactive X, Y, Z planes with mouse probe (shows XYZ coordinates and HU values).
-* **🏔️ Isosurface**: Solid-void interface with multiple coloring modes (Solid, Depth, Radial Distance).
-* **⚪ PNM Mesh**: Network topology visualization with Pores (Spheres) and Throats (Tubes).
+* **🔳 Orthogonal Slices**: Interactive X, Y, Z planes with mouse probe.
+* **🏔️ Isosurface**: Solid-void interface with multiple coloring modes.
+* **⚪ PNM Mesh**: Network topology visualization (Pores & Throats).
+* **⏱️ 4D Playback**: Navigate through time steps for temporal CT data.
 
 ### Structural Analysis
-* **Void Extraction**: Segments air/void voxels from solid matrix using intensity thresholding.
-* **Pore Network Modeling (PNM)**: Watershed segmentation with Ball-and-Stick model generation.
+
+* **Void Extraction**: Segment air/void voxels using intensity thresholding.
+* **Pore Network Modeling (PNM)**: Watershed segmentation (Ball-and-Stick model).
+* **4D Tracking**: Track individual pores across time steps to analyze evolution.
+* **GPU Acceleration**: (Experimental) CuPy-based acceleration for heavy operations.
 
 ### Data IO
+
 * **Load DICOM**: Standard CT image series support.
+* **Import 4D-CT**: Load multiple time steps from folder series.
 * **Fast Load**: Downsampled preview for large datasets.
 * **Synthetic Generator**: Gaussian Random Field volume for testing.
 
 ## Installation
 
 ### Requirements
+
 * Python 3.8+
 * See `requirements.txt` for dependencies
 
 ### Setup
+
 ```bash
 pip install -r requirements.txt
-python app.py
+python App.py
 ```
 
 ## Dependencies
@@ -71,7 +85,7 @@ python app.py
 | Package | Purpose |
 |---------|---------|
 | PyQt5 | GUI framework |
-| pyvista, pyvistaqt, vtk | 3D rendering |
+| pyvista, pyvistaqt | 3D rendering |
 | numpy, scipy, scikit-image | Image processing |
 | pydicom | DICOM data loading |
-| joblib, numba (optional) | Performance optimization |
+| cupy (optional) | GPU acceleration |
