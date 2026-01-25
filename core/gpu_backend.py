@@ -18,10 +18,7 @@ except ImportError:
 
 
 class GPUBackend:
-    """
-    Singleton for GPU backend management.
-    Handles GPU detection, memory queries, and array transfers.
-    """
+    """Singleton for GPU backend management."""
     
     _instance = None
     _initialized = False
@@ -35,44 +32,43 @@ class GPUBackend:
         if GPUBackend._initialized:
             return
         GPUBackend._initialized = True
-        
         self._gpu_enabled = True
         
-        if CUPY_AVAILABLE:
-            try:
-                device = cp.cuda.Device()
-                total_mem = device.mem_info[1] / (1024**3)  # GB
-                print(f"[GPU] Initialized: Device {device.id}, {total_mem:.1f} GB VRAM")
-                
-                # Kernel warmup: pre-compile common CUDA kernels to avoid first-call latency
-                self._warmup_kernels()
-            except Exception as e:
-                print(f"[GPU] Initialization failed: {e}")
-                self._gpu_enabled = False
-        else:
+        if not CUPY_AVAILABLE:
             print("[GPU] CuPy not available, using CPU backend")
             self._gpu_enabled = False
+            return
+        
+        try:
+            device = cp.cuda.Device()
+            print(f"[GPU] Initialized: Device {device.id}, {device.mem_info[1] / (1024**3):.1f} GB VRAM")
+            self._configure_memory_pool()
+            self._warmup_kernels()
+        except Exception as e:
+            print(f"[GPU] Initialization failed: {e}")
+            self._gpu_enabled = False
+    
+    def _configure_memory_pool(self):
+        """Configure CuPy memory pool for optimal performance."""
+        try:
+            mempool = cp.get_default_memory_pool()
+            free_mem = cp.cuda.Device().mem_info[0]
+            mempool.set_limit(size=int(free_mem * 0.9))
+            print(f"[GPU] Memory pool configured: {free_mem / (1024**3):.1f} GB limit")
+        except Exception as e:
+            print(f"[GPU] Memory pool config warning: {e}")
     
     def _warmup_kernels(self):
-        """Pre-compile common CUDA kernels with small dummy data."""
+        """Pre-compile common CUDA kernels."""
         try:
-            # Small 16x16x16 warmup data
-            warmup_data = cp.zeros((16, 16, 16), dtype=cp.float32)
-            warmup_bool = warmup_data > 0
-            
-            # Warmup common ndimage operations
-            gpu_ndimage.binary_dilation(warmup_bool)
-            gpu_ndimage.maximum_filter(warmup_data, size=3)
-            gpu_ndimage.distance_transform_edt(warmup_bool.astype(cp.uint8))
-            
-            # Warmup basic operations
-            _ = cp.argwhere(warmup_bool)
-            _ = cp.roll(warmup_data, 1, axis=0)
-            
-            # Cleanup
-            del warmup_data, warmup_bool
+            data = cp.zeros((16, 16, 16), dtype=cp.float32)
+            mask = data > 0
+            gpu_ndimage.binary_dilation(mask)
+            gpu_ndimage.maximum_filter(data, size=3)
+            gpu_ndimage.distance_transform_edt(mask.astype(cp.uint8))
+            cp.argwhere(mask)
+            del data, mask
             cp.get_default_memory_pool().free_all_blocks()
-            
             print("[GPU] Kernel warmup completed")
         except Exception as e:
             print(f"[GPU] Kernel warmup failed (non-critical): {e}")
@@ -116,70 +112,40 @@ class GPUBackend:
             return cp.asnumpy(array)
         return array
     
-    def clear_memory(self):
-        """Clear GPU memory pool (use sparingly)."""
+    def clear_memory(self, force: bool = False):
+        """Clear GPU memory pool. Use force=True only when memory is critically low."""
         if CUPY_AVAILABLE:
-            cp.get_default_memory_pool().free_all_blocks()
+            mempool = cp.get_default_memory_pool()
+            if force:
+                mempool.free_all_blocks()
+            else:
+                mempool.free_all_free()
     
     def create_stream(self, non_blocking: bool = True) -> Any:
-        """
-        Create a CUDA stream for async operations.
-        
-        Args:
-            non_blocking: If True, the stream can run concurrently with default stream
-            
-        Returns:
-            CuPy CUDA Stream object, or None if GPU not available
-        """
-        if not self.available:
-            return None
-        return cp.cuda.Stream(non_blocking=non_blocking)
+        """Create a CUDA stream for async operations."""
+        return cp.cuda.Stream(non_blocking=non_blocking) if self.available else None
     
     def to_gpu_async(self, array: np.ndarray, stream: Any = None) -> Any:
-        """
-        Transfer NumPy array to GPU asynchronously.
-        
-        For best performance with async transfers, use pinned (page-locked) memory
-        on the CPU side. This method works with regular numpy arrays but pinned
-        memory will provide better PCIe throughput.
-        
-        Args:
-            array: NumPy array to transfer
-            stream: Optional CUDA stream for async transfer
-            
-        Returns:
-            CuPy array on GPU
-        """
+        """Transfer NumPy array to GPU asynchronously."""
         if not self.available or not isinstance(array, np.ndarray):
             return array
-        
-        if stream is not None:
+        if stream:
             with stream:
                 return cp.asarray(array)
         return cp.asarray(array)
     
     def to_cpu_async(self, array: Any, stream: Any = None) -> np.ndarray:
-        """
-        Transfer GPU array to CPU asynchronously.
-        
-        Args:
-            array: CuPy array to transfer
-            stream: Optional CUDA stream for async transfer
-            
-        Returns:
-            NumPy array on CPU
-        """
+        """Transfer GPU array to CPU asynchronously."""
         if not CUPY_AVAILABLE or not isinstance(array, cp.ndarray):
             return array
-        
-        if stream is not None:
+        if stream:
             with stream:
                 return cp.asnumpy(array)
         return cp.asnumpy(array)
     
     def synchronize_stream(self, stream: Any):
-        """Wait for all operations in the stream to complete."""
-        if stream is not None and self.available:
+        """Wait for stream operations to complete."""
+        if stream and self.available:
             stream.synchronize()
 
 

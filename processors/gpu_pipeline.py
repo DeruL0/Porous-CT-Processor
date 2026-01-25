@@ -1,13 +1,5 @@
 """
-GPU Pipeline for Pore Network Modeling.
-
-Provides a unified GPU execution path that keeps data on GPU memory
-across multiple processing stages:
-  binary_fill_holes -> EDT -> local_maxima -> watershed
-
-This avoids the 6+ PCIe round-trips that occur when each function
-independently transfers data CPU <-> GPU.
-"""
+"""GPU Pipeline for unified segmentation (EDT -> local_maxima -> watershed)."""
 
 import numpy as np
 import time
@@ -22,23 +14,8 @@ def run_segmentation_pipeline_gpu(
     pores_mask: np.ndarray,
     min_peak_distance: int = 6
 ) -> Tuple[np.ndarray, np.ndarray, int]:
-    """
-    GPU-accelerated segmentation pipeline with minimal data transfers.
+    """GPU-accelerated segmentation: EDT -> local_maxima -> watershed."""
     
-    Workflow (all on GPU):
-    1. Distance transform
-    2. Find local maxima
-    3. Create markers
-    4. Watershed segmentation
-    
-    Args:
-        pores_mask: Binary mask of pore space (NumPy, bool)
-        min_peak_distance: Minimum distance between pore centers
-        
-    Returns:
-        Tuple of (distance_map, segmented_regions, num_pores)
-        All returned as NumPy arrays (transferred from GPU at end)
-    """
     if not GPU_ENABLED or not CUPY_AVAILABLE:
         # Fall back to individual CPU functions
         from processors.utils import distance_transform_edt, find_local_maxima
@@ -79,20 +56,18 @@ def run_segmentation_pipeline_gpu(
         return distance_map, segmented, int(np.max(segmented))
     
     start_total = time.time()
-    print(f"[GPU Pipeline] Starting unified GPU segmentation ({size_mb:.1f}MB)")
+    print(f"[GPU Pipeline] Starting ({size_mb:.1f}MB)")
     
-    # === SINGLE UPLOAD ===
-    start = time.time()
+    # Upload
     mask_gpu = cp.asarray(pores_mask.astype(np.uint8))
-    print(f"[GPU Pipeline] Upload: {time.time() - start:.2f}s")
     
-    # === DISTANCE TRANSFORM (on GPU) ===
+    # EDT
     start = time.time()
     distance_gpu = gpu_ndimage.distance_transform_edt(mask_gpu).astype(cp.float32)
-    del mask_gpu  # Free immediately
+    del mask_gpu
     print(f"[GPU Pipeline] EDT: {time.time() - start:.2f}s")
     
-    # === FIND LOCAL MAXIMA (on GPU) ===
+    # Local maxima
     start = time.time()
     size = 2 * min_peak_distance + 1
     max_filtered = gpu_ndimage.maximum_filter(distance_gpu, size=size)
@@ -107,35 +82,26 @@ def run_segmentation_pipeline_gpu(
         backend.clear_memory()
         return np.zeros(pores_mask.shape, dtype=np.float32), np.zeros(pores_mask.shape, dtype=np.int32), 0
     
-    # Get values at candidates for sorting
     candidate_values = distance_gpu[is_peak]
     del is_peak
     
-    # Sort by value descending
     sort_idx = cp.argsort(-candidate_values)
-    sorted_candidates = candidates[sort_idx]
+    sorted_candidates_cpu = cp.asnumpy(candidates[sort_idx])
     del candidates, candidate_values, sort_idx
     
-    # Transfer sorted candidates to CPU for NMS (sequential algorithm)
-    sorted_candidates_cpu = cp.asnumpy(sorted_candidates)
-    del sorted_candidates
-    
-    # NMS on CPU (inherently sequential)
     selected_peaks = _nms_cpu(sorted_candidates_cpu, min_peak_distance)
     print(f"[GPU Pipeline] Local maxima: {time.time() - start:.2f}s, {len(selected_peaks)} peaks")
     
-    # === CREATE MARKERS (on GPU) ===
+    # Markers
     markers_gpu = cp.zeros(pores_mask.shape, dtype=cp.int32)
     if len(selected_peaks) > 0:
         peak_coords = np.array(selected_peaks)
         markers_gpu[tuple(peak_coords.T)] = cp.arange(len(selected_peaks), dtype=cp.int32) + 1
     
-    # === WATERSHED (on GPU using RawKernel) ===
+    # Watershed
     start = time.time()
-    image_gpu = -distance_gpu  # Negative for watershed
+    image_gpu = -distance_gpu
     mask_bool_gpu = distance_gpu > 0
-    
-    # Keep distance_map for return, but as CPU array
     distance_map_cpu = cp.asnumpy(distance_gpu)
     del distance_gpu
     
@@ -143,27 +109,35 @@ def run_segmentation_pipeline_gpu(
     del image_gpu, markers_gpu, mask_bool_gpu
     print(f"[GPU Pipeline] Watershed: {time.time() - start:.2f}s")
     
-    # === SINGLE DOWNLOAD ===
-    start = time.time()
+    # Download
     segmented_cpu = cp.asnumpy(segmented_gpu)
     del segmented_gpu
-    backend.clear_memory()
-    print(f"[GPU Pipeline] Download: {time.time() - start:.2f}s")
     
     num_pores = int(np.max(segmented_cpu))
     print(f"[GPU Pipeline] Total: {time.time() - start_total:.2f}s, {num_pores} pores")
+    
+    # Only free unused blocks instead of all blocks
+    backend.clear_memory(force=False)
     
     return distance_map_cpu, segmented_cpu, num_pores
 
 
 def _nms_cpu(sorted_candidates: np.ndarray, min_distance: int) -> list:
-    """Non-maximum suppression (must be sequential, runs on CPU)."""
-    if len(sorted_candidates) > 10000:
+    """Non-maximum suppression with adaptive GPU/KDTree acceleration."""
+    n = len(sorted_candidates)
+    
+    if n > 50000 and CUPY_AVAILABLE:
+        try:
+            return _nms_gpu_parallel(sorted_candidates, min_distance)
+        except Exception:
+            pass
+    
+    if n > 10000:
         from scipy.spatial import cKDTree
         tree = cKDTree(sorted_candidates)
-        suppressed = np.zeros(len(sorted_candidates), dtype=bool)
+        suppressed = np.zeros(n, dtype=bool)
         selected = []
-        for i in range(len(sorted_candidates)):
+        for i in range(n):
             if suppressed[i]:
                 continue
             peak = sorted_candidates[i]
@@ -173,31 +147,47 @@ def _nms_cpu(sorted_candidates: np.ndarray, min_distance: int) -> list:
                 if j > i:
                     suppressed[j] = True
         return selected
-    else:
-        suppressed = np.zeros(len(sorted_candidates), dtype=bool)
-        min_dist_sq = min_distance * min_distance
-        selected = []
-        for i in range(len(sorted_candidates)):
-            if suppressed[i]:
-                continue
-            peak = sorted_candidates[i]
-            selected.append(peak)
-            if i + 1 < len(sorted_candidates):
-                remaining = sorted_candidates[i+1:]
-                diff = remaining - peak
-                dist_sq = np.sum(diff * diff, axis=1)
-                suppressed[i+1:][dist_sq < min_dist_sq] = True
-        return selected
+    suppressed = np.zeros(n, dtype=bool)
+    min_dist_sq = min_distance * min_distance
+    selected = []
+    for i in range(n):
+        if suppressed[i]:
+            continue
+        peak = sorted_candidates[i]
+        selected.append(peak)
+        if i + 1 < n:
+            diff = sorted_candidates[i+1:] - peak
+            suppressed[i+1:][np.sum(diff * diff, axis=1) < min_dist_sq] = True
+    return selected
+
+
+def _nms_gpu_parallel(candidates: np.ndarray, min_distance: int) -> list:
+    """GPU parallel NMS for large candidate sets."""
+    import cupy as cp
+    
+    backend = get_gpu_backend()
+    min_dist_sq = min_distance * min_distance
+    candidates_gpu = cp.asarray(candidates, dtype=cp.float32)
+    suppressed = cp.zeros(len(candidates), dtype=cp.bool_)
+    selected = []
+    
+    for idx in range(len(candidates)):
+        if suppressed[idx].item():
+            continue
+        selected.append(candidates[idx])
+        if idx + 1 < len(candidates):
+            diff = candidates_gpu[idx+1:] - candidates_gpu[idx]
+            suppressed[idx+1:] |= (cp.sum(diff * diff, axis=1) < min_dist_sq)
+    
+    del candidates_gpu, suppressed
+    backend.clear_memory(force=False)
+    return selected
 
 
 def _watershed_gpu_inplace(image_gpu, markers_gpu, mask_gpu, max_iterations: int = 500):
-    """
-    GPU watershed that operates on existing GPU arrays (no transfer).
-    Uses the optimized RawKernel implementation.
-    """
+    """GPU watershed with optimized RawKernel."""
     import cupy as cp
     
-    # Compile kernel
     watershed_kernel = cp.RawKernel(r'''
     extern "C" __global__
     void watershed_kernel(
@@ -212,36 +202,74 @@ def _watershed_gpu_inplace(image_gpu, markers_gpu, mask_gpu, max_iterations: int
         int total = shape[0] * shape[1] * shape[2];
         if (idx >= total) return;
         
-        bool is_masked = mask[idx];
+        if (!mask[idx]) { labels_out[idx] = 0; return; }
         int current = labels_in[idx];
-        
-        if (!is_masked) { labels_out[idx] = 0; return; }
         if (current > 0) { labels_out[idx] = current; return; }
         
         int d = shape[0], h = shape[1], w = shape[2];
-        int z = idx / (h * w);
-        int rem = idx % (h * w);
-        int y = rem / w;
-        int x = rem % w;
+        int z = idx / (h * w), rem = idx % (h * w), y = rem / w, x = rem % w;
         
         int best_label = 0;
         float best_val = 1e30f;
         
-        int dz[] = {-1, 1, 0, 0, 0, 0};
-        int dy[] = {0, 0, -1, 1, 0, 0};
-        int dx[] = {0, 0, 0, 0, -1, 1};
-        
-        for (int i = 0; i < 6; i++) {
-            int nz = z + dz[i], ny = y + dy[i], nx = x + dx[i];
-            if (nz >= 0 && nz < d && ny >= 0 && ny < h && nx >= 0 && nx < w) {
-                int n_idx = nz * h * w + ny * w + nx;
-                int n_label = labels_in[n_idx];
-                if (n_label > 0) {
-                    float n_val = image[n_idx];
-                    if (n_val < best_val || (n_val == best_val && n_label < best_label)) {
-                        best_val = n_val;
-                        best_label = n_label;
-                    }
+        // 6-connectivity neighbor check (unrolled)
+        if (z > 0) {
+            int n_idx = (z-1) * h * w + y * w + x;
+            int n_label = labels_in[n_idx];
+            if (n_label > 0) {
+                float n_val = image[n_idx];
+                if (n_val < best_val || (n_val == best_val && n_label < best_label)) {
+                    best_val = n_val; best_label = n_label;
+                }
+            }
+        }
+        if (z < d-1) {
+            int n_idx = (z+1) * h * w + y * w + x;
+            int n_label = labels_in[n_idx];
+            if (n_label > 0) {
+                float n_val = image[n_idx];
+                if (n_val < best_val || (n_val == best_val && n_label < best_label)) {
+                    best_val = n_val; best_label = n_label;
+                }
+            }
+        }
+        if (y > 0) {
+            int n_idx = z * h * w + (y-1) * w + x;
+            int n_label = labels_in[n_idx];
+            if (n_label > 0) {
+                float n_val = image[n_idx];
+                if (n_val < best_val || (n_val == best_val && n_label < best_label)) {
+                    best_val = n_val; best_label = n_label;
+                }
+            }
+        }
+        if (y < h-1) {
+            int n_idx = z * h * w + (y+1) * w + x;
+            int n_label = labels_in[n_idx];
+            if (n_label > 0) {
+                float n_val = image[n_idx];
+                if (n_val < best_val || (n_val == best_val && n_label < best_label)) {
+                    best_val = n_val; best_label = n_label;
+                }
+            }
+        }
+        if (x > 0) {
+            int n_idx = z * h * w + y * w + (x-1);
+            int n_label = labels_in[n_idx];
+            if (n_label > 0) {
+                float n_val = image[n_idx];
+                if (n_val < best_val || (n_val == best_val && n_label < best_label)) {
+                    best_val = n_val; best_label = n_label;
+                }
+            }
+        }
+        if (x < w-1) {
+            int n_idx = z * h * w + y * w + (x+1);
+            int n_label = labels_in[n_idx];
+            if (n_label > 0) {
+                float n_val = image[n_idx];
+                if (n_val < best_val || (n_val == best_val && n_label < best_label)) {
+                    best_val = n_val; best_label = n_label;
                 }
             }
         }
@@ -264,16 +292,19 @@ def _watershed_gpu_inplace(image_gpu, markers_gpu, mask_gpu, max_iterations: int
     threads = 256
     blocks = (total + threads - 1) // threads
     
+    check_interval, last_changed = 20, -1
+    
     for iteration in range(max_iterations):
-        watershed_kernel(
-            (blocks,), (threads,),
-            (image_gpu, labels_curr, labels_next, mask_gpu, shape_gpu, changed)
-        )
+        watershed_kernel((blocks,), (threads,), (image_gpu, labels_curr, labels_next, mask_gpu, shape_gpu, changed))
         labels_curr, labels_next = labels_next, labels_curr
         
-        if iteration % 10 == 9:
-            if changed.item() == 0:
+        if iteration % check_interval == check_interval - 1:
+            n_changed = changed.item()
+            if n_changed == 0:
                 break
+            if last_changed > 0 and n_changed < last_changed * 0.1:
+                check_interval = max(5, check_interval // 2)
+            last_changed = n_changed
             changed.fill(0)
     
     del labels_next, shape_gpu, changed

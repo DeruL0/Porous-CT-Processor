@@ -1,16 +1,12 @@
-"""
-Shared utility functions for DICOM loaders.
-Provides common operations for loading and processing DICOM files.
-"""
+"""DICOM loading utilities with GPU/Numba acceleration."""
 
 import os
 import re
 import numpy as np
 import pydicom
 from glob import glob
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
-# Try to import Numba for JIT acceleration
 try:
     from numba import jit, prange
     NUMBA_AVAILABLE = True
@@ -18,25 +14,17 @@ except ImportError:
     NUMBA_AVAILABLE = False
 
 
-# ==========================================
-# Numba-accelerated rescale
-# ==========================================
-
 if NUMBA_AVAILABLE:
     @jit(nopython=True, parallel=True, cache=True)
     def rescale_volume_numba(volume: np.ndarray, slopes: np.ndarray, intercepts: np.ndarray):
         """Numba JIT accelerated volume rescaling."""
-        n_slices = volume.shape[0]
-        for i in prange(n_slices):
-            slope = slopes[i]
-            intercept = intercepts[i]
-            if slope != 1.0 or intercept != 0.0:
+        for i in prange(volume.shape[0]):
+            if slopes[i] != 1.0 or intercepts[i] != 0.0:
                 for j in range(volume.shape[1]):
                     for k in range(volume.shape[2]):
-                        volume[i, j, k] = volume[i, j, k] * slope + intercept
+                        volume[i, j, k] = volume[i, j, k] * slopes[i] + intercepts[i]
 else:
     def rescale_volume_numba(volume, slopes, intercepts):
-        """Fallback: vectorized numpy rescale."""
         for i in range(len(slopes)):
             if slopes[i] != 1.0:
                 volume[i] *= slopes[i]
@@ -45,118 +33,64 @@ else:
 
 
 def rescale_volume_gpu(volume_gpu, slopes: np.ndarray, intercepts: np.ndarray):
-    """
-    GPU-accelerated unique rescaling using CuPy ElementwiseKernel.
-    
-    Args:
-        volume_gpu: CuPy array (modified in-place)
-        slopes: NumPy array of slopes
-        intercepts: NumPy array of intercepts
-    """
+    """GPU-accelerated volume rescaling (in-place)."""
     import cupy as cp
     
-    # Transfer parameters to GPU
     slopes_gpu = cp.asarray(slopes, dtype=cp.float32)
     intercepts_gpu = cp.asarray(intercepts, dtype=cp.float32)
     
-    # Create custom kernel for z-stack processing
-    # efficient broadcasting: volume is (z, y, x), params are (z,)
-    kernel = cp.ElementwiseKernel(
-        'float32 vol, raw float32 slopes, raw float32 intercepts',
-        'float32 out',
-        '''
-        // Calculate z-index from flat index
-        // dimension 0 is Z (slowest changing in C-order)
-        // We need to map flat index i back to z,y,x, but since params only depend on z:
-        int z = i / (_ind.shape()[1] * _ind.shape()[2]);
-        
-        float s = slopes[z];
-        float b = intercepts[z];
-        
-        if (s != 1.0 || b != 0.0) {
-            out = vol * s + b;
-        } else {
-            out = vol;
-        }
-        ''',
-        'rescale_volume_kernel'
-    )
+    kernel = cp.RawKernel(r'''
+    extern "C" __global__
+    void rescale_kernel(float* volume, const float* slopes, const float* intercepts,
+                        const int n_slices, const int slice_size) {
+        int idx = blockDim.x * blockIdx.x + threadIdx.x;
+        if (idx >= n_slices * slice_size) return;
+        int z = idx / slice_size;
+        float s = slopes[z], b = intercepts[z];
+        if (s != 1.0f || b != 0.0f) volume[idx] = volume[idx] * s + b;
+    }
+    ''', 'rescale_kernel')
     
-    kernel(volume_gpu, slopes_gpu, intercepts_gpu, volume_gpu)
+    n_slices = volume_gpu.shape[0]
+    slice_size = volume_gpu.shape[1] * volume_gpu.shape[2]
+    blocks = (volume_gpu.size + 255) // 256
+    kernel((blocks,), (256,), (volume_gpu, slopes_gpu, intercepts_gpu, n_slices, slice_size))
+    del slopes_gpu, intercepts_gpu
 
 
 def natural_sort_key(text: str):
-    """
-    Natural sorting key for filenames like img_1, img_2, ..., img_10.
-    
-    Example:
-        sorted(files, key=natural_sort_key)
-    """
+    """Natural sort key for filenames (img_1, img_2, ..., img_10)."""
     return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', text)]
 
 
-# ==========================================
-# Path & File Validation
-# ==========================================
-
 def validate_path(folder_path: str) -> None:
-    """
-    Validate that folder path exists.
-    
-    Raises:
-        FileNotFoundError: If path does not exist
-    """
+    """Validate folder path exists."""
     if not os.path.exists(folder_path):
         raise FileNotFoundError(f"Path does not exist: {folder_path}")
 
 
 def find_dicom_files(folder_path: str) -> List[str]:
-    """
-    Find DICOM files in folder, checking extension first then content.
-    
-    Args:
-        folder_path: Directory to search
-        
-    Returns:
-        List of file paths to valid DICOM files
-        
-    Raises:
-        FileNotFoundError: If no valid DICOM files found
-    """
+    """Find DICOM files in folder (by extension then content check)."""
     files = glob(os.path.join(folder_path, "*.dcm"))
     if not files:
-        # Check all files for DICOM magic bytes or valid header
-        all_files = glob(os.path.join(folder_path, "*"))
-        files = []
-        for f in all_files:
-            if os.path.isfile(f):
-                try:
-                    pydicom.dcmread(f, stop_before_pixels=True)
-                    files.append(f)
-                except (pydicom.errors.InvalidDicomError, IOError, OSError):
-                    # Not a valid DICOM file, skip
-                    continue
+        files = [f for f in glob(os.path.join(folder_path, "*")) 
+                 if os.path.isfile(f) and _is_dicom(f)]
     if not files:
         raise FileNotFoundError("No valid DICOM/CT files found")
     return files
 
 
-# ==========================================
-# DICOM Header Utilities
-# ==========================================
+def _is_dicom(filepath: str) -> bool:
+    """Check if file is valid DICOM."""
+    try:
+        pydicom.dcmread(filepath, stop_before_pixels=True)
+        return True
+    except Exception:
+        return False
+
 
 def calculate_z_spacing(ds1, ds2=None, step: int = 1) -> float:
-    """
-    Calculate Z-spacing from DICOM headers.
-    
-    Args:
-        ds1: First DICOM dataset
-        ds2: Second DICOM dataset (optional, for calculating from position difference)
-        step: Multiplier for spacing (used by downsampling loaders)
-        
-    Returns:
-        Z-spacing in mm
-    """
+    """Calculate Z-spacing from DICOM headers."""
     if ds2 is not None:
         if hasattr(ds1, 'ImagePositionPatient') and hasattr(ds2, 'ImagePositionPatient'):
             return abs(float(ds2.ImagePositionPatient[2]) - float(ds1.ImagePositionPatient[2]))
@@ -164,18 +98,7 @@ def calculate_z_spacing(ds1, ds2=None, step: int = 1) -> float:
 
 
 def get_spacing_and_origin(ds1, ds2=None, xy_step: int = 1, z_step: int = 1) -> Tuple[tuple, tuple]:
-    """
-    Extract spacing and origin from DICOM dataset.
-    
-    Args:
-        ds1: First DICOM dataset
-        ds2: Second DICOM dataset (for Z-spacing calculation)
-        xy_step: Multiplier for XY spacing (used by downsampling)
-        z_step: Multiplier for Z spacing (used by downsampling)
-        
-    Returns:
-        Tuple of (spacing, origin) where each is (x, y, z)
-    """
+    """Extract spacing and origin from DICOM dataset."""
     pixel_spacing = ds1.PixelSpacing
     z_spacing = calculate_z_spacing(ds1, ds2, z_step)
     spacing = (
@@ -188,16 +111,7 @@ def get_spacing_and_origin(ds1, ds2=None, xy_step: int = 1, z_step: int = 1) -> 
 
 
 def apply_rescale(arr: np.ndarray, ds) -> np.ndarray:
-    """
-    Apply DICOM rescale slope and intercept to pixel array (in-place).
-    
-    Args:
-        arr: Pixel array (float32)
-        ds: DICOM dataset with RescaleSlope/RescaleIntercept
-        
-    Returns:
-        Modified array (same reference as input)
-    """
+    """Apply DICOM rescale slope/intercept to array (in-place)."""
     slope = float(getattr(ds, 'RescaleSlope', 1.0))
     intercept = float(getattr(ds, 'RescaleIntercept', 0.0))
     if slope != 1.0:
@@ -208,16 +122,7 @@ def apply_rescale(arr: np.ndarray, ds) -> np.ndarray:
 
 
 def sort_slices_by_position(slices: List, loader_name: str = "Loader") -> List:
-    """
-    Sort DICOM slices by ImagePositionPatient Z-coordinate.
-    
-    Args:
-        slices: List of DICOM datasets
-        loader_name: Name for logging
-        
-    Returns:
-        Sorted list of slices
-    """
+    """Sort DICOM slices by Z-position."""
     if len(slices) > 1 and hasattr(slices[0], 'ImagePositionPatient'):
         try:
             slices.sort(key=lambda s: float(s.ImagePositionPatient[2]))
@@ -230,17 +135,7 @@ def sort_slices_by_position(slices: List, loader_name: str = "Loader") -> List:
 
 
 def extract_metadata(ds, slice_count: int, extra: dict = None) -> dict:
-    """
-    Extract common metadata from DICOM dataset.
-    
-    Args:
-        ds: DICOM dataset
-        slice_count: Number of slices
-        extra: Additional metadata to include
-        
-    Returns:
-        Metadata dictionary
-    """
+    """Extract common metadata from DICOM dataset."""
     metadata = {
         "SampleID": getattr(ds, "PatientID", "Unknown Sample"),
         "ScanType": getattr(ds, "Modality", "CT"),
