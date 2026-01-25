@@ -33,13 +33,9 @@ class StatisticsPanel(QWidget):
         title = QLabel("📈 Statistics & Analysis")
         title.setStyleSheet(PANEL_TITLE_STYLE)
         layout.addWidget(title)
-
-        # Splitter for resizing
-        splitter = QSplitter(Qt.Vertical)
-
-        # Tab Widget for Charts
+        
         self.tabs = QTabWidget()
-        splitter.addWidget(self.tabs)
+        self.tabs.setMinimumHeight(280) # Ensure charts are visible
         
         # 1. Pore Size Chart
         self.fig_pore = Figure(figsize=(5, 3), dpi=80)
@@ -50,6 +46,9 @@ class StatisticsPanel(QWidget):
         self.fig_throat = Figure(figsize=(5, 3), dpi=80)
         self.canvas_throat = FigureCanvas(self.fig_throat)
         self.tabs.addTab(self.canvas_throat, "Throat Sizes")
+        
+        layout.addWidget(self.tabs)
+
 
         # Statistics Table
         self.stats_table = QTableWidget()
@@ -57,25 +56,16 @@ class StatisticsPanel(QWidget):
         self.stats_table.setHorizontalHeaderLabels(["Metric", "Value"])
         self.stats_table.horizontalHeader().setStretchLastSection(True)
         self.stats_table.verticalHeader().setVisible(False)
-        self.stats_table.setSelectionMode(QTableWidget.ExtendedSelection)
-        self.stats_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.stats_table.setStyleSheet("""
-            QHeaderView::section {
-                background-color: transparent;
-                font-weight: bold;
-                padding: 10px;
-                border-bottom: 1px solid #666666;
-                font-size: 15px;
-            }
-            QTableWidget {
-                font-size: 15px;
-            }
-        """)
+        self.stats_table.setStyleSheet(TABLE_STYLESHEET)
+        
+        layout.addWidget(self.stats_table)
+        
+        # UI behavior - auto growth
+        self.stats_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        layout.addStretch()
 
-        splitter.addWidget(self.stats_table)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 1)
-        layout.addWidget(splitter)
+
+
 
     def update_statistics(self, metadata):
         """Update the panel with new statistics from VolumeData metadata."""
@@ -139,6 +129,30 @@ class StatisticsPanel(QWidget):
         for row, (metric, value) in enumerate(stats_data):
             self.stats_table.setItem(row, 0, QTableWidgetItem(metric))
             self.stats_table.setItem(row, 1, QTableWidgetItem(value))
+            
+        self._adjust_table_height(self.stats_table, max_height=350)
+
+
+    def _adjust_table_height(self, table: QTableWidget, max_height: int = 400):
+        """Dynamically adjust table height to fit contents."""
+        table.doItemsLayout() # Ensure rows are laid out
+        
+        # Calculate total height: header + all rows + small margin
+        height = table.horizontalHeader().height()
+        for i in range(table.rowCount()):
+            height += table.rowHeight(i)
+        
+        height += 5 # Add safe margin
+        
+        # Clamp between reasonable min/max
+        clamped_height = max(100, min(height, max_height))
+        table.setFixedHeight(clamped_height)
+        
+        # Toggle scrollbar
+        if height > max_height:
+            table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        else:
+            table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
     def clear(self):
         """Clear all statistics."""
@@ -199,12 +213,32 @@ class InfoPanel(QGroupBox):
         self.computed_table.setShowGrid(True)
         bottom_layout.addWidget(self.computed_table)
 
-        splitter.addWidget(bottom_widget)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
-
-        main_layout.addWidget(splitter)
+        main_layout.addWidget(self.info_table)
+        main_layout.addWidget(self.computed_label)
+        main_layout.addWidget(self.computed_table)
+        
+        # Disable internal scrollbars
+        self.info_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.computed_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        
         self.setLayout(main_layout)
+
+    def _adjust_table_height(self, table: QTableWidget, max_height: int = 400):
+        """Dynamically adjust table height to fit contents."""
+        table.doItemsLayout()
+        height = table.horizontalHeader().height()
+        for i in range(table.rowCount()):
+            height += table.rowHeight(i)
+        height += 5
+        
+        clamped_height = max(60, min(height, max_height))
+        table.setFixedHeight(clamped_height)
+        
+        if height > max_height:
+            table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        else:
+            table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
 
     def update_info(self, type_str: str, dim: tuple, spacing: tuple, metadata: dict):
         """Update with new data including computed scientific metrics."""
@@ -235,6 +269,10 @@ class InfoPanel(QGroupBox):
         for row, (prop, val) in enumerate(basic_data):
             self.info_table.setItem(row, 0, QTableWidgetItem(prop))
             self.info_table.setItem(row, 1, QTableWidgetItem(val))
+            
+        self._adjust_table_height(self.info_table, max_height=300)
+
+
 
         # Computed Metrics
         computed = []
@@ -278,3 +316,7 @@ class InfoPanel(QGroupBox):
         for row, (metric, val) in enumerate(computed):
             self.computed_table.setItem(row, 0, QTableWidgetItem(metric))
             self.computed_table.setItem(row, 1, QTableWidgetItem(val))
+            
+        self._adjust_table_height(self.computed_table, max_height=400)
+
+

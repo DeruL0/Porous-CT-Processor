@@ -13,13 +13,17 @@ class TimeseriesHandler(QObject):
     Manages loading, tracking, and visualization of time-series data.
     """
     
+
     def __init__(self, main_controller):
         super().__init__()
         self.controller = main_controller
         self.visualizer = main_controller.visualizer
         self.panel = main_controller.panel
-        self.timeseries_panel = main_controller.timeseries_panel
+        self.control_panel = main_controller.timeseries_control
+        self.analysis_panel = main_controller.tracking_analysis
+        self.stats_panel = main_controller.stats_panel
         self.data_manager = main_controller.data_manager
+
         
         # State
         self._volumes: List[VolumeData] = []
@@ -34,8 +38,9 @@ class TimeseriesHandler(QObject):
     def has_volumes(self) -> bool:
         return bool(self._volumes)
 
-    def load_series(self):
+    def load_series(self, strategy=None):
         """Load 4D CT series workflow."""
+        from loaders import SmartDicomLoader
         folder = QFileDialog.getExistingDirectory(
             self.visualizer, 
             "Select 4D CT Parent Folder (containing t0, t1, t2... subfolders)"
@@ -43,8 +48,12 @@ class TimeseriesHandler(QObject):
         if not folder:
             return
         
-        sort_mode = self.panel.get_sort_mode()
-        loader = TimeSeriesDicomLoader()
+        sort_mode = self.panel.sort_combo.currentText().lower()
+        
+        # Use existing loaders by passing a SmartDicomLoader with desired strategy
+        inner_loader = SmartDicomLoader(strategy=strategy)
+        loader = TimeSeriesDicomLoader(loader=inner_loader)
+        
         manual_order = None
         
         # Manual sorting dialog
@@ -82,8 +91,7 @@ class TimeseriesHandler(QObject):
                 "4D CT Loaded", 
                 f"Loaded {len(self._volumes)} timepoints.\n"
                 f"Sorting: {sort_mode.title()}\n"
-                f"Use timeline slider to navigate volumes.\n"
-                f"Use 'Track 4D Pores' to generate PNM and track changes."
+                f"Use timeline slider (left) to navigate volumes."
             )
             self.visualizer.update_status(f"4D CT: {len(self._volumes)} timepoints loaded.")
             
@@ -99,10 +107,15 @@ class TimeseriesHandler(QObject):
         self.data_manager.load_raw_data(first_vol)
         self.visualizer.set_data(first_vol)
         self.panel.set_threshold(-300)
+        self.stats_panel.update_statistics(first_vol.metadata)
+
         
-        # Setup timeline
+        # Setup timeline (left side)
         names = [v.metadata.get('folder_name', f't={i}') for i, v in enumerate(self._volumes)]
-        self.timeseries_panel.set_volume_only_mode(len(self._volumes), folder_names=names)
+        self.control_panel.set_range(len(self._volumes), folder_names=names)
+        
+        # Reset analysis (right side)
+        self.analysis_panel.reset()
         
         # Reset tracking state
         self._pnm_result = None
@@ -149,10 +162,12 @@ class TimeseriesHandler(QObject):
             
             # Update UI
             progress.setValue(95)
-            self.timeseries_panel.set_time_series(self._pnm_result)
+            self.analysis_panel.set_time_series(self._pnm_result)
             self.visualizer.set_data(self._reference_mesh)
+            self.stats_panel.update_statistics(self._reference_mesh.metadata)
             
             self._show_tracking_summary()
+
             
         except Exception as e:
             self.controller._show_err("4D CT Tracking Error", e)
@@ -163,30 +178,33 @@ class TimeseriesHandler(QObject):
         """Handle timepoint change request."""
         if not self._volumes or index >= len(self._volumes):
             return
+        
+        # Update analysis panel view
+        self.analysis_panel.set_timepoint(index)
             
         # If we have a full tracking result, show PNM mesh
         if self._reference_mesh and self._pnm_result:
-            if index == 0:
-                self.visualizer.set_data(self._reference_mesh, reset_camera=False)
-            else:
-                # Find current snapshot if available
-                current_snapshot = None
-                if index < len(self._pnm_result.snapshots):
-                    current_snapshot = self._pnm_result.snapshots[index]
-                    
-                mesh = self._sphere_processor.create_time_varying_mesh(
-                    self._reference_mesh,
-                    self._reference_snapshot,
-                    self._pnm_result.tracking,
-                    index,
-                    current_snapshot=current_snapshot
-                )
-                self.visualizer.set_data(mesh, reset_camera=False)
+            # Find current snapshot if available
+            current_snapshot = None
+            if index < len(self._pnm_result.snapshots):
+                current_snapshot = self._pnm_result.snapshots[index]
+                
+            mesh = self._sphere_processor.create_time_varying_mesh(
+                self._reference_mesh,
+                self._reference_snapshot,
+                self._pnm_result.tracking,
+                index,
+                current_snapshot=current_snapshot
+            )
+            self.visualizer.set_data(mesh, reset_camera=False)
+            self.stats_panel.update_statistics(mesh.metadata)
             self.visualizer.update_status(f"Viewing PNM at t={index} (connectivity from t=0)")
         else:
             # Otherwise just show raw volume
             self.visualizer.set_data(self._volumes[index], reset_camera=False)
+            self.stats_panel.update_statistics(self._volumes[index].metadata)
             self.visualizer.update_status(f"Viewing volume at t={index}")
+
 
     def _show_tracking_summary(self):
         summary = self._pnm_result.get_summary()
@@ -196,6 +214,7 @@ class TimeseriesHandler(QObject):
             f"• Active pores: {summary['active_pores']}\n"
             f"• Compressed pores: {summary['compressed_pores']}\n"
             f"• Avg. volume retention: {summary['avg_volume_retention']:.1%}\n\n"
-            f"Connectivity is preserved from t=0.\n"
-            f"Use the timeline to view size changes over time."
+            f"Use the timeline (left) to navigate time steps.\n"
+            f"Use the analysis table (right) to see pore details."
         )
+

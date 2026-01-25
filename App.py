@@ -13,7 +13,7 @@ from exporters import VTKExporter
 
 # Import View and UI Components
 from gui import MainWindow, StructureProcessingPanel, StatisticsPanel
-from gui.panels import TimeSeriesPanel
+from gui.panels import TimeSeriesControlPanel, TrackingAnalysisPanel
 
 # Import Handlers
 from gui.handlers.timeseries_handler import TimeseriesHandler
@@ -49,26 +49,34 @@ class AppController:
         # 5. Connect Handler Signals
         self._connect_signals()
 
+
     def _setup_workflow_ui(self):
         self.panel = StructureProcessingPanel()
 
         # Add to left side (controls)
         self.visualizer.add_custom_panel(self.panel, index=1, side='left')
         
+        # Add Time Series Control to left side
+        from gui.panels import TimeSeriesControlPanel, TrackingAnalysisPanel
+        self.timeseries_control = TimeSeriesControlPanel()
+        self.visualizer.add_custom_panel(self.timeseries_control, index=2, side='left')
+
         # Add Statistics Panel to right side (info)
         self.stats_panel = StatisticsPanel()
         self.visualizer.add_custom_panel(self.stats_panel, index=1, side='right')
         
-        # Add Time Series Panel to right side
-        self.timeseries_panel = TimeSeriesPanel()
-        self.visualizer.add_custom_panel(self.timeseries_panel, index=2, side='right')
+        # Add Tracking Analysis Panel to right side
+        self.tracking_analysis = TrackingAnalysisPanel()
+        self.visualizer.add_custom_panel(self.tracking_analysis, index=2, side='right')
 
         # GPU Control
+
         from core.gpu_backend import get_gpu_backend
         self.panel.gpu_toggled.connect(lambda checked: get_gpu_backend().set_enabled(checked))
         
         self.panel.export_clicked.connect(self._export_vtk_dialog)
         self.panel.reset_clicked.connect(self._reset_to_original)
+
 
     def _connect_signals(self):
         """Connect UI signals to handlers."""
@@ -82,9 +90,10 @@ class AppController:
         self.panel.auto_threshold_clicked.connect(self.workflow_handler.auto_detect_threshold)
         
         # 4D CT Signals
-        self.panel.load_4dct_clicked.connect(self.timeseries_handler.load_series)
-        self.panel.track_4dct_clicked.connect(self.timeseries_handler.track_pores)
-        self.timeseries_panel.timepoint_changed.connect(self.timeseries_handler.set_timepoint)
+
+        self.timeseries_control.timepoint_changed.connect(self.timeseries_handler.set_timepoint)
+
+
 
     # ==========================================
     # Helper Components (Shared by Handlers)
@@ -140,6 +149,11 @@ class AppController:
 
     def _process_spheres(self):
         """Generate Pore Network Model from current data."""
+        # Automate 4D tracking if series is loaded
+        if self.timeseries_handler.has_volumes:
+            self.timeseries_handler.track_pores()
+            return
+            
         processor = PoreToSphereProcessor()
         
         def on_complete(pnm_data):
@@ -157,6 +171,7 @@ class AppController:
             self._show_msg("Model Generated", msg)
 
         self.workflow_handler.run_processor_async(processor, on_complete)
+
 
     def _reset_to_original(self):
         """Reset to original raw data."""

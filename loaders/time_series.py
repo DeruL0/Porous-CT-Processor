@@ -36,8 +36,10 @@ class TimeSeriesDicomLoader:
     - manual: User selects order in dialog
     """
     
-    def __init__(self):
-        self._loader = SmartDicomLoader()
+
+    def __init__(self, loader: Optional[SmartDicomLoader] = None):
+        self._loader = loader or SmartDicomLoader()
+
     
     def load_series(self, 
                    parent_folder: str,

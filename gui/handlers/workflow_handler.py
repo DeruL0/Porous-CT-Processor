@@ -55,17 +55,25 @@ class WorkflowHandler(QObject):
         self.worker = None
         self.progress_dialog = None
 
+
     def load_dicom_dialog(self):
         """Load DICOM with full resolution."""
-        folder = QFileDialog.getExistingDirectory(self.visualizer, "Select Scan Series Folder")
-        if folder:
-            self._load_data(folder, strategy=None)
+        if self.panel.load_4d_check.isChecked():
+            self.controller.timeseries_handler.load_series(strategy=LoadStrategy.FULL)
+        else:
+            folder = QFileDialog.getExistingDirectory(self.visualizer, "Select Scan Series Folder")
+            if folder:
+                self._load_data(folder, strategy=None)
 
     def fast_load_dicom_dialog(self):
         """Load DICOM with fast/preview mode."""
-        folder = QFileDialog.getExistingDirectory(self.visualizer, "Select Scan Series Folder (Fast)")
-        if folder:
-            self._load_data(folder, strategy=LoadStrategy.FAST)
+        if self.panel.load_4d_check.isChecked():
+            self.controller.timeseries_handler.load_series(strategy=LoadStrategy.FAST)
+        else:
+            folder = QFileDialog.getExistingDirectory(self.visualizer, "Select Scan Series Folder (Fast)")
+            if folder:
+                self._load_data(folder, strategy=LoadStrategy.FAST)
+
 
     def load_dummy_data(self):
         """Generate and load synthetic sample data."""

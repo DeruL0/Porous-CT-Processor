@@ -38,29 +38,26 @@ class StructureProcessingPanel(QGroupBox):
         title_lbl.setStyleSheet(PANEL_TITLE_STYLE)
         layout.addWidget(title_lbl)
         
-        # === 4D CT Section (TOP) ===
-        layout.addWidget(QLabel("─── 4D CT Analysis ───"))
-        self._add_button(layout, "📁 Load 4D CT Series", self.load_4dct_clicked, min_height=35)
+
+        # === Data Loading Section ===
+        layout.addWidget(QLabel("─── Data Loading ───"))
         
-        # Sorting mode selection
-        from PyQt5.QtWidgets import QComboBox
-        sort_layout = QHBoxLayout()
-        sort_lbl = QLabel("Order:")
+        # 4D CT Toggle + Order
+        from PyQt5.QtWidgets import QCheckBox, QComboBox
+        load_opt_layout = QHBoxLayout()
+        self.load_4d_check = QCheckBox("Load as 4D Series")
+        self.load_4d_check.setToolTip("If checked, Load buttons will ask for a folder containing timepoint subfolders")
+        
         self.sort_combo = QComboBox()
         self.sort_combo.addItems(["Alphabetical", "Numeric", "Date Modified", "Manual"])
-        self.sort_combo.setToolTip(
-            "Alphabetical: Sort by folder name A-Z\n"
-            "Numeric: Extract numbers from names (t1, t2, t10...)\n"
-            "Date Modified: Sort by file modification time\n"
-            "Manual: Select and reorder in dialog"
-        )
-        sort_layout.addWidget(sort_lbl)
-        sort_layout.addWidget(self.sort_combo, stretch=1)
-        layout.addLayout(sort_layout)
-        layout.addSpacing(10)
+        self.sort_combo.setToolTip("Sorting order for 4D timepoints")
+        self.sort_combo.setEnabled(False)
+        self.load_4d_check.toggled.connect(self.sort_combo.setEnabled)
         
-        # === Data Loading Section ===
-        layout.addWidget(QLabel("─── Single Volume ───"))
+        load_opt_layout.addWidget(self.load_4d_check)
+        load_opt_layout.addWidget(self.sort_combo, stretch=1)
+        layout.addLayout(load_opt_layout)
+        
         self._add_button(layout, "📂 Load DICOM Series", self.load_clicked)
         self._add_button(layout, "⚡ Fast Load (2x Downsample)", self.fast_load_clicked)
         self._add_button(layout, "🧪 Generate Synthetic Sample", self.dummy_clicked)
@@ -122,12 +119,13 @@ class StructureProcessingPanel(QGroupBox):
         layout.addSpacing(5)
         self._add_button(layout, "🔬 Extract Pores", self.extract_pores_clicked)
         self._add_button(layout, "🌐 Generate PNM Model", self.pnm_clicked)
-        self._add_button(layout, "🔄 Track 4D Pores", self.track_4dct_clicked, min_height=35)
+
         
         # Reset Section
         layout.addSpacing(10)
         self._add_button(layout, "↩ Reset to Original", self.reset_clicked, min_height=35)
         self._add_button(layout, "💾 Export VTK", self.export_clicked, min_height=35)
+
         
         self.setLayout(layout)
     

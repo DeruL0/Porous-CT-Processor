@@ -545,87 +545,9 @@ class PoreToSphereProcessor(BaseProcessor):
     def _create_empty_result(self, data: VolumeData) -> VolumeData:
         return VolumeData(metadata={"Type": "Empty", "PoreCount": 0})
 
-        # Calculate new radii and positions based on volume/tracking changes
-        new_radii = np.zeros_like(ref_radii, dtype=np.float64)
-        new_centers = np.copy(ref_centers)
-        
-        # Get mapping for this timepoint if available (to find current positions)
-        # Note: tracking_result might need to store displacements or positions in future updates.
-        # For now, we will rely on finding the current snapshot if we want positions.
-        # However, checking only volume history doesn't give us position.
-        # We need to access the stored snapshots in the TimeSeriesPNM object if possible,
-        # or just accept that this simple method uses reference positions.
-        
-        # IMPROVEMENT: If we have displacement data or can access the current snapshot's centers
-        # We can update positions. 
-        # But `tracking_result` only has histories.
-        # Let's see if we can infer position from the snapshot (passed in ref, but we need current snapshot).
-        # Since we don't have easy access to all snapshots here (only result + ref mesh),
-        # we will strictly handle volume scaling as requested, 
-        # BUT the USER asked to update position too.
-        # To support position updates, we need the CURRENT snapshot passed in, or looked up.
-        
-        # Assuming the caller might not pass the full TimeSeries object, we can't easily get new centroids
-        # purely from `tracking_result` (which is just CSV-like history).
-        # We'll stick to the current logic for now unless we change the signature.
-        
-        # RE-READING USER REQUEST: "优化追踪pnm的算法，其会随着原模型的压缩，改变位置和大小，但不会改变连通性"
-        # It MUST change position.
-        # I need to update how `create_time_varying_mesh` works or how it's called.
-        # I will update this method to optionally accept `current_snapshot` or `current_centers`.
-        
-        # Actually, looking at `TimeseriesHandler.set_timepoint`, it calls this method.
-        # And `TimeseriesHandler` HAS `_pnm_result` which is a `TimeSeriesPNM` object.
-        # `TimeSeriesPNM` has `.snapshots` list!
-        # So I should change the signature to accept `TimeSeriesPNM` or `current_snapshot`.
-        
-        # But `tracking_result` passed in IS `PoreTrackingResult` (just history).
-        # The caller code: `self._pnm_result.tracking` passed as 3rd arg.
-        # `self._pnm_result` is `TimeSeriesPNM`.
-        
-        # Let's check `create_time_varying_mesh` signature again.
-        # It takes `tracking_result`.
-        
-        # We can't get positions from `PoreTrackingResult`.
-        # I will defer the "position update" to a second edit if I need to change signature.
-        # Wait, the user said "optimize the algorithm".
-        # This implies modifying the logic here.
-        
-        # Let's assume we can get positions if we passed the full `TimeSeriesPNM` object.
-        # But I'm only editing this file.
-        
-        # Let's update `create_time_varying_mesh` to TRY to find positions if available.
-        # OR better: Assume we only scale size for now as per current signature.
-        
-        # WAIT! I can see `ref_centers` is used.
-        # If I want to update positions, I need the positions at `timepoint`.
-        
-        # Proposal:
-        # Update `create_time_varying_mesh` to use `current_centers` if provided.
-        # But that requires changing the caller.
-        
-        # Actually, let's look at `create_time_varying_mesh`.
-        # The user wants Position AND Size changes.
-        
-        # I will modify the loop to update `new_centers` as well.
-        # BUT I need the data source.
-        
-        # Let's look at `Processors` again.
-        # `PNMSnapshot` (which we have in the handler) has `pore_centers`.
-        # The Handler has access to `_pnm_result.snapshots[timepoint]`.
-        
-        # So the plan is:
-        # 1. Modify `create_time_varying_mesh` to accept `current_snapshot` argument (Optional).
-        # 2. If `current_snapshot` is present, use its centers for matched pores.
-        # 3. Update Handler to pass this snapshot.
-        
-        # Let's implement the `current_snapshot` logic here first.
-        
-        pass 
-        
-    # Redefine the method signature in the replacement content to include `current_snapshot`
     def create_time_varying_mesh(self, 
-                                  reference_mesh: VolumeData,
+                               reference_mesh: VolumeData,
+
                                   reference_snapshot,
                                   tracking_result,
                                   timepoint: int,
@@ -692,6 +614,7 @@ class PoreToSphereProcessor(BaseProcessor):
             else:
                 new_radii[i] = ref_radii[i]
                 
+    
             # 2. Update Position
             # We need to know which ID in the current snapshot corresponds to this reference pore_id
             if current_snapshot:
@@ -703,25 +626,23 @@ class PoreToSphereProcessor(BaseProcessor):
                     new_centers[i] = current_center_map[matched_id]
         
         # Create new sphere mesh with updated radii AND positions
+
         pores_mesh = self._create_pores_mesh(new_centers, new_radii, ref_ids)
         
-        # Copy the throat mesh from the reference (connectivity unchanged)
-        # Extract original meshes
-        ref_mesh = reference_mesh.mesh
+        # Regenerate Throat Mesh using new centers (connectivity remains unchanged)
+        # reference_snapshot.connections stores (id_a, id_b)
+        connections = reference_snapshot.connections
         
-        # Try to extract throat portion by filtering IsPore == 0
-        if "IsPore" in ref_mesh.point_data:
-            # Create new combined mesh
-            throat_mask = ref_mesh.point_data["IsPore"] == 0
-            if np.any(throat_mask):
-                # Keep throat geometry from reference
-                throat_points = ref_mesh.points[throat_mask]
-                throat_mesh_portion = ref_mesh.extract_points(throat_mask)
-                combined_mesh = pores_mesh.merge(throat_mesh_portion)
-            else:
-                combined_mesh = pores_mesh
-        else:
-            combined_mesh = pores_mesh
+        # Create new throat mesh
+        # We don't use distance_map or segmented_regions here to keep it fast and 
+        # because the connectivity is strictly from the reference frame.
+        throats_mesh, throat_radii = create_throat_mesh(
+            connections, new_centers, new_radii, ref_ids,
+            distance_map=None, segmented_regions=None, spacing=reference_mesh.spacing
+        )
+        
+        # Combine
+        combined_mesh = pores_mesh.merge(throats_mesh)
         
         # Calculate stats for this timepoint
         active_count = sum(1 for pid in ref_ids 
@@ -729,6 +650,19 @@ class PoreToSphereProcessor(BaseProcessor):
                          timepoint < len(tracking_result.status_history[pid]) and
                          tracking_result.status_history[pid][timepoint].value == 'active')
         
+        # Calculate distributions for dynamic histograms
+        pore_dist = self._calculate_size_distribution(new_radii)
+        throat_dist = self._calculate_size_distribution(throat_radii)
+        
+        # Calculate throat stats
+        throat_stats = {}
+        if len(throat_radii) > 0:
+            throat_stats = {
+                'min': float(np.min(throat_radii)),
+                'max': float(np.max(throat_radii)),
+                'mean': float(np.mean(throat_radii))
+            }
+
         return VolumeData(
             raw_data=None,
             mesh=combined_mesh,
@@ -740,6 +674,11 @@ class PoreToSphereProcessor(BaseProcessor):
                 "ActivePores": active_count,
                 "CompressedPores": len(ref_ids) - active_count,
                 "Timepoint": timepoint,
-                "ConnectionCount": reference_mesh.metadata.get("ConnectionCount", 0)
+                "ConnectionCount": len(connections),
+                "PoreSizeDistribution": pore_dist,
+                "ThroatSizeDistribution": throat_dist,
+                "ThroatStats": throat_stats,
+                "LargestPoreRatio": reference_mesh.metadata.get("LargestPoreRatio", "N/A")
             }
         )
+
