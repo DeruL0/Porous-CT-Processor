@@ -219,10 +219,18 @@ class RenderEngine:
             return
         
         # Save camera state before clearing (for smooth time step transitions)
-        saved_camera = None
-        if not reset_view:
+        saved_camera_position = None
+        saved_camera_focal_point = None
+        saved_camera_view_up = None
+        saved_camera_view_angle = None
+        
+        if not reset_view and self.active_view_mode == 'mesh':
             try:
-                saved_camera = self.plotter.camera.copy()
+                # Save detailed camera state
+                saved_camera_position = self.plotter.camera.position
+                saved_camera_focal_point = self.plotter.camera.focal_point
+                saved_camera_view_up = self.plotter.camera.up
+                saved_camera_view_angle = self.plotter.camera.view_angle
             except Exception:
                 pass
             
@@ -264,10 +272,13 @@ class RenderEngine:
 
         if reset_view:
             self.reset_camera()
-        elif saved_camera:
-            # Restore previous camera state
+        elif saved_camera_position is not None:
+            # Restore previous camera state with detailed parameters
             try:
-                self.plotter.camera = saved_camera
+                self.plotter.camera.position = saved_camera_position
+                self.plotter.camera.focal_point = saved_camera_focal_point
+                self.plotter.camera.up = saved_camera_view_up
+                self.plotter.camera.view_angle = saved_camera_view_angle
                 self.plotter.render()
             except Exception:
                 pass
@@ -279,6 +290,22 @@ class RenderEngine:
         """
         if not self.grid:
             return
+
+        # Save camera state before potential view change
+        saved_camera_position = None
+        saved_camera_focal_point = None
+        saved_camera_view_up = None
+        saved_camera_view_angle = None
+        
+        if not reset_view and self.active_view_mode in ['volume', 'mesh', 'slices', 'iso']:
+            try:
+                # Save detailed camera state
+                saved_camera_position = self.plotter.camera.position
+                saved_camera_focal_point = self.plotter.camera.focal_point
+                saved_camera_view_up = self.plotter.camera.up
+                saved_camera_view_angle = self.plotter.camera.view_angle
+            except Exception:
+                pass
 
         if reset_view or self.active_view_mode != 'volume' or self.volume_actor is None:
             self.update_status("Rendering volume (New)...")
@@ -314,6 +341,16 @@ class RenderEngine:
             self.plotter.add_axes()
             if reset_view:
                 self.reset_camera()
+            elif saved_camera_position is not None:
+                # Restore previous camera state when switching from other modes
+                try:
+                    self.plotter.camera.position = saved_camera_position
+                    self.plotter.camera.focal_point = saved_camera_focal_point
+                    self.plotter.camera.up = saved_camera_view_up
+                    self.plotter.camera.view_angle = saved_camera_view_angle
+                    self.plotter.render()
+                except Exception:
+                    pass
         else:
             # Fast update without clearing
             self.update_status("Updating volume properties...")
@@ -344,6 +381,22 @@ class RenderEngine:
         if not self.grid:
             return
 
+        # Save camera state before potential view change
+        saved_camera_position = None
+        saved_camera_focal_point = None
+        saved_camera_view_up = None
+        saved_camera_view_angle = None
+        
+        if not reset_view and self.active_view_mode in ['volume', 'mesh', 'slices', 'iso']:
+            try:
+                # Save detailed camera state
+                saved_camera_position = self.plotter.camera.position
+                saved_camera_focal_point = self.plotter.camera.focal_point
+                saved_camera_view_up = self.plotter.camera.up
+                saved_camera_view_angle = self.plotter.camera.view_angle
+            except Exception:
+                pass
+
         if reset_view or self.active_view_mode != 'slices':
             self.clear_view()
             self.active_view_mode = 'slices'
@@ -371,11 +424,37 @@ class RenderEngine:
         self.plotter.add_axes()
         if reset_view:
             self.reset_camera()
+        elif saved_camera_position is not None:
+            # Restore previous camera state when switching from other modes
+            try:
+                self.plotter.camera.position = saved_camera_position
+                self.plotter.camera.focal_point = saved_camera_focal_point
+                self.plotter.camera.up = saved_camera_view_up
+                self.plotter.camera.view_angle = saved_camera_view_angle
+                self.plotter.render()
+            except Exception:
+                pass
 
     def render_isosurface(self, threshold=300, reset_view=True):
         """Render isosurface at specified threshold using optimized VTK algorithm."""
         if not self.grid:
             return
+
+        # Save camera state before potential view change
+        saved_camera_position = None
+        saved_camera_focal_point = None
+        saved_camera_view_up = None
+        saved_camera_view_angle = None
+        
+        if not reset_view and self.active_view_mode in ['volume', 'mesh', 'slices', 'iso']:
+            try:
+                # Save detailed camera state
+                saved_camera_position = self.plotter.camera.position
+                saved_camera_focal_point = self.plotter.camera.focal_point
+                saved_camera_view_up = self.plotter.camera.up
+                saved_camera_view_angle = self.plotter.camera.view_angle
+            except Exception:
+                pass
 
         self.update_status(f"Generating isosurface ({threshold})...")
         self.clear_view()
@@ -455,6 +534,16 @@ class RenderEngine:
             self.plotter.add_axes()
             if reset_view:
                 self.reset_camera()
+            elif saved_camera_position is not None:
+                # Restore previous camera state when switching from other modes
+                try:
+                    self.plotter.camera.position = saved_camera_position
+                    self.plotter.camera.focal_point = saved_camera_focal_point
+                    self.plotter.camera.up = saved_camera_view_up
+                    self.plotter.camera.view_angle = saved_camera_view_angle
+                    self.plotter.render()
+                except Exception:
+                    pass
         except Exception as e:
             print(f"Isosurface error: {e}")
 

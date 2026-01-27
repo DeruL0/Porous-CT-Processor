@@ -117,3 +117,13 @@ TRACKING_IOU_THRESHOLD = 0.1           # Min IoU to consider pores matched
 TRACKING_COMPRESSION_THRESHOLD = 0.01  # Volume ratio below which pore is "compressed"
 TRACKING_ANIMATION_FPS = 5             # Animation playback speed
 
+# Tracking algorithm options
+TRACKING_USE_GPU = True                # Use GPU acceleration for tracking (requires CuPy)
+TRACKING_USE_BATCH = True              # Use batch IoU calculation (faster for many pores)
+TRACKING_USE_HUNGARIAN = False         # Use Hungarian algorithm for global optimal matching
+TRACKING_BATCH_SIZE = 1000             # Max pores to process in one batch (memory vs speed)
+TRACKING_GPU_MIN_PORES = 100           # Min pores to use GPU (smaller uses CPU)
+
+# Topology preservation
+TRACKING_PRESERVE_TOPOLOGY = True      # Keep reference connectivity (t=0) for all timepoints
+

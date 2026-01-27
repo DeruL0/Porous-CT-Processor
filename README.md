@@ -57,7 +57,13 @@ Porous/
 * **Void Extraction**: Segment air/void voxels using intensity thresholding.
 * **Pore Network Modeling (PNM)**: Watershed segmentation (Ball-and-Stick model).
 * **4D Tracking**: Track individual pores across time steps to analyze evolution.
-* **GPU Acceleration**: (Experimental) CuPy-based acceleration for heavy operations.
+  - **Optimized Algorithms**: Batch IoU calculation (3-5x faster), GPU acceleration (5-10x for 500+ pores)
+  - **Automatic Selection**: Chooses best algorithm based on dataset size and hardware
+  - **Hungarian Matching**: Optional global optimal assignment for complex scenarios
+* **Smart Caching**: 
+  - PNM results are cached after generation, avoiding regeneration when switching views.
+  - Extracted pores are cached per timepoint for instant navigation in 4D series.
+* **GPU Acceleration**: CuPy-based acceleration for tracking, watershed, and EDT operations.
 
 ### Data IO
 

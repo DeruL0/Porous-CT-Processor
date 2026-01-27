@@ -1,11 +1,12 @@
-from typing import List, Optional
+from typing import List, Optional, Dict
 from PyQt5.QtWidgets import QFileDialog, QMessageBox
 from PyQt5.QtCore import QObject
 
 from core import VolumeData
 from loaders import TimeSeriesDicomLoader
 from loaders.time_series import TimeSeriesOrderDialog
-from processors import PNMTracker, PoreToSphereProcessor
+from processors import PNMTracker, PoreToSphereProcessor, PoreExtractionProcessor
+from data import get_timeseries_pnm_cache
 
 class TimeseriesHandler(QObject):
     """
@@ -30,9 +31,15 @@ class TimeseriesHandler(QObject):
         self._pnm_result = None
         self._reference_mesh = None    # t=0 PNM mesh
         self._reference_snapshot = None # t=0 PNM snapshot
+        self._current_cache_key = None  # Current cache key for PNM data
+        self._pores_cache: Dict[int, VolumeData] = {}  # Cache for extracted pores at each timepoint
         
         # Helper processor for on-demand mesh generation
         self._sphere_processor = PoreToSphereProcessor()
+        self._pore_processor = PoreExtractionProcessor()
+        
+        # Cache manager
+        self._pnm_cache = get_timeseries_pnm_cache()
 
     @property
     def has_volumes(self) -> bool:
@@ -47,6 +54,12 @@ class TimeseriesHandler(QObject):
         )
         if not folder:
             return
+        
+        # Clear old PNM cache when loading new series
+        if self._current_cache_key:
+            print("[TimeseriesHandler] Clearing old PNM cache before loading new series")
+            # Keep the cache for potential reuse if user switches back
+            # Only clear if it's a different dataset
         
         sort_mode = self.panel.sort_combo.currentText().lower()
         
@@ -121,6 +134,8 @@ class TimeseriesHandler(QObject):
         self._pnm_result = None
         self._reference_mesh = None
         self._reference_snapshot = None
+        self._current_cache_key = None
+        self._pores_cache.clear()  # Clear pores cache when loading new series
 
     def track_pores(self):
         """Execute pore tracking workflow."""
@@ -130,6 +145,26 @@ class TimeseriesHandler(QObject):
             return
         
         thresh = self.panel.get_threshold()
+        
+        # Generate cache key for this configuration
+        cache_key = self._pnm_cache.generate_key(self._volumes, thresh)
+        
+        # Check if we have cached results
+        cached_data = self._pnm_cache.get(cache_key)
+        if cached_data:
+            self._pnm_result, self._reference_mesh, self._reference_snapshot = cached_data
+            self._current_cache_key = cache_key
+            
+            # Update UI
+            self.analysis_panel.set_time_series(self._pnm_result)
+            self.visualizer.set_data(self._reference_mesh)
+            self.stats_panel.update_statistics(self._reference_mesh.metadata)
+            
+            self._show_tracking_summary()
+            self.visualizer.update_status("4D CT PNM loaded from cache.")
+            return
+        
+        # No cache, proceed with tracking
         progress = self.controller._create_progress_dialog("Tracking pores across timepoints...")
         
         try:
@@ -144,12 +179,20 @@ class TimeseriesHandler(QObject):
                 
                 if progress.wasCanceled(): raise InterruptedError()
                 
-                snapshot = self._sphere_processor.extract_snapshot(volume, threshold=thresh, time_index=i)
+                # Only compute connectivity for t=0 (reference frame)
+                # Subsequent frames inherit connectivity from reference
+                compute_connections = (i == 0)
+                snapshot = self._sphere_processor.extract_snapshot(
+                    volume, threshold=thresh, time_index=i, 
+                    compute_connectivity=compute_connections
+                )
                 
                 if i == 0:
                     tracker.set_reference(snapshot)
                     self._reference_snapshot = snapshot
                 else:
+                    # Inherit connections from reference
+                    snapshot.connections = self._reference_snapshot.connections
                     tracker.track_snapshot(snapshot)
             
             # Phase 2: Reference Mesh
@@ -159,6 +202,15 @@ class TimeseriesHandler(QObject):
             
             self._reference_mesh = self._sphere_processor.process(self._volumes[0], threshold=thresh)
             self._pnm_result = tracker.get_results()
+            
+            # Store in cache
+            progress.setValue(90)
+            progress.setLabelText("Caching PNM results...")
+            self.controller.app.processEvents()
+            
+            self._pnm_cache.store(cache_key, self._pnm_result, 
+                                 self._reference_mesh, self._reference_snapshot)
+            self._current_cache_key = cache_key
             
             # Update UI
             progress.setValue(95)
@@ -181,9 +233,12 @@ class TimeseriesHandler(QObject):
         
         # Update analysis panel view
         self.analysis_panel.set_timepoint(index)
-            
-        # If we have a full tracking result, show PNM mesh
-        if self._reference_mesh and self._pnm_result:
+        
+        # Check current view mode to maintain user's preference
+        current_mode = self.visualizer.active_view_mode
+        
+        # If user is currently viewing PNM mesh and we have tracking data, update PNM view
+        if current_mode == 'mesh' and self._reference_mesh and self._pnm_result:
             # Find current snapshot if available
             current_snapshot = None
             if index < len(self._pnm_result.snapshots):
@@ -199,8 +254,38 @@ class TimeseriesHandler(QObject):
             self.visualizer.set_data(mesh, reset_camera=False)
             self.stats_panel.update_statistics(mesh.metadata)
             self.visualizer.update_status(f"Viewing PNM at t={index} (connectivity from t=0)")
+        
+        # If user is viewing extracted pores (segmented data), show pores for this timepoint
+        elif current_mode in ['volume', 'slices', 'iso'] and self.data_manager.has_segmented():
+            # Check if we have cached pores for this timepoint
+            if index in self._pores_cache:
+                pores_data = self._pores_cache[index]
+                self.visualizer.set_data(pores_data, reset_camera=False)
+                self.stats_panel.update_statistics(pores_data.metadata)
+                self.visualizer.update_status(f"Viewing pores at t={index} (cached)")
+            else:
+                # Extract pores for this timepoint
+                thresh = self.panel.get_threshold()
+                try:
+                    pores_data = self._pore_processor.process(
+                        self._volumes[index], 
+                        threshold=thresh
+                    )
+                    # Cache the result
+                    self._pores_cache[index] = pores_data
+                    
+                    self.visualizer.set_data(pores_data, reset_camera=False)
+                    self.stats_panel.update_statistics(pores_data.metadata)
+                    self.visualizer.update_status(f"Viewing pores at t={index}")
+                except Exception as e:
+                    print(f"[TimeseriesHandler] Failed to extract pores for t={index}: {e}")
+                    # Fallback to raw volume
+                    self.visualizer.set_data(self._volumes[index], reset_camera=False)
+                    self.stats_panel.update_statistics(self._volumes[index].metadata)
+                    self.visualizer.update_status(f"Viewing volume at t={index}")
+        
         else:
-            # Otherwise just show raw volume
+            # Otherwise show raw volume (user is in volume/slices/iso mode without pores data)
             self.visualizer.set_data(self._volumes[index], reset_camera=False)
             self.stats_panel.update_statistics(self._volumes[index].metadata)
             self.visualizer.update_status(f"Viewing volume at t={index}")
@@ -218,3 +303,17 @@ class TimeseriesHandler(QObject):
             f"Use the analysis table (right) to see pore details."
         )
 
+    def cleanup(self):
+        """Clean up resources and cache when closing or switching datasets."""
+        # Note: We don't clear all cache here, as it might be useful for re-opening
+        # Only clear the current session's state
+        self._volumes.clear()
+        self._pnm_result = None
+        self._reference_mesh = None
+        self._reference_snapshot = None
+        self._current_cache_key = None
+        self._pores_cache.clear()
+        
+        # Optionally clear all PNM cache on explicit cleanup
+        # Uncomment if you want to clear cache on every cleanup:
+        # self._pnm_cache.clear()

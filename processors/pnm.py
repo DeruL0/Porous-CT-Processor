@@ -359,7 +359,8 @@ class PoreToSphereProcessor(BaseProcessor):
     def extract_snapshot(self, data: VolumeData, 
                         callback: Optional[Callable[[int, str], None]] = None,
                         threshold: int = -300,
-                        time_index: int = 0) -> 'PNMSnapshot':
+                        time_index: int = 0,
+                        compute_connectivity: bool = True) -> 'PNMSnapshot':
         """
         Extract a PNMSnapshot for 4D CT tracking.
         
@@ -372,6 +373,7 @@ class PoreToSphereProcessor(BaseProcessor):
             callback: Progress callback (percent, message)
             threshold: HU threshold for solid/void separation
             time_index: Time index for this snapshot
+            compute_connectivity: If False, skip connection computation (saves time for t>0)
             
         Returns:
             PNMSnapshot with pore data and segmented regions
@@ -415,11 +417,15 @@ class PoreToSphereProcessor(BaseProcessor):
             segmented_regions, num_pores, data.spacing, data.origin
         )
         
-        # Find connections
-        report(90, "Finding pore connections...")
-        connections = find_adjacency(segmented_regions)
-        
-        report(100, f"Snapshot extracted: {len(pore_ids)} pores, {len(connections)} connections")
+        # Find connections only for reference frame (t=0)
+        # For subsequent frames, connectivity is inherited from reference
+        if compute_connectivity:
+            report(90, "Finding pore connections...")
+            connections = find_adjacency(segmented_regions)
+            report(100, f"Snapshot extracted: {len(pore_ids)} pores, {len(connections)} connections")
+        else:
+            connections = []  # Will be filled from reference snapshot
+            report(100, f"Snapshot extracted: {len(pore_ids)} pores (connectivity from reference)")
         
         return PNMSnapshot(
             time_index=time_index,
