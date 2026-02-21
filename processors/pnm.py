@@ -444,7 +444,7 @@ class PoreToSphereProcessor(BaseProcessor):
             }
         )
 
-    def _create_pores_mesh(self, centers, radii, ids):
+    def _create_pores_mesh(self, centers, radii, ids, compression_ratios=None):
         """Create sphere glyphs for pore visualization."""
         if len(centers) == 0:
             return pv.PolyData()
@@ -453,6 +453,8 @@ class PoreToSphereProcessor(BaseProcessor):
         pore_cloud["radius"] = radii
         pore_cloud["IsPore"] = np.ones(len(centers), dtype=int)
         pore_cloud["ID"] = ids
+        if compression_ratios is not None:
+            pore_cloud["CompressionRatio"] = compression_ratios
 
         sphere_glyph = pv.Sphere(theta_resolution=10, phi_resolution=10)
         pores_mesh = pore_cloud.glyph(scale="radius", geom=sphere_glyph)
@@ -460,6 +462,16 @@ class PoreToSphereProcessor(BaseProcessor):
         n_pts_per_sphere = sphere_glyph.n_points
         pore_radius_scalars = np.repeat(radii, n_pts_per_sphere)
         pores_mesh["PoreRadius"] = pore_radius_scalars
+        
+        # Repeat ID scalars for each sphere vertex (needed for highlighting)
+        pore_id_scalars = np.repeat(ids, n_pts_per_sphere)
+        pores_mesh["ID"] = pore_id_scalars
+
+        if compression_ratios is not None:
+            comp_scalars = np.repeat(compression_ratios, n_pts_per_sphere)
+            pores_mesh["CompressionRatio"] = comp_scalars
+        else:
+            pores_mesh["CompressionRatio"] = np.ones(len(pores_mesh.points))
         
         return pores_mesh
 
@@ -551,13 +563,12 @@ class PoreToSphereProcessor(BaseProcessor):
     def _create_empty_result(self, data: VolumeData) -> VolumeData:
         return VolumeData(metadata={"Type": "Empty", "PoreCount": 0})
 
-    def create_time_varying_mesh(self, 
-                               reference_mesh: VolumeData,
-
-                                  reference_snapshot,
-                                  tracking_result,
-                                  timepoint: int,
-                                  current_snapshot = None) -> VolumeData:
+    def create_time_varying_mesh(self,
+                                 reference_mesh: VolumeData,
+                                 reference_snapshot,
+                                 tracking_result,
+                                 timepoint: int,
+                                 current_snapshot=None) -> VolumeData:
         """
         Create a PNM mesh for a specific timepoint using the reference structure.
         
@@ -586,6 +597,7 @@ class PoreToSphereProcessor(BaseProcessor):
         # Calculate new radii and positions
         new_radii = np.zeros_like(ref_radii, dtype=np.float64)
         new_centers = np.copy(ref_centers) # Default to reference positions
+        compression_ratios = np.ones(len(ref_ids), dtype=np.float64)
         
         # Get ID mapping for this timepoint if available
         id_mapping = tracking_result.id_mapping.get(timepoint, {})
@@ -597,6 +609,8 @@ class PoreToSphereProcessor(BaseProcessor):
             current_pos = current_snapshot.pore_centers
             for i, pid in enumerate(current_ids):
                 current_center_map[int(pid)] = current_pos[i]
+
+        center_history = getattr(tracking_result, "center_history", None)
         
         for i, pore_id in enumerate(ref_ids):
             pore_id = int(pore_id)
@@ -613,27 +627,29 @@ class PoreToSphereProcessor(BaseProcessor):
             if ref_vol > 0 and current_vol > 0:
                 vol_ratio = current_vol / ref_vol
                 new_radii[i] = ref_radii[i] * (vol_ratio ** (1/3))
+                compression_ratios[i] = vol_ratio
             elif current_vol <= 0:
                 # Compressed pore: very small but visible
                 new_radii[i] = ref_radii[i] * 0.1
+                compression_ratios[i] = 0.0
                 # Mark as compressed (we might want to hide it, but user asked for "compressed" view)
             else:
                 new_radii[i] = ref_radii[i]
+                compression_ratios[i] = 1.0
                 
     
             # 2. Update Position
-            # We need to know which ID in the current snapshot corresponds to this reference pore_id
-            if current_snapshot:
-                # Get the matched ID in current frame
+            # Prefer stabilized center history if available
+            if center_history and pore_id in center_history and timepoint < len(center_history[pore_id]):
+                new_centers[i] = np.array(center_history[pore_id][timepoint], dtype=np.float64)
+            elif current_snapshot:
                 matched_id = id_mapping.get(pore_id, -1)
-                
                 if matched_id != -1 and matched_id in current_center_map:
-                    # Move sphere to the new tracked position
                     new_centers[i] = current_center_map[matched_id]
         
         # Create new sphere mesh with updated radii AND positions
 
-        pores_mesh = self._create_pores_mesh(new_centers, new_radii, ref_ids)
+        pores_mesh = self._create_pores_mesh(new_centers, new_radii, ref_ids, compression_ratios=compression_ratios)
         
         # Regenerate Throat Mesh using new centers (connectivity remains unchanged)
         # reference_snapshot.connections stores (id_a, id_b)
@@ -646,6 +662,9 @@ class PoreToSphereProcessor(BaseProcessor):
             connections, new_centers, new_radii, ref_ids,
             distance_map=None, segmented_regions=None, spacing=reference_mesh.spacing
         )
+        if throats_mesh.n_points > 0:
+            throats_mesh["CompressionRatio"] = np.ones(throats_mesh.n_points, dtype=np.float64)
+            throats_mesh["ID"] = np.zeros(throats_mesh.n_points, dtype=ref_ids.dtype)
         
         # Combine
         combined_mesh = pores_mesh.merge(throats_mesh)

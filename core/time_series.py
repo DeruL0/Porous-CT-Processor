@@ -86,12 +86,21 @@ class PoreTrackingResult:
         status_history: {pore_id: [status0, status1, ...]} status at each timepoint
         id_mapping: {time_index: {ref_id: current_id}} maps reference to current IDs
         iou_history: {pore_id: [iou0, iou1, ...]} IoU scores for matching quality
+        match_confidence: {pore_id: [c0, c1, ...]} assignment confidence in [0, 1]
+        miss_count: {pore_id: count} consecutive unmatched count
+        unmatched_reason: {pore_id: [reason0, reason1, ...]} reason when unmatched
+        evaluation: Optional structured quality report against simulation GT labels
     """
     reference_ids: List[int] = field(default_factory=list)
     volume_history: Dict[int, List[float]] = field(default_factory=dict)
     status_history: Dict[int, List[PoreStatus]] = field(default_factory=dict)
     id_mapping: Dict[int, Dict[int, int]] = field(default_factory=dict)
     iou_history: Dict[int, List[float]] = field(default_factory=dict)
+    center_history: Dict[int, List[List[float]]] = field(default_factory=dict)
+    match_confidence: Dict[int, List[float]] = field(default_factory=dict)
+    miss_count: Dict[int, int] = field(default_factory=dict)
+    unmatched_reason: Dict[int, List[str]] = field(default_factory=dict)
+    evaluation: Dict[str, Any] = field(default_factory=dict)
     
     def get_volume_series(self, pore_id: int) -> List[float]:
         """Get volume history for a specific pore."""
@@ -218,7 +227,7 @@ class TimeSeriesPNM:
         
         avg_retention = np.mean(volume_ratios) if volume_ratios else 0.0
         
-        return {
+        summary = {
             "num_timepoints": self.num_timepoints,
             "reference_pores": self.num_reference_pores,
             "active_pores": num_active,
@@ -226,3 +235,14 @@ class TimeSeriesPNM:
             "compression_rate": num_compressed / self.num_reference_pores if self.num_reference_pores > 0 else 0,
             "avg_volume_retention": avg_retention
         }
+
+        eval_report = self.tracking.evaluation if isinstance(self.tracking.evaluation, dict) else {}
+        overall_eval = eval_report.get("overall", {}) if isinstance(eval_report, dict) else {}
+        if isinstance(overall_eval, dict):
+            summary["sim_eval_available"] = bool(eval_report.get("available", False))
+            if "mean_tracking_accuracy" in overall_eval:
+                summary["sim_eval_mean_tracking_accuracy"] = float(overall_eval.get("mean_tracking_accuracy", 0.0))
+            if "mean_instance_f1" in overall_eval:
+                summary["sim_eval_mean_instance_f1"] = float(overall_eval.get("mean_instance_f1", 0.0))
+
+        return summary

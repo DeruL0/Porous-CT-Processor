@@ -11,6 +11,7 @@ from loaders.dicom import (
     LoadStrategy
 )
 from loaders.dummy import DummyLoader
+from loaders.annotation_validator import AnnotationValidator
 from loaders.time_series import TimeSeriesDicomLoader, load_time_series
 
 __all__ = [
@@ -21,6 +22,7 @@ __all__ = [
     'DummyLoader',
     'SmartDicomLoader',
     'LoadStrategy',
+    'AnnotationValidator',
     'TimeSeriesDicomLoader',
     'load_time_series',
 ]

@@ -10,6 +10,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from typing import Dict, Any
 
 from gui.styles import PANEL_TITLE_STYLE
+from gui.ui_constants import apply_group_layout, make_description_label
 
 
 class ClipPlanePanel(QGroupBox):
@@ -27,9 +28,11 @@ class ClipPlanePanel(QGroupBox):
 
     def _init_ui(self):
         layout = QVBoxLayout()
+        apply_group_layout(layout)
         
         title_lbl = QLabel(self.custom_title)
         title_lbl.setStyleSheet(PANEL_TITLE_STYLE)
+        make_description_label(title_lbl)
         layout.addWidget(title_lbl)
 
         # Enable checkbox

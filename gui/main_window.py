@@ -4,6 +4,7 @@ Delegates rendering logic to RenderEngine for separation of concerns.
 """
 
 import math
+import weakref
 from typing import Optional
 
 import numpy as np
@@ -12,10 +13,10 @@ from pyvistaqt import BackgroundPlotter
 
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout,
                              QLabel, QFrame, QStatusBar, QScrollArea, QSplitter)
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import Qt, QTimer, QSignalBlocker
+from PyQt5.QtGui import QFont, QCloseEvent
 
-from core import BaseVisualizer, VolumeData
+from core import VolumeData
 from gui.panels import (
     VisualizationModePanel,
     RenderingParametersPanel,
@@ -23,21 +24,22 @@ from gui.panels import (
     ClipPlanePanel,
     ROIPanel
 )
+from gui.ui_constants import PANEL_MARGIN, PANEL_SPACING
+from gui.widgets import CollapsiblePanel
 from rendering import RenderEngine
 from rendering.roi_handler import ROIHandler
 from rendering.clip_handler import ClipHandler
 
 
-# Resolve Metaclass conflict between PyQt5 and ABC
-class _MainWindowMeta(type(QMainWindow), type(BaseVisualizer)):
-    pass
-
-
-class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
+class MainWindow(QMainWindow):
     """
     Main application window.
     Integrates PyQt5 UI controls with a PyVista 3D rendering canvas.
     Delegates rendering to RenderEngine for separation of concerns.
+
+    Note: previously inherited from both QMainWindow and BaseVisualizer (ABC),
+    which required a _MainWindowMeta metaclass hack.  BaseVisualizer is now a
+    typing.Protocol so no metaclass resolution is needed.
     """
 
     def __init__(self):
@@ -56,6 +58,7 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
             clip_panel=self.clip_panel,
             status_callback=self.update_status
         )
+        self._sync_render_style_ui()
         
         # Initialize ROIHandler
         self.roi_handler = ROIHandler(
@@ -137,11 +140,13 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
     def _create_control_panel(self) -> QWidget:
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         panel = QWidget()
         self.control_panel_layout = QVBoxLayout(panel)
         layout = self.control_panel_layout
-        layout.setSpacing(10)
+        layout.setContentsMargins(*PANEL_MARGIN)
+        layout.setSpacing(PANEL_SPACING)
 
         title = QLabel("Control Panel")
         title.setFont(QFont("Arial", 16, QFont.Bold))
@@ -163,10 +168,10 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
         for signal in [self.params_panel.solid_color_changed,
                        self.params_panel.light_angle_changed,
                        self.params_panel.coloring_mode_changed,
-                       self.params_panel.render_style_changed,
                        self.params_panel.threshold_changed,
                        self.params_panel.slice_position_changed]:
             signal.connect(self.trigger_render)
+        self.params_panel.render_style_changed.connect(self._on_render_style_changed)
 
         self.params_panel.opacity_changed.connect(lambda: self.render_volume(reset_view=False))
         self.params_panel.clim_changed.connect(self._on_clim_changed_fast)
@@ -183,7 +188,7 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
         self.roi_panel = ROIPanel()
         layout.addWidget(self.roi_panel)
 
-        layout.addStretch()
+        layout.addStretch(1)
         scroll_area.setWidget(panel)
         return scroll_area
 
@@ -191,11 +196,14 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
         """Create right sidebar with global scroll area."""
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
         panel = QWidget()
         self.info_panel_layout = QVBoxLayout(panel)
         layout = self.info_panel_layout
-        layout.setSpacing(10)
+        layout.setContentsMargins(*PANEL_MARGIN)
+        layout.setSpacing(PANEL_SPACING)
         
         # Title
         title = QLabel("Information")
@@ -206,26 +214,51 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
         
         # Default Info Panel
         self.info_panel = InfoPanel()
-        layout.addWidget(self.info_panel)
+        info_wrapper = CollapsiblePanel(
+            title=self._resolve_panel_title(self.info_panel),
+            content=self.info_panel,
+            expanded=True,
+        )
+        layout.addWidget(info_wrapper)
         
-        layout.addStretch()
+        layout.addStretch(1)
         scroll_area.setWidget(panel)
         
         return scroll_area
+
+    @staticmethod
+    def _resolve_panel_title(panel: QWidget) -> str:
+        for attr in ("custom_title", "windowTitle", "title"):
+            candidate = getattr(panel, attr, None)
+            if callable(candidate):
+                try:
+                    value = candidate()
+                except Exception:
+                    value = None
+            else:
+                value = candidate
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return panel.__class__.__name__
 
     def add_custom_panel(self, panel: QWidget, index: int = 2, side: str = 'left'):
         """Add a custom panel to either the left or right sidebar."""
         if side == 'left' and hasattr(self, 'control_panel_layout'):
             self.control_panel_layout.insertWidget(index, panel)
         elif side == 'right' and hasattr(self, 'info_panel_layout'):
+            wrapped_panel = panel
+            if not isinstance(panel, CollapsiblePanel):
+                title = self._resolve_panel_title(panel)
+                wrapped_panel = CollapsiblePanel(title=title, content=panel, expanded=True)
+
             # Insert before the stretch (last item)
             count = self.info_panel_layout.count()
             # If there is a stretch, insert before it. 
             # The stretch is usually the last item.
             if count > 0:
-                self.info_panel_layout.insertWidget(count - 1, panel)
+                self.info_panel_layout.insertWidget(count - 1, wrapped_panel)
             else:
-                self.info_panel_layout.addWidget(panel)
+                self.info_panel_layout.addWidget(wrapped_panel)
 
     def _create_separator(self):
         line = QFrame()
@@ -253,6 +286,7 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
 
     def set_data(self, data: VolumeData, reset_camera: bool = False):
         """Set data and delegate to RenderEngine."""
+        previous_mode = self.active_view_mode
         self.render_engine.set_data(data)
         
         # Sync with ROIHandler
@@ -272,7 +306,8 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
             default_color = "red" if is_processed else "ivory"
             idx = self.params_panel.solid_color_combo.findText(default_color)
             if idx >= 0:
-                self.params_panel.solid_color_combo.setCurrentIndex(idx)
+                with QSignalBlocker(self.params_panel.solid_color_combo):
+                    self.params_panel.solid_color_combo.setCurrentIndex(idx)
             
             # Update Histogram
             self._update_histogram()
@@ -285,7 +320,17 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
             self.params_panel.set_slice_limits(dims[0] - 1, dims[1] - 1, dims[2] - 1)
             self.params_panel.set_slice_defaults(dims[0] // 2, dims[1] // 2, dims[2] // 2)
 
-            self.render_volume(reset_view=reset_camera)
+            # Keep user's current volumetric view mode during time-step updates.
+            target_mode = 'volume'
+            if not reset_camera and previous_mode in {'volume', 'slices', 'iso'}:
+                target_mode = previous_mode
+
+            if target_mode == 'slices':
+                self.render_slices(reset_view=False)
+            elif target_mode == 'iso':
+                self.render_isosurface_auto(reset_view=False)
+            else:
+                self.render_volume(reset_view=reset_camera)
             self.info_panel.update_info(d_type, data.dimensions, data.spacing, data.metadata)
 
     def _update_histogram(self):
@@ -334,17 +379,15 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
     # ==========================================
     
     def _clear_render_caches(self):
-        """Clear all render engine caches. Called before data modification."""
-        import gc
-        self.plotter.clear()
+        """Clear all render engine caches via unified RenderEngine teardown."""
         if hasattr(self, 'render_engine'):
-            self.render_engine.data = None
-            self.render_engine.grid = None
-            self.render_engine._cached_vol_grid = None
-            self.render_engine._lod_pyramid = None
-            self.render_engine._iso_cache = {}
-            self.render_engine.volume_actor = None
-        gc.collect()
+            self.render_engine.release_resources(
+                clear_scene=True,
+                clear_data=True,
+                clear_cache=True,
+                clear_gpu=True,
+                add_axes=True,
+            )
     
     def _refresh_view(self):
         """Re-render current view mode."""
@@ -384,6 +427,28 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
     def render_isosurface(self, threshold=300, reset_view=True):
         self.render_engine.render_isosurface(threshold=threshold, reset_view=reset_view)
 
+    def _sync_render_style_ui(self):
+        """Sync render-style combo to engine state without emitting UI signals."""
+        if not hasattr(self, 'params_panel') or not hasattr(self, 'render_engine'):
+            return
+        combo = self.params_panel.render_style_combo
+        desired = self.render_engine.get_current_render_mode_label()
+        index = combo.findText(desired)
+        if index >= 0 and combo.currentIndex() != index:
+            with QSignalBlocker(combo):
+                combo.setCurrentIndex(index)
+
+    def _on_render_style_changed(self, render_style: str):
+        """
+        Handle render-style requests with central state + guard clauses.
+        Falls back to full render only when no live actor is available.
+        """
+        result = self.render_engine.request_render_mode_change(render_style)
+        if result == 'unchanged':
+            return
+        if self.active_view_mode == 'iso' and result != 'applied':
+            self.render_isosurface_auto(reset_view=False)
+
     # ==========================================
     # Clip Plane Methods
     # ==========================================
@@ -410,47 +475,50 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
         if not hasattr(self, '_data_manager') or not self._data_manager:
             self.update_status("No data to clip")
             return
-        
-        import gc
+
         import traceback
-        
+
         min_val, max_val = float(clim[0]), float(clim[1])
-        
+
         try:
             # Step 1: Clear render caches
             self.update_status("Clipping: Clearing caches...")
             self._clear_render_caches()
-            
-            # Step 2: Delegate data manipulation to DataManager
+
+            # Step 2: Delegate data manipulation to DataManager.
+            # Use a weakref so the callback does not keep the window alive if
+            # the UI is closed while a long clip operation is running.
+            _self_ref = weakref.ref(self)
+
             def progress_cb(percent, msg):
-                self.update_status(f"Clipping: {msg}")
-            
+                win = _self_ref()
+                if win is not None:
+                    win.update_status(f"Clipping: {msg}")
+
             self._data_manager.clip_data(min_val, max_val, progress_callback=progress_cb)
-            
+
             # Step 3: Update UI
             self.update_status("Clipping: Updating UI...")
             self.params_panel.set_data_range(int(min_val), int(max_val))
-            
+
             # Step 4: Recreate rendering grid
             self.update_status("Clipping: Recreating grid...")
             self.render_engine.set_data(self._data_manager.active_data)
-            
+
             # Step 5: Update histogram
             self._update_histogram()
-            
+
             # Step 6: Re-render
             self._refresh_view()
-            
+
             self.update_status(f"Applied clip: [{min_val:.0f}, {max_val:.0f}]")
-            gc.collect()
-            
+
         except ValueError as e:
             self.update_status(str(e))
         except MemoryError as e:
             print(f"[RangeClip] Memory Error: {e}")
             print(traceback.format_exc())
             self.update_status("Memory Error during clip")
-            gc.collect()
         except Exception as e:
             print(f"[RangeClip] Error: {type(e).__name__}: {e}")
             print(traceback.format_exc())
@@ -461,30 +529,34 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
         if not hasattr(self, '_data_manager') or not self._data_manager:
             self.update_status("No data to invert")
             return
-        
-        import gc
+
         import traceback
-        
+
         try:
             # Step 1: Clear render caches
             self.update_status("Inverting: Clearing caches...")
             self._clear_render_caches()
-            
+
             # Step 2: Get current clim before inversion (for UI update)
             data = self._data_manager.active_data
             current_clim = self.params_panel.get_current_values().get('clim', [0, 1000])
             old_min_clim, old_max_clim = current_clim[0], current_clim[1]
-            
-            # Step 3: Delegate data inversion to DataManager
+
+            # Step 3: Delegate data inversion to DataManager.
+            # Use weakref to avoid keeping the window alive through the closure.
+            _self_ref = weakref.ref(self)
+
             def progress_cb(percent, msg):
-                self.update_status(f"Inverting: {msg}")
-            
+                win = _self_ref()
+                if win is not None:
+                    win.update_status(f"Inverting: {msg}")
+
             data_min, data_max, invert_offset = self._data_manager.invert_data(progress_callback=progress_cb)
-            
+
             # Step 4: Calculate inverted clim values for UI
             new_min_clim = int(invert_offset - old_max_clim)
             new_max_clim = int(invert_offset - old_min_clim)
-            
+
             # Step 5: Update params panel
             self.update_status("Inverting: Updating UI...")
             self.params_panel.set_data_range(int(data_min), int(data_max))
@@ -494,20 +566,19 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
             self.params_panel.spinbox_clim_min.setValue(new_min_clim)
             self.params_panel.spinbox_clim_max.setValue(new_max_clim)
             self.params_panel.block_signals(False)
-            
+
             # Step 6: Recreate rendering grid
             self.update_status("Inverting: Recreating grid...")
             self.render_engine.set_data(self._data_manager.active_data)
-            
+
             # Step 7: Update histogram
             self._update_histogram()
-            
+
             # Step 8: Re-render
             self._refresh_view()
-            
+
             self.update_status(f"Volume inverted. Clim: [{new_min_clim}, {new_max_clim}]")
-            gc.collect()
-            
+
         except ValueError as e:
             self.update_status(str(e))
         except Exception as e:
@@ -522,6 +593,28 @@ class MainWindow(QMainWindow, BaseVisualizer, metaclass=_MainWindowMeta):
 
     def _setup_mouse_probe(self):
         self.plotter.iren.add_observer("MouseMoveEvent", self._on_mouse_move)
+
+    def closeEvent(self, event: QCloseEvent):
+        """Explicitly release rendering resources when window closes."""
+        try:
+            if hasattr(self, "render_engine"):
+                self.render_engine.release_resources(
+                    clear_scene=True,
+                    clear_data=True,
+                    clear_cache=True,
+                    clear_gpu=True,
+                    add_axes=False,
+                )
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "plotter"):
+                self.plotter.close()
+        except Exception:
+            pass
+
+        super().closeEvent(event)
 
     def _on_mouse_move(self, obj, event):
         if self.data is None or self.active_view_mode != 'slices':

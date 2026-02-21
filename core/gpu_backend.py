@@ -119,7 +119,7 @@ class GPUBackend:
             if force:
                 mempool.free_all_blocks()
             else:
-                mempool.free_all_free()
+                mempool.free_all_blocks()
     
     def create_stream(self, non_blocking: bool = True) -> Any:
         """Create a CUDA stream for async operations."""

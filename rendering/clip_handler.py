@@ -117,6 +117,8 @@ class ClipHandler:
             self.plotter.add_axes()
             params = self.render_engine.params_panel.get_current_values() if self.render_engine.params_panel else {}
 
+            new_iso_actor = None
+
             if mode == 'volume' and self.render_engine.grid is not None:
                 clipped = self.render_engine.grid.clip_box(clip_bounds, invert=False)
                 if clipped.n_cells > 0:
@@ -142,28 +144,19 @@ class ClipHandler:
 
             elif mode == 'iso':
                 clipped = data_source.clip_box(clip_bounds, invert=False)
-                style_map = {'Surface': 'surface', 'Wireframe': 'wireframe', 'Wireframe + Surface': 'surface'}
-                render_style = style_map.get(params.get('render_style', 'Surface'), 'surface')
-                show_edges = params.get('render_style') == 'Wireframe + Surface'
-
-                mesh_kwargs = {
-                    'style': render_style,
-                    'show_edges': show_edges,
-                    'smooth_shading': True,
-                    'specular': 0.4,
-                    'diffuse': 0.7,
-                    'ambient': 0.15,
-                    'lighting': True
-                }
+                mesh_kwargs = self.render_engine.get_iso_mesh_kwargs(params=params, sync_mode=True)
 
                 coloring = params.get('coloring_mode', 'Solid Color')
                 if coloring == 'Solid Color':
-                    self.plotter.add_mesh(clipped, color=params.get('solid_color', 'ivory'), **mesh_kwargs)
+                    new_iso_actor = self.plotter.add_mesh(clipped, color=params.get('solid_color', 'ivory'), **mesh_kwargs)
                 elif coloring == 'Depth (Z-Axis)':
                     clipped["Elevation"] = clipped.points[:, 2]
-                    self.plotter.add_mesh(clipped, scalars="Elevation", cmap=params.get('colormap', 'viridis'), **mesh_kwargs)
+                    new_iso_actor = self.plotter.add_mesh(clipped, scalars="Elevation", cmap=params.get('colormap', 'viridis'), **mesh_kwargs)
                 else:
-                    self.plotter.add_mesh(clipped, color='white', **mesh_kwargs)
+                    new_iso_actor = self.plotter.add_mesh(clipped, color='white', **mesh_kwargs)
+
+            if self.render_engine:
+                self.render_engine.iso_actor = new_iso_actor if mode == 'iso' else None
 
             self.render_engine._apply_custom_lighting(params)
             self.plotter.render()

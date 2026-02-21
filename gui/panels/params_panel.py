@@ -12,6 +12,7 @@ import numpy as np
 import pyqtgraph as pg
 
 from gui.styles import PANEL_TITLE_STYLE
+from gui.ui_constants import apply_group_layout, make_description_label, set_primary_button_policy
 from config import (
     DEFAULT_COLORMAPS, 
     SOLID_COLORS, 
@@ -37,7 +38,6 @@ class RenderingParametersPanel(QGroupBox):
     clim_changed = pyqtSignal()
     apply_clim_clip = pyqtSignal(list)  # Emits [min, max] for permanent clipping
     invert_volume = pyqtSignal()        # Emits signal to invert volume values
-    invert_volume = pyqtSignal()        # Emits signal to invert volume values
 
     def __init__(self, title: str = "🎨 Rendering Parameters"):
         super().__init__()
@@ -48,9 +48,11 @@ class RenderingParametersPanel(QGroupBox):
 
     def _init_ui(self):
         layout = QVBoxLayout()
+        apply_group_layout(layout)
         
         title_lbl = QLabel(self.custom_title)
         title_lbl.setStyleSheet(PANEL_TITLE_STYLE)
+        make_description_label(title_lbl)
         layout.addWidget(title_lbl)
 
         # 1. Threshold (Iso)
@@ -154,12 +156,14 @@ class RenderingParametersPanel(QGroupBox):
         # Apply Clip button
         self.btn_apply_clim_clip = QPushButton("✂️ Apply Range Clip")
         self.btn_apply_clim_clip.setToolTip("Permanently clip data to current min/max range")
+        set_primary_button_policy(self.btn_apply_clim_clip)
         self.btn_apply_clim_clip.clicked.connect(self._on_apply_clim_clip)
         layout.addWidget(self.btn_apply_clim_clip)
 
         # Invert Volume button
         self.btn_invert_volume = QPushButton("🔄 Invert Volume")
         self.btn_invert_volume.setToolTip("Invert volume values (extract pore surfaces instead of object surfaces)")
+        set_primary_button_policy(self.btn_invert_volume)
         self.btn_invert_volume.clicked.connect(self.invert_volume.emit)
         layout.addWidget(self.btn_invert_volume)
 

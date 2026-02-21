@@ -6,6 +6,7 @@ from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton, QLabel, QGroupBox
 from PyQt5.QtCore import pyqtSignal
 
 from gui.styles import PANEL_TITLE_STYLE
+from gui.ui_constants import apply_group_layout, make_description_label, set_primary_button_policy
 
 
 class Separator(QFrame):
@@ -33,9 +34,11 @@ class VisualizationModePanel(QGroupBox):
 
     def _init_ui(self):
         layout = QVBoxLayout()
+        apply_group_layout(layout)
         
         title_lbl = QLabel(self.custom_title)
         title_lbl.setStyleSheet(PANEL_TITLE_STYLE)
+        make_description_label(title_lbl)
         layout.addWidget(title_lbl)
         
         self._add_button(layout, "📊 Volume Rendering", self.volume_clicked)
@@ -49,5 +52,6 @@ class VisualizationModePanel(QGroupBox):
     def _add_button(self, layout, text, signal, min_height=40):
         btn = QPushButton(text)
         btn.setMinimumHeight(min_height)
+        set_primary_button_policy(btn)
         btn.clicked.connect(signal.emit)
         layout.addWidget(btn)

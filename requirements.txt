@@ -17,3 +17,4 @@ vtk>=9.1.0
 joblib>=1.2.0
 numba>=0.56.0
 connected-components-3d>=3.10.0  # Fast 3D labeling
+lapjv>=1.3.0  # Jonker-Volgenant assignment solver for TGGA

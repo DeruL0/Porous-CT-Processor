@@ -123,43 +123,179 @@ def _find_local_maxima_gpu_impl(image: np.ndarray,
         backend.clear_memory(force=False)
         return np.array([]).reshape(0, image.ndim)
     
-    # Sort by value descending
+    # Sort by value descending — single argsort, reused for both arrays
     values = image_gpu[is_peak]
     del max_filtered, is_peak
-    sorted_candidates = backend.to_cpu(candidates[cp.argsort(-values)])
+    sort_idx              = cp.argsort(-values)
+    candidates_gpu_sorted = candidates[sort_idx]   # (N, 3) int64, descending intensity
+    values_gpu_sorted     = values[sort_idx]       # (N,)   float32
     del candidates, values, image_gpu
+
+    # GPU NMS via spatial hash grid  O(N)
+    keep_mask  = _nms_gpu_parallel(candidates_gpu_sorted, values_gpu_sorted, min_distance)
+    result_gpu = candidates_gpu_sorted[keep_mask]
+    result     = backend.to_cpu(result_gpu)
+    del candidates_gpu_sorted, values_gpu_sorted, sort_idx, keep_mask, result_gpu
     backend.clear_memory(force=False)
-    
-    # NMS
-    n = len(sorted_candidates)
-    if n > 10000:
-        # Use KDTree for large candidate sets
-        from scipy.spatial import cKDTree
-        tree = cKDTree(sorted_candidates)
-        suppressed = np.zeros(n, dtype=bool)
-        selected_peaks = []
-        for i in range(n):
-            if suppressed[i]:
-                continue
-            selected_peaks.append(sorted_candidates[i])
-            for j in tree.query_ball_point(sorted_candidates[i], r=min_distance, p=2):
-                if j > i:
-                    suppressed[j] = True
-    else:
-        selected_peaks = []
-        suppressed = np.zeros(n, dtype=bool)
-        min_dist_sq = min_distance * min_distance
-        for i in range(n):
-            if suppressed[i]:
-                continue
-            selected_peaks.append(sorted_candidates[i])
-            if i + 1 < n:
-                diff = sorted_candidates[i+1:] - sorted_candidates[i]
-                suppressed[i+1:][np.sum(diff * diff, axis=1) < min_dist_sq] = True
-    
-    result = np.array(selected_peaks) if selected_peaks else np.array([]).reshape(0, image.ndim)
     print(f"[GPU] find_local_maxima: {time.time() - start:.2f}s, {len(result)} peaks")
     return result
+
+
+# ---------------------------------------------------------------------------
+# GPU Non-Maximum Suppression — O(N) via spatial hashing
+# ---------------------------------------------------------------------------
+
+def _nms_gpu_parallel(candidates_gpu, intensities_gpu, min_distance: int):
+    """
+    GPU-accelerated NMS with spatial hash grid.  O(N) vs. O(N²) brute-force.
+
+    Parameters
+    ----------
+    candidates_gpu  : cp.ndarray (N, 3) int32 / int64  — voxel coordinates
+    intensities_gpu : cp.ndarray (N,)  float32          — intensity at each candidate
+    min_distance    : int                               — exclusion radius (voxels)
+
+    Returns
+    -------
+    keep : cp.ndarray (N,) bool   — True where the point IS kept
+    """
+    import cupy as cp
+
+    n = int(candidates_gpu.shape[0])
+    if n == 0:
+        return cp.zeros(0, dtype=cp.bool_)
+
+    cell_size   = max(float(min_distance), 1.0)
+    pts_f32     = candidates_gpu.astype(cp.float32)           # (N,3)
+    grid_coords = cp.floor(pts_f32 / cell_size).astype(cp.int32)  # (N,3)
+
+    # Large coprime primes for spatial hashing
+    P1 = np.int64(73_856_093)
+    P2 = np.int64(19_349_663)
+    P3 = np.int64(83_492_791)
+    hash_table_size = max(n * 4, 1024)
+
+    gc_i64      = grid_coords.astype(cp.int64)
+    raw_hashes  = (
+        gc_i64[:, 0] * int(P1) ^
+        gc_i64[:, 1] * int(P2) ^
+        gc_i64[:, 2] * int(P3)
+    ) % hash_table_size
+    raw_hashes  = raw_hashes.astype(cp.int32)
+
+    # Sort by hash bucket to enable contiguous cell ranges
+    sort_order      = cp.argsort(raw_hashes)
+    sorted_hashes   = raw_hashes[sort_order]
+    sorted_pts_f32  = pts_f32[sort_order]          # (N, 3) float32
+    sorted_intens   = intensities_gpu[sort_order].astype(cp.float32)
+    sorted_gc       = grid_coords[sort_order].astype(cp.int32)  # (N, 3)
+
+    # Build cell_start / cell_end arrays
+    cell_start = cp.full(hash_table_size, -1, dtype=cp.int32)
+    cell_end   = cp.zeros(hash_table_size, dtype=cp.int32)
+    is_boundary = cp.concatenate([
+        cp.array([True]),
+        sorted_hashes[1:] != sorted_hashes[:-1],
+        cp.array([True]),
+    ])
+    starts        = cp.where(is_boundary[:-1])[0].astype(cp.int32)
+    ends          = cp.where(is_boundary[1:])[0].astype(cp.int32)
+    bucket_keys   = sorted_hashes[starts]
+    cell_start[bucket_keys] = starts
+    cell_end[bucket_keys]   = ends + 1
+
+    # ------------------------------------------------------------------
+    # RawKernel: each thread owns one candidate; checks 27 neighbor cells
+    # ------------------------------------------------------------------
+    nms_kernel_code = r'''
+    extern "C" __global__
+    void nms_spatial_hash_kernel(
+        const float* __restrict__ points,      // (N, 3) float32, row-major
+        const float* __restrict__ intensities, // (N,)   float32
+        const int*   __restrict__ gc,          // (N, 3) int32  grid coords
+        const int*   __restrict__ cell_start,  // (hash_table_size,)
+        const int*   __restrict__ cell_end,    // (hash_table_size,)
+        bool*                     keep_flag,   // (N,)   output
+        int          N,
+        int          hash_table_size,
+        float        min_dist_sq,
+        long long    P1,
+        long long    P2,
+        long long    P3
+    ) {
+        int i = blockDim.x * blockIdx.x + threadIdx.x;
+        if (i >= N) return;
+
+        float my_val = intensities[i];
+        float p_z    = points[i * 3 + 0];
+        float p_y    = points[i * 3 + 1];
+        float p_x    = points[i * 3 + 2];
+        int   g_z    = gc[i * 3 + 0];
+        int   g_y    = gc[i * 3 + 1];
+        int   g_x    = gc[i * 3 + 2];
+
+        // Traverse 27 neighbouring grid cells (3x3x3 cube around owning cell)
+        for (int dz = -1; dz <= 1; dz++) {
+        for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            int cz = g_z + dz;
+            int cy = g_y + dy;
+            int cx = g_x + dx;
+            long long h = ((long long)cz * P1 ^ (long long)cy * P2 ^ (long long)cx * P3)
+                          % (long long)hash_table_size;
+            if (h < 0) h += (long long)hash_table_size;
+            int bucket = (int)h;
+            int cs = cell_start[bucket];
+            if (cs < 0) continue;
+            int ce = cell_end[bucket];
+            for (int j = cs; j < ce; j++) {
+                if (j == i) continue;
+                // Hash-collision guard: verify exact grid-cell match
+                if (gc[j*3+0] != cz || gc[j*3+1] != cy || gc[j*3+2] != cx) continue;
+                float ddz  = points[j*3+0] - p_z;
+                float ddy  = points[j*3+1] - p_y;
+                float ddx  = points[j*3+2] - p_x;
+                float dist2 = ddz*ddz + ddy*ddy + ddx*ddx;
+                if (dist2 < min_dist_sq) {
+                    float jval = intensities[j];
+                    // Suppress self if neighbour is strictly stronger,
+                    // or equally strong with a lower sorted index (tie-break).
+                    if (jval > my_val || (jval == my_val && j < i)) {
+                        keep_flag[i] = false;
+                        return;
+                    }
+                }
+            }
+        }}}
+        keep_flag[i] = true;
+    }
+    '''
+    nms_kernel = cp.RawKernel(nms_kernel_code, 'nms_spatial_hash_kernel')
+
+    keep_sorted = cp.ones(n, dtype=cp.bool_)
+    threads     = 256
+    blocks_nms  = (n + threads - 1) // threads
+
+    nms_kernel(
+        (blocks_nms,), (threads,),
+        (
+            sorted_pts_f32.ravel(),
+            sorted_intens,
+            sorted_gc.ravel(),
+            cell_start,
+            cell_end,
+            keep_sorted,
+            np.int32(n),
+            np.int32(hash_table_size),
+            np.float32(min_distance * min_distance),
+            P1, P2, P3,
+        ),
+    )
+
+    # Map keep flags from sorted-by-hash space back to original candidate order
+    keep_original = cp.empty(n, dtype=cp.bool_)
+    keep_original[sort_order] = keep_sorted
+    return keep_original
 
 
 def watershed_gpu(image: np.ndarray,
@@ -196,97 +332,199 @@ def _watershed_gpu_impl(image: np.ndarray,
                         markers: np.ndarray,
                         mask: Optional[np.ndarray],
                         max_iterations: int) -> np.ndarray:
-    """GPU watershed with optimized RawKernel."""
+    """
+    GPU watershed — 3-D shared-memory kernel with hierarchical warp/block
+    reduction, plus batched host-sync to minimise PCIe stalls.
+
+    Optimisation summary
+    --------------------
+    * 8x8x8 thread blocks load a (10,10,10) halo tile into __shared__ memory
+      so all 6-neighbour reads hit L1 instead of L2/DRAM.
+    * atomicAdd on changed_flag is replaced by:
+        thread-local int  →  warp __shfl_down_sync  →  block __shared__ int
+        →  single atomicAdd per block (27-64× fewer global atomic ops).
+    * Host loop synchronises (calls .item()) only every CHECK_INTERVAL steps,
+      keeping the GPU pipeline full between convergence checks.
+    """
     import cupy as cp
-    
+
     backend = get_gpu_backend()
-    start = time.time()
-    
-    watershed_kernel = cp.RawKernel(r'''
+    start   = time.time()
+
+    watershed_kernel_code = r'''
+    #define BLOCK_DIM_X 8
+    #define BLOCK_DIM_Y 8
+    #define BLOCK_DIM_Z 8
+
     extern "C" __global__
     void watershed_kernel(
-        const float* image,         // 0
-        const int* labels_in,       // 1
-        int* labels_out,            // 2
-        const bool* mask,           // 3
-        const int* shape,           // 4
-        int* changed_flag           // 5
+        const float* __restrict__ image,      // [d*h*w] float32
+        const int*   __restrict__ labels_in,  // [d*h*w] int32
+        int*                      labels_out, // [d*h*w] int32
+        const bool*  __restrict__ mask,       // [d*h*w] bool  (may be NULL)
+        const int*   __restrict__ shape,      // [3]  = {d, h, w}
+        int*                      changed_flag
     ) {
-        int idx = blockDim.x * blockIdx.x + threadIdx.x;
-        int total_pixels = shape[0] * shape[1] * shape[2];
-        
-        if (idx >= total_pixels) return;
-        
-        bool is_masked = mask ? mask[idx] : true;
-        int current_label = labels_in[idx];
-        
-        if (!is_masked) { labels_out[idx] = 0; return; }
-        if (current_label > 0) { labels_out[idx] = current_label; return; }
-        
-        int d = shape[0], h = shape[1], w = shape[2];
-        int z = idx / (h * w);
-        int rem = idx % (h * w);
-        int y = rem / w;
-        int x = rem % w;
-        
-        int best_label = 0;
-        float best_neighbor_val = 1e30;
-        
-        #define CHECK_NEIGHBOR(nz, ny, nx) \
-            if ((nz) >= 0 && (nz) < d && (ny) >= 0 && (ny) < h && (nx) >= 0 && (nx) < w) { \
-                int n_idx = (nz) * h * w + (ny) * w + (nx); \
-                int n_label = labels_in[n_idx]; \
-                if (n_label > 0) { \
-                    float n_val = image[n_idx]; \
-                    if (n_val < best_neighbor_val || (n_val == best_neighbor_val && n_label < best_label)) { \
-                        best_neighbor_val = n_val; best_label = n_label; \
-                    } \
-                } \
+        // ---- 3-D shared memory with 1-pixel halo ---------------------------
+        __shared__ int   s_labels[BLOCK_DIM_Z+2][BLOCK_DIM_Y+2][BLOCK_DIM_X+2];
+        __shared__ float s_image [BLOCK_DIM_Z+2][BLOCK_DIM_Y+2][BLOCK_DIM_X+2];
+        __shared__ int   s_block_changed;
+
+        const int d = shape[0], h = shape[1], w = shape[2];
+
+        // Global voxel this thread "owns"
+        int gx = blockIdx.x * BLOCK_DIM_X + threadIdx.x;
+        int gy = blockIdx.y * BLOCK_DIM_Y + threadIdx.y;
+        int gz = blockIdx.z * BLOCK_DIM_Z + threadIdx.z;
+
+        // Flat thread ID within the block (for cooperative loading & warp ID)
+        int tid = threadIdx.z * (BLOCK_DIM_Y * BLOCK_DIM_X)
+                + threadIdx.y * BLOCK_DIM_X
+                + threadIdx.x;
+
+        if (tid == 0) s_block_changed = 0;
+        __syncthreads();
+
+        // ---- Cooperative halo load -----------------------------------------
+        // Shared tile size: (BZ+2)*(BY+2)*(BX+2) = 1000 elements
+        // Block threads:    8*8*8 = 512  → each thread loads 1-2 elements
+        const int BX2 = BLOCK_DIM_X + 2;
+        const int BY2 = BLOCK_DIM_Y + 2;
+        const int BZ2 = BLOCK_DIM_Z + 2;
+        const int shared_total = BX2 * BY2 * BZ2;
+        const int block_threads = BLOCK_DIM_X * BLOCK_DIM_Y * BLOCK_DIM_Z;
+
+        // Origin of tile in global space (includes -1 halo offset)
+        int bx0 = (int)blockIdx.x * BLOCK_DIM_X - 1;
+        int by0 = (int)blockIdx.y * BLOCK_DIM_Y - 1;
+        int bz0 = (int)blockIdx.z * BLOCK_DIM_Z - 1;
+
+        for (int si = tid; si < shared_total; si += block_threads) {
+            int sx = si % BX2;
+            int sy = (si / BX2) % BY2;
+            int sz = si / (BX2 * BY2);
+            int rx = bx0 + sx;
+            int ry = by0 + sy;
+            int rz = bz0 + sz;
+            if (rx >= 0 && rx < w && ry >= 0 && ry < h && rz >= 0 && rz < d) {
+                int g = rz * h * w + ry * w + rx;
+                s_labels[sz][sy][sx] = labels_in[g];
+                s_image [sz][sy][sx] = image[g];
+            } else {
+                s_labels[sz][sy][sx] = 0;
+                s_image [sz][sy][sx] = 1e30f;
             }
-        
-        CHECK_NEIGHBOR(z-1, y, x)
-        CHECK_NEIGHBOR(z+1, y, x)
-        CHECK_NEIGHBOR(z, y-1, x)
-        CHECK_NEIGHBOR(z, y+1, x)
-        CHECK_NEIGHBOR(z, y, x-1)
-        CHECK_NEIGHBOR(z, y, x+1)
-        
-        #undef CHECK_NEIGHBOR
-        
-        if (best_label > 0) {
-            labels_out[idx] = best_label;
-            atomicAdd(changed_flag, 1);
-        } else {
-            labels_out[idx] = 0;
         }
+        __syncthreads();
+
+        // ---- Process owned voxel  ------------------------------------------
+        int local_changed = 0;
+
+        if (gx < w && gy < h && gz < d) {
+            int g_idx   = gz * h * w + gy * w + gx;
+            bool masked = mask ? mask[g_idx] : true;
+
+            if (!masked) {
+                labels_out[g_idx] = 0;
+            } else {
+                // Shared-memory indices (+1 for halo offset)
+                int sx = threadIdx.x + 1;
+                int sy = threadIdx.y + 1;
+                int sz = threadIdx.z + 1;
+
+                int cur = s_labels[sz][sy][sx];
+                if (cur > 0) {
+                    labels_out[g_idx] = cur;
+                } else {
+                    int   best_label = 0;
+                    float best_val   = 1e30f;
+
+                    #define CHECK_SHM(dz, dy, dx) {\
+                        int nl = s_labels[sz+(dz)][sy+(dy)][sx+(dx)]; \
+                        if (nl > 0) { \
+                            float nv = s_image[sz+(dz)][sy+(dy)][sx+(dx)]; \
+                            if (nv < best_val || (nv == best_val && nl < best_label)) { \
+                                best_val = nv; best_label = nl; \
+                            } \
+                        } \
+                    }
+                    CHECK_SHM(-1,  0,  0)
+                    CHECK_SHM(+1,  0,  0)
+                    CHECK_SHM( 0, -1,  0)
+                    CHECK_SHM( 0, +1,  0)
+                    CHECK_SHM( 0,  0, -1)
+                    CHECK_SHM( 0,  0, +1)
+                    #undef CHECK_SHM
+
+                    if (best_label > 0) {
+                        labels_out[g_idx] = best_label;
+                        local_changed = 1;
+                    } else {
+                        labels_out[g_idx] = 0;
+                    }
+                }
+            }
+        }
+
+        // ---- Hierarchical reduction: thread → warp → block → global --------
+        // Warp-level reduction with shuffle
+        unsigned int full_mask = 0xffffffffu;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            local_changed += __shfl_down_sync(full_mask, local_changed, offset);
+
+        // Warp lane 0 accumulates into shared block counter
+        if ((tid & 31) == 0)
+            atomicAdd(&s_block_changed, local_changed);
+        __syncthreads();
+
+        // Block thread 0 does single global atomic per block
+        if (tid == 0 && s_block_changed > 0)
+            atomicAdd(changed_flag, s_block_changed);
     }
-    ''', 'watershed_kernel')
-    
-    image_gpu = cp.asarray(image, dtype=cp.float32)
+    '''
+    watershed_kernel = cp.RawKernel(watershed_kernel_code, 'watershed_kernel')
+
+    d, h, w = image.shape
+    image_gpu   = cp.asarray(image, dtype=cp.float32)
     labels_curr = cp.asarray(markers, dtype=cp.int32)
     labels_next = cp.empty_like(labels_curr)
-    mask_gpu = cp.asarray(mask, dtype=cp.bool_) if mask is not None else cp.ones(image.shape, dtype=cp.bool_)
-    shape_gpu = cp.array(image.shape, dtype=cp.int32)
-    
-    total_pixels = image.size
-    blocks = (total_pixels + 255) // 256
-    changed = cp.zeros(1, dtype=cp.int32)
-    check_interval, last_changed = 20, -1
-    
-    for iteration in range(max_iterations):
-        watershed_kernel((blocks,), (256,), (image_gpu, labels_curr, labels_next, mask_gpu, shape_gpu, changed))
-        labels_curr, labels_next = labels_next, labels_curr
-        
-        if iteration % check_interval == check_interval - 1:
-            n_changed = changed.item()
-            if n_changed == 0:
+    mask_gpu    = (cp.asarray(mask, dtype=cp.bool_)
+                   if mask is not None
+                   else cp.ones(image.shape, dtype=cp.bool_))
+    shape_gpu   = cp.array([d, h, w], dtype=cp.int32)
+    changed     = cp.zeros(1, dtype=cp.int32)
+
+    BLOCK = (8, 8, 8)
+    GRID  = ((w + 7) // 8, (h + 7) // 8, (d + 7) // 8)
+
+    # -------------------------------------------------------------------
+    # Batched host-sync: run CHECK_INTERVAL kernel launches between each
+    # .item() call so the GPU pipeline is never starved waiting for the
+    # host to decide "keep going".
+    # -------------------------------------------------------------------
+    CHECK_INTERVAL = 10
+    final_iter     = 0
+    n_changed      = 1  # sentinel — assume not converged yet
+
+    for outer in range(0, max_iterations, CHECK_INTERVAL):
+        changed.fill(0)  # async clear — no host stall
+        for inner in range(CHECK_INTERVAL):
+            current_iter = outer + inner
+            if current_iter >= max_iterations:
                 break
-            if last_changed > 0 and n_changed < last_changed * 0.1:
-                check_interval = max(5, check_interval // 2)
-            last_changed = n_changed
-            changed.fill(0)
-    
-    print(f"[GPU] watershed: {time.time() - start:.2f}s, {iteration+1} iters")
+            watershed_kernel(
+                GRID, BLOCK,
+                (image_gpu, labels_curr, labels_next, mask_gpu, shape_gpu, changed),
+            )
+            labels_curr, labels_next = labels_next, labels_curr
+            final_iter = current_iter
+
+        # Single sync per batch — amortises PCIe round-trip over CHECK_INTERVAL iters
+        n_changed = int(changed.item())
+        if n_changed == 0:
+            break
+
+    print(f"[GPU] watershed: {time.time() - start:.2f}s, {final_iter + 1} iters")
     result = backend.to_cpu(labels_curr)
     del image_gpu, labels_curr, labels_next, mask_gpu, shape_gpu, changed
     backend.clear_memory(force=False)

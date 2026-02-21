@@ -8,6 +8,7 @@ from typing import Optional, Dict, Any, Tuple
 import numpy as np
 import pyvista as pv
 from core import VolumeData
+from core.dto import RenderParamsDTO
 from rendering.lod_manager import LODPyramid, LODRenderManager, check_gpu_volume_rendering
 from config import (
     RENDER_MAX_VOXELS_VOLUME,
@@ -56,11 +57,57 @@ class RenderEngine:
         self._cached_vol_grid_source: Optional[int] = None
         self._lod_pyramid: Optional[LODPyramid] = None
         
+        # PNM color range cache (for consistent colors across timepoints)
+        self._pnm_radius_clim: Optional[Tuple[float, float]] = None
+        self._pnm_compression_clim: Optional[Tuple[float, float]] = None
+        self._highlight_pore_id: Optional[int] = None
+        
         # GPU capability
         self.gpu_available, self.gpu_info = check_gpu_volume_rendering()
-        
+
         # Actors
         self.volume_actor = None
+        self.iso_actor = None
+        self._current_iso_threshold: Optional[int] = None
+
+        # Centralized render-style state (single source of truth for isosurface style)
+        self._current_render_mode = 'surface'
+        self._current_render_show_edges = False
+        self._current_render_mode_label = 'Surface'
+
+        # Injected params DTO (used when running headless without a params_panel)
+        self._injected_params: Optional[RenderParamsDTO] = None
+
+    # ------------------------------------------------------------------
+    # Headless / DTO interface
+    # ------------------------------------------------------------------
+
+    def inject_params(self, dto: RenderParamsDTO) -> None:
+        """
+        Push a RenderParamsDTO directly into the engine.
+
+        When set, ``_get_render_params()`` will return values from this DTO
+        instead of querying the live params_panel.  Call with ``None`` to
+        restore live-panel mode.
+        """
+        self._injected_params = dto
+
+    def _get_render_params(self) -> Dict[str, Any]:
+        """
+        Return current render parameters as a plain dict.
+
+        Priority:
+        1. Injected DTO (headless / CLI mode)
+        2. Live params_panel.get_current_values() (GUI mode)
+        3. Hard-coded safe defaults (neither present)
+        """
+        if self._injected_params is not None:
+            return self._injected_params.to_dict()
+        if self.params_panel is not None:
+            return self.params_panel.get_current_values()
+        return RenderParamsDTO().to_dict()
+
+    # ------------------------------------------------------------------
 
     def update_status(self, message: str):
         """Update status via callback."""
@@ -69,25 +116,183 @@ class RenderEngine:
         else:
             print(f"[RenderEngine] {message}")
 
+    @staticmethod
+    def _detach_mapper_inputs(mapper) -> None:
+        """Best-effort disconnect of VTK mapper input graph."""
+        if mapper is None:
+            return
+
+        for method_name, args in (
+            ("SetInputConnection", (None,)),
+            ("SetInputDataObject", (None,)),
+            ("SetInputData", (None,)),
+            ("RemoveAllInputs", ()),
+            ("RemoveAllClippingPlanes", ()),
+        ):
+            method = getattr(mapper, method_name, None)
+            if callable(method):
+                try:
+                    method(*args)
+                except Exception:
+                    pass
+
+    def _detach_actor(self, actor) -> None:
+        """Best-effort disconnect of actor -> mapper -> data references."""
+        if actor is None:
+            return
+
+        mapper = getattr(actor, "mapper", None)
+        if mapper is None:
+            get_mapper = getattr(actor, "GetMapper", None)
+            if callable(get_mapper):
+                try:
+                    mapper = get_mapper()
+                except Exception:
+                    mapper = None
+
+        self._detach_mapper_inputs(mapper)
+
+        set_mapper = getattr(actor, "SetMapper", None)
+        if callable(set_mapper):
+            try:
+                set_mapper(None)
+            except Exception:
+                pass
+
+        if hasattr(actor, "mapper"):
+            try:
+                actor.mapper = None
+            except Exception:
+                pass
+
+    def _prepare_vtk_volume_array(self, raw_data: np.ndarray) -> np.ndarray:
+        """
+        Normalize volume layout before handing memory to VTK.
+
+        We explicitly repack non-contiguous / reversed-stride views so memory
+        cost is predictable and not deferred to implicit bridge conversions.
+        """
+        array = np.asarray(raw_data)
+        if array.ndim != 3:
+            raise ValueError(f"Expected 3D volume, got shape={array.shape}")
+
+        has_nonpositive_stride = any(stride <= 0 for stride in array.strides)
+        is_contiguous = array.flags.c_contiguous or array.flags.f_contiguous
+        if array.flags.f_contiguous and not has_nonpositive_stride:
+            return array
+
+        est_mb = array.nbytes / (1024 * 1024)
+        if not is_contiguous or has_nonpositive_stride:
+            self.update_status(
+                f"Repacking non-contiguous volume for VTK (~{est_mb:.1f} MB copy)."
+            )
+        else:
+            self.update_status(
+                f"Converting volume to Fortran layout for VTK (~{est_mb:.1f} MB copy)."
+            )
+        return np.asfortranarray(array)
+
+    def release_resources(
+        self,
+        *,
+        clear_scene: bool = True,
+        clear_data: bool = True,
+        clear_cache: bool = True,
+        clear_gpu: bool = True,
+        add_axes: bool = True,
+    ) -> None:
+        """
+        Explicitly tear down VTK/PyVista resources in reverse dependency order.
+        """
+        # 1) Detach actors from renderer and disconnect mapper inputs first.
+        for actor_attr in ("volume_actor", "iso_actor"):
+            actor = getattr(self, actor_attr, None)
+            if actor is None:
+                continue
+            try:
+                self.plotter.remove_actor(actor, render=False)
+            except Exception:
+                pass
+            self._detach_actor(actor)
+            setattr(self, actor_attr, None)
+
+        self._current_iso_threshold = None
+
+        # 2) Optionally clear scene-level objects.
+        if clear_scene:
+            try:
+                self.plotter.clear()
+            except Exception:
+                pass
+            if add_axes:
+                try:
+                    self.plotter.add_axes()
+                except Exception:
+                    pass
+            self.active_view_mode = None
+            if self.params_panel:
+                try:
+                    self.params_panel.set_mode(None)
+                except Exception:
+                    pass
+
+        # 3) Drop intermediate caches and LOD references.
+        if clear_cache:
+            self._iso_cache = {}
+            self._cached_vol_grid = None
+            self._cached_vol_grid_source = None
+            self._lod_pyramid = None
+
+        # 4) Release core data references after graph disconnect.
+        if clear_data:
+            self.data = None
+            self.grid = None
+            self.mesh = None
+            self.active_view_mode = None
+            self._pnm_radius_clim = None
+            self._pnm_compression_clim = None
+            self._highlight_pore_id = None
+
+            if clear_gpu:
+                try:
+                    from core.gpu_backend import get_gpu_backend
+                    get_gpu_backend().clear_memory(force=True)
+                except Exception:
+                    pass
+
+    def teardown(self) -> None:
+        """Compatibility alias for full engine teardown."""
+        self.release_resources(
+            clear_scene=True,
+            clear_data=True,
+            clear_cache=True,
+            clear_gpu=True,
+            add_axes=False,
+        )
+
     def set_data(self, data: VolumeData):
         """Set volume data and prepare grid. Clears previous data first."""
-        import gc
-        
-        # Clear previous data to free memory
-        if self.data is not None or self.grid is not None:
+        # Explicitly release previous references — no gc.collect() needed;
+        # Python's reference counting handles deallocation as soon as the
+        # last reference drops.
+        had_previous = any((
+            self.data is not None,
+            self.grid is not None,
+            self.mesh is not None,
+            self.volume_actor is not None,
+            self.iso_actor is not None,
+        ))
+        if had_previous:
             self.update_status("Clearing previous data...")
-        
-        self.data = None
-        self.grid = None
-        self.mesh = None
-        self.volume_actor = None
-        self._iso_cache = {}
-        self._cached_vol_grid = None
-        self._lod_pyramid = None
-        
-        # Force garbage collection to free memory before loading new data
-        gc.collect()
-        
+
+        self.release_resources(
+            clear_scene=had_previous,
+            clear_data=True,
+            clear_cache=True,
+            clear_gpu=had_previous,
+            add_axes=had_previous,
+        )
+
         # Now set new data
         self.data = data
 
@@ -104,21 +309,36 @@ class RenderEngine:
         """Create PyVista ImageData grid from volume data."""
         if not self.data or self.data.raw_data is None:
             return
+        prepared = self._prepare_vtk_volume_array(self.data.raw_data)
         grid = pv.ImageData()
-        grid.dimensions = np.array(self.data.raw_data.shape) + 1
+        grid.dimensions = np.array(prepared.shape) + 1
         grid.origin = self.data.origin
         grid.spacing = self.data.spacing
-        grid.cell_data["values"] = self.data.raw_data.flatten(order="F")
+        cell_values = prepared.ravel(order="F")
+        if not cell_values.flags.c_contiguous:
+            cell_values = np.ascontiguousarray(cell_values)
+        grid.cell_data["values"] = cell_values
         self.grid = grid
 
     def clear_view(self):
-        """Clear all actors from plotter."""
-        self.plotter.clear()
-        self.plotter.add_axes()
-        self.active_view_mode = None
-        self.volume_actor = None
-        if self.params_panel:
-            self.params_panel.set_mode(None)
+        """Clear rendered actors but keep loaded data and caches."""
+        self.release_resources(
+            clear_scene=True,
+            clear_data=False,
+            clear_cache=False,
+            clear_gpu=False,
+            add_axes=True,
+        )
+
+    def set_highlight_pore(self, pore_id: Optional[int]):
+        """Set the pore ID to highlight in yellow. Pass None to clear highlight."""
+        self._highlight_pore_id = pore_id
+    
+    def clear_pnm_color_cache(self):
+        """Clear PNM color range cache (call when loading new dataset)."""
+        self._pnm_radius_clim = None
+        self._pnm_compression_clim = None
+        self._highlight_pore_id = None
 
     def reset_camera(self):
         """Reset camera to isometric view."""
@@ -213,6 +433,112 @@ class RenderEngine:
         self.clip_panel._enabled = False
         self.clip_panel._update_slider_state()
 
+    @staticmethod
+    def normalize_render_mode(render_style: Optional[str]) -> Tuple[str, bool, str]:
+        """Normalize UI render style text into VTK style + edge-visibility flags."""
+        style_map = {
+            'surface': ('surface', False, 'Surface'),
+            'wireframe': ('wireframe', False, 'Wireframe'),
+            'wireframe + surface': ('surface', True, 'Wireframe + Surface'),
+            'points': ('points', False, 'Points'),
+        }
+        key = str(render_style or 'Surface').strip().lower()
+        return style_map.get(key, ('surface', False, 'Surface'))
+
+    def get_current_render_mode_label(self) -> str:
+        """Return current UI label for isosurface render style."""
+        return self._current_render_mode_label
+
+    def get_iso_mesh_kwargs(self, params: Optional[Dict[str, Any]] = None, sync_mode: bool = True) -> Dict[str, Any]:
+        """
+        Build shared mesh kwargs for isosurface-like rendering.
+
+        This centralizes style mapping to keep render paths DRY.
+        """
+        render_style = self._current_render_mode_label
+        if isinstance(params, dict):
+            render_style = params.get('render_style', render_style)
+
+        style, show_edges, canonical = self.normalize_render_mode(render_style)
+        if sync_mode:
+            self._current_render_mode = style
+            self._current_render_show_edges = show_edges
+            self._current_render_mode_label = canonical
+
+        return {
+            'style': style,
+            'show_edges': show_edges,
+            'smooth_shading': True,
+            'specular': 0.4,
+            'diffuse': 0.7,
+            'ambient': 0.15,
+            'lighting': True
+        }
+
+    def _apply_actor_render_style(self, actor, style: str, show_edges: bool) -> bool:
+        """Apply style in-place to an existing actor without rebuilding scene objects."""
+        prop = getattr(actor, 'prop', None)
+        if prop is None:
+            try:
+                prop = actor.GetProperty()
+            except Exception:
+                prop = None
+        if prop is None:
+            return False
+
+        changed = False
+        try:
+            # PyVista actor property helper
+            prop.style = style
+            changed = True
+        except Exception:
+            try:
+                # VTK fallback
+                if style == 'wireframe':
+                    prop.SetRepresentationToWireframe()
+                elif style == 'points':
+                    prop.SetRepresentationToPoints()
+                else:
+                    prop.SetRepresentationToSurface()
+                changed = True
+            except Exception:
+                pass
+
+        try:
+            if hasattr(prop, 'show_edges'):
+                prop.show_edges = bool(show_edges)
+                changed = True
+            elif hasattr(prop, 'SetEdgeVisibility'):
+                prop.SetEdgeVisibility(1 if show_edges else 0)
+                changed = True
+        except Exception:
+            pass
+
+        return changed
+
+    def request_render_mode_change(self, mode_label: str) -> str:
+        """
+        Request an isosurface render-style change.
+
+        Returns:
+            'unchanged': requested mode equals current state
+            'applied': changed and applied in-place to current iso actor
+            'state_only': state changed but no live iso actor to mutate
+        """
+        style, show_edges, canonical = self.normalize_render_mode(mode_label)
+        if style == self._current_render_mode and show_edges == self._current_render_show_edges:
+            return 'unchanged'
+
+        self._current_render_mode = style
+        self._current_render_show_edges = show_edges
+        self._current_render_mode_label = canonical
+
+        if self.active_view_mode == 'iso' and self.iso_actor is not None:
+            if self._apply_actor_render_style(self.iso_actor, style, show_edges):
+                self.plotter.render()
+                return 'applied'
+        return 'state_only'
+
     def render_mesh(self, reset_view=True):
         """Render PNM mesh with PoreRadius colormap."""
         if not self.mesh:
@@ -234,10 +560,8 @@ class RenderEngine:
             except Exception:
                 pass
             
-        # Clean up previous actors before adding new ones
-        self.plotter.clear()
-        self.plotter.add_axes()
-        self.volume_actor = None
+        # Clean up previous scene actors before adding new ones.
+        self.clear_view()
         
         self.active_view_mode = 'mesh'
         self._update_clip_panel_state()
@@ -245,13 +569,81 @@ class RenderEngine:
             self.params_panel.set_mode('mesh')
         self.plotter.enable_lightkit()
 
-        params = self.params_panel.get_current_values() if self.params_panel else {}
+        params = self._get_render_params()
 
-        if "PoreRadius" in self.mesh.point_data:
+        # Priority 1: CompressionRatio (cached range) with optional highlight
+        if "CompressionRatio" in self.mesh.point_data:
+            comp = self.mesh.point_data["CompressionRatio"]
+            if self._pnm_compression_clim is None:
+                self._pnm_compression_clim = (float(comp.min()), float(comp.max()))
+            clim_comp = self._pnm_compression_clim
+
+            # Invert so smaller ratios look darker
+            comp_display = 1.0 - comp
+            clim_display = (1.0 - clim_comp[1], 1.0 - clim_comp[0])
+
+            if self._highlight_pore_id is not None and "ID" in self.mesh.point_data:
+                pore_ids = self.mesh.point_data.get("ID", np.array([]))
+                highlight_mask = (pore_ids == self._highlight_pore_id)
+                if highlight_mask.any():
+                    display_scalar = comp_display.copy()
+                    # set highlighted to max+10% to map to yellow
+                    display_scalar[highlight_mask] = clim_display[1] * 1.1
+                    self.plotter.add_mesh(
+                        self.mesh,
+                        scalars=display_scalar,
+                        cmap=['black', 'dimgray', 'lightgray', 'yellow'],
+                        clim=[clim_display[0], clim_display[1] * 1.1],
+                        show_scalar_bar=True,
+                        scalar_bar_args={'title': 'Compression (dark=compressed, yellow=selected)'},
+                        smooth_shading=True,
+                        specular=0.5
+                    )
+                    return
+
+            # No highlight
+            self.plotter.add_mesh(
+                self.mesh,
+                scalars=comp_display,
+                cmap='Greys',
+                clim=clim_display,
+                show_scalar_bar=True,
+                scalar_bar_args={'title': 'Compression (dark=compressed)'},
+                smooth_shading=True,
+                specular=0.5
+            )
+
+        # Priority 2: PoreRadius (cached range) with optional highlight
+        elif "PoreRadius" in self.mesh.point_data:
+            pore_radii = self.mesh.point_data["PoreRadius"]
+            if self._pnm_radius_clim is None:
+                self._pnm_radius_clim = (float(pore_radii.min()), float(pore_radii.max()))
+
+            if self._highlight_pore_id is not None and "ID" in self.mesh.point_data:
+                pore_ids = self.mesh.point_data.get("ID", np.array([]))
+                highlight_mask = (pore_ids == self._highlight_pore_id)
+                if highlight_mask.any():
+                    display_scalar = pore_radii.copy()
+                    max_radius = self._pnm_radius_clim[1]
+                    display_scalar[highlight_mask] = max_radius * 1.5
+                    self.plotter.add_mesh(
+                        self.mesh,
+                        scalars=display_scalar,
+                        cmap=['darkblue', 'blue', 'cyan', 'lime', 'yellow'],
+                        clim=[self._pnm_radius_clim[0], max_radius * 1.5],
+                        show_scalar_bar=True,
+                        scalar_bar_args={'title': 'Pore Radius (mm) - Yellow=Selected'},
+                        smooth_shading=True,
+                        specular=0.5
+                    )
+                    return
+
+            # Normal rendering with cached color range
             self.plotter.add_mesh(
                 self.mesh,
                 scalars="PoreRadius",
-                cmap=params.get('colormap', 'viridis'),
+                cmap=params.get('colormap', 'Oranges'),
+                clim=self._pnm_radius_clim,
                 show_scalar_bar=True,
                 scalar_bar_args={'title': 'Pore Radius (mm)'},
                 smooth_shading=True,
@@ -329,7 +721,7 @@ class RenderEngine:
                 self._cached_vol_grid_source = grid_id
 
             vol_grid = self._cached_vol_grid
-            params = self.params_panel.get_current_values() if self.params_panel else {}
+            params = self._get_render_params()
 
             self.volume_actor = self.plotter.add_volume(
                 vol_grid,
@@ -354,7 +746,7 @@ class RenderEngine:
         else:
             # Fast update without clearing
             self.update_status("Updating volume properties...")
-            params = self.params_panel.get_current_values() if self.params_panel else {}
+            params   = self._get_render_params()
             vol_grid = self._cached_vol_grid or self.grid.cell_data_to_point_data()
 
             old_actor = self.volume_actor
@@ -406,7 +798,7 @@ class RenderEngine:
             self.plotter.enable_lightkit()
             self.plotter.show_grid()
 
-        params = self.params_panel.get_current_values() if self.params_panel else {}
+        params = self._get_render_params()
         ox, oy, oz = self.grid.origin
         dx, dy, dz = self.grid.spacing
         x = ox + params.get('slice_x', 0) * dx
@@ -463,7 +855,8 @@ class RenderEngine:
         if self.params_panel:
             self.params_panel.set_mode('iso')
         self.plotter.enable_lightkit()
-        params = self.params_panel.get_current_values() if self.params_panel else {}
+        params = self._get_render_params()
+        mesh_kwargs = self.get_iso_mesh_kwargs(params=params, sync_mode=True)
 
         try:
             # Check cache
@@ -505,30 +898,20 @@ class RenderEngine:
                 
                 self._iso_cache[threshold] = contours
 
-            style_map = {'Surface': 'surface', 'Wireframe': 'wireframe', 'Wireframe + Surface': 'surface'}
-            render_style = style_map.get(params.get('render_style', 'Surface'), 'surface')
-            show_edges = params.get('render_style') == 'Wireframe + Surface'
-
-            mesh_kwargs = {
-                'style': render_style,
-                'show_edges': show_edges,
-                'smooth_shading': True,
-                'specular': 0.4,
-                'diffuse': 0.7,
-                'ambient': 0.15,
-                'lighting': True
-            }
-
             mode = params.get('coloring_mode', 'Solid Color')
+            actor = None
             if mode == 'Solid Color':
-                self.plotter.add_mesh(contours, color=params.get('solid_color', 'ivory'), **mesh_kwargs)
+                actor = self.plotter.add_mesh(contours, color=params.get('solid_color', 'ivory'), **mesh_kwargs)
             elif mode == 'Depth (Z-Axis)':
                 contours["Elevation"] = contours.points[:, 2]
-                self.plotter.add_mesh(contours, scalars="Elevation", cmap=params.get('colormap', 'viridis'), **mesh_kwargs)
+                actor = self.plotter.add_mesh(contours, scalars="Elevation", cmap=params.get('colormap', 'viridis'), **mesh_kwargs)
             elif mode == 'Radial (Center Dist)':
                 dist = np.linalg.norm(contours.points - contours.center, axis=1)
                 contours["RadialDistance"] = dist
-                self.plotter.add_mesh(contours, scalars="RadialDistance", cmap=params.get('colormap', 'viridis'), **mesh_kwargs)
+                actor = self.plotter.add_mesh(contours, scalars="RadialDistance", cmap=params.get('colormap', 'viridis'), **mesh_kwargs)
+
+            self.iso_actor = actor
+            self._current_iso_threshold = threshold
 
             self._apply_custom_lighting(params)
             self.plotter.add_axes()
@@ -546,10 +929,11 @@ class RenderEngine:
                     pass
         except Exception as e:
             print(f"Isosurface error: {e}")
+            self.iso_actor = None
 
     def render_isosurface_auto(self, reset_view=True):
         """Render isosurface with current threshold parameter."""
-        params = self.params_panel.get_current_values() if self.params_panel else {}
+        params = self._get_render_params()
         self.render_isosurface(threshold=params.get('threshold', 300), reset_view=reset_view)
 
     def _apply_custom_lighting(self, params):

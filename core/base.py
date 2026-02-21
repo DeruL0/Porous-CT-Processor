@@ -6,7 +6,7 @@ import numpy as np
 import pyvista as pv
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
-from typing import Tuple, Dict, Any, Optional, Callable
+from typing import Tuple, Dict, Any, Optional, Callable, runtime_checkable, Protocol
 
 
 @dataclass
@@ -77,15 +77,22 @@ class BaseProcessor(ABC):
         pass
 
 
-class BaseVisualizer(ABC):
-    """Abstract base class for visualization controllers."""
+@runtime_checkable
+class BaseVisualizer(Protocol):
+    """
+    Structural protocol for visualization controllers.
 
-    @abstractmethod
-    def set_data(self, data: VolumeData) -> None:
+    Using ``typing.Protocol`` instead of ``abc.ABC`` eliminates the
+    ``metaclass=_MainWindowMeta`` hack that was required to reconcile
+    QMainWindow's meta-type with ABCMeta.  Any class that implements
+    ``set_data`` and ``show`` satisfies this protocol automatically —
+    no explicit inheritance required.
+    """
+
+    def set_data(self, data: "VolumeData", reset_camera: bool = False) -> None:  # type: ignore[override]
         """Set valid data to the visualizer."""
-        pass
+        ...
 
-    @abstractmethod
     def show(self) -> None:
         """Show the visualization window."""
-        pass
+        ...
