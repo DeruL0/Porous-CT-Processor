@@ -8,8 +8,7 @@ from PyQt5.QtWidgets import QFileDialog, QMessageBox
 from core import VolumeProcessDTO, resolve_pipeline_stages, run_volume_pipeline
 from core.progress import CancelFlagObserver, ProgressBus, StageProgressMapper
 from gui.progress_observers import QtSignalProgressObserver
-from loaders import DummyLoader, LoadStrategy, SmartDicomLoader
-from processors import PoreExtractionProcessor
+from loaders import LoadStrategy
 
 
 class PipelineWorker(QThread):
@@ -57,86 +56,9 @@ class PipelineWorker(QThread):
             self.error.emit(str(exc))
 
 
-class VolumeLoadWorker(QThread):
-    """Background worker for synthetic/DICOM loading."""
-
-    finished = pyqtSignal(object)  # VolumeData
-    cancelled = pyqtSignal()
-    error = pyqtSignal(str)
-    progress = pyqtSignal(int, str)
-
-    def __init__(self, mode: str, folder_path: Optional[str] = None, strategy: Optional[LoadStrategy] = None):
-        super().__init__()
-        self.mode = mode
-        self.folder_path = folder_path
-        self.strategy = strategy
-        self._cancelled = False
-
-    def cancel(self) -> None:
-        self._cancelled = True
-
-    def run(self) -> None:
-        try:
-            def callback(percent: int, message: str) -> None:
-                if self._cancelled:
-                    raise InterruptedError("Operation cancelled by user.")
-                self.progress.emit(max(0, min(100, int(percent))), message)
-
-            if self.mode == "dummy":
-                data = DummyLoader().load(128, callback=callback)
-            elif self.mode == "dicom":
-                if not self.folder_path:
-                    raise ValueError("folder_path is required for dicom loading")
-                data = SmartDicomLoader(strategy=self.strategy).load(self.folder_path, callback=callback)
-            else:
-                raise ValueError(f"Unknown load mode: {self.mode}")
-
-            if self._cancelled:
-                self.cancelled.emit()
-                return
-            self.finished.emit(data)
-        except InterruptedError:
-            self.cancelled.emit()
-        except Exception as exc:
-            self.error.emit(str(exc))
-
-
-class ThresholdDetectWorker(QThread):
-    """Background worker for auto-threshold detection."""
-
-    finished = pyqtSignal(int)
-    cancelled = pyqtSignal()
-    error = pyqtSignal(str)
-    progress = pyqtSignal(int, str)
-
-    def __init__(self, data, algorithm: str):
-        super().__init__()
-        self.data = data
-        self.algorithm = algorithm
-        self._cancelled = False
-
-    def cancel(self) -> None:
-        self._cancelled = True
-
-    def run(self) -> None:
-        try:
-            if self._cancelled:
-                self.cancelled.emit()
-                return
-            self.progress.emit(0, f"Calculating threshold ({self.algorithm})...")
-            suggested = PoreExtractionProcessor.suggest_threshold(self.data, self.algorithm)
-            if self._cancelled:
-                self.cancelled.emit()
-                return
-            self.progress.emit(100, "Threshold detection complete.")
-            self.finished.emit(int(suggested))
-        except Exception as exc:
-            self.error.emit(str(exc))
-
-
 class WorkflowHandler(QObject):
     """
-    Handler for standard workflow operations (load, segment, model).
+    Handler for standard workflow operations (load, threshold, segment, model).
     """
 
     def __init__(self, main_controller):
@@ -147,14 +69,11 @@ class WorkflowHandler(QObject):
         self.data_manager = main_controller.data_manager
 
         self._pipeline_worker: Optional[PipelineWorker] = None
-        self._load_worker: Optional[VolumeLoadWorker] = None
-        self._threshold_worker: Optional[ThresholdDetectWorker] = None
         self._progress_dialog = None
 
     @property
     def is_busy(self) -> bool:
-        workers = (self._pipeline_worker, self._load_worker, self._threshold_worker)
-        return any(w is not None and w.isRunning() for w in workers)
+        return self._pipeline_worker is not None and self._pipeline_worker.isRunning()
 
     def _set_ui_busy(self, busy: bool) -> None:
         self.panel.setEnabled(not busy)
@@ -167,6 +86,96 @@ class WorkflowHandler(QObject):
             QMessageBox.warning(self.visualizer, "Busy", "Time-series operation is currently running.")
             return False
         return True
+
+    def _resolve_input_data(self):
+        """
+        Resolve runtime input data for processing.
+
+        In 4D mode, always prefer the currently selected timepoint volume.
+        """
+        ts_handler = getattr(self.controller, "timeseries_handler", None)
+        if ts_handler is not None and getattr(ts_handler, "has_volumes", False):
+            current = ts_handler.get_current_raw_volume()
+            if current is not None and current.raw_data is not None:
+                return current
+        return self.data_manager.active_data
+
+    def _start_pipeline_task(
+        self,
+        *,
+        dto: VolumeProcessDTO,
+        target_stage: str,
+        title: str,
+        success_callback: Callable[[dict], None],
+        error_title: str,
+        cancel_status: str,
+        ready_status: Optional[str] = "Ready.",
+        input_data=None,
+    ) -> None:
+        self._set_ui_busy(True)
+        self._progress_dialog = self.controller._create_progress_dialog(title)
+        self._pipeline_worker = PipelineWorker(
+            dto=dto,
+            input_data=input_data,
+            target_stage=target_stage,
+        )
+
+        def finalize():
+            dialog = self._progress_dialog
+            self._progress_dialog = None
+            if dialog is not None:
+                try:
+                    dialog.close()
+                except Exception:
+                    pass
+            self._set_ui_busy(False)
+            self._pipeline_worker = None
+
+        def on_progress(percent: int, message: str):
+            dialog = self._progress_dialog
+            if dialog is not None:
+                try:
+                    dialog.setValue(percent)
+                    dialog.setLabelText(message)
+                except (RuntimeError, AttributeError):
+                    # Dialog may already be closed by finish/cancel path.
+                    pass
+            self.visualizer.update_status(message)
+
+        def on_finished(results: dict):
+            finalize()
+            try:
+                success_callback(results)
+                if ready_status:
+                    self.visualizer.update_status(ready_status)
+            except Exception as exc:
+                self.controller._show_err(error_title, exc)
+
+        def on_cancelled():
+            finalize()
+            self.visualizer.update_status(cancel_status)
+
+        def on_error(message: str):
+            finalize()
+            self.controller._show_err(error_title, Exception(message))
+
+        def on_cancel_requested():
+            if self._pipeline_worker is not None:
+                self._pipeline_worker.cancel()
+                self.visualizer.update_status("Cancelling...")
+
+        self._pipeline_worker.progress.connect(on_progress)
+        self._pipeline_worker.finished.connect(on_finished)
+        self._pipeline_worker.cancelled.connect(on_cancelled)
+        self._pipeline_worker.error.connect(on_error)
+        self._progress_dialog.canceled.connect(on_cancel_requested)
+        self._pipeline_worker.start()
+
+    @staticmethod
+    def _strategy_value(strategy: Optional[LoadStrategy]) -> str:
+        if strategy is None:
+            return LoadStrategy.AUTO.value
+        return strategy.value
 
     def load_dicom_dialog(self):
         """Load DICOM with full resolution."""
@@ -195,101 +204,94 @@ class WorkflowHandler(QObject):
             self.load_dicom_path(folder, strategy=LoadStrategy.FAST)
 
     def load_dicom_path(self, folder_path: str, strategy: Optional[LoadStrategy] = None) -> None:
-        """Load DICOM from a known folder path asynchronously."""
+        """Load DICOM from a known folder path asynchronously through shared DAG."""
+        if not self._ensure_idle():
+            return
+
         title = "Loading scan data (fast)..." if strategy == LoadStrategy.FAST else "Loading scan data..."
-        self._run_load_worker(mode="dicom", title=title, folder_path=folder_path, strategy=strategy)
+        dto = VolumeProcessDTO(
+            input_path=folder_path,
+            loader_type="dicom",
+            load_strategy=self._strategy_value(strategy),
+            export_formats=tuple(),
+        )
+
+        def on_complete(results: dict) -> None:
+            data = results.get("load")
+            if data is None:
+                raise ValueError("Load stage did not return volume data.")
+
+            self.data_manager.load_raw_data(data)
+            self.visualizer.set_data(data)
+            self.panel.set_threshold(-300)
+            load_mode = data.metadata.get("LoadStrategy", "Auto")
+            self.controller._show_msg("Scan Loaded", f"Loaded successfully.\nMode: {load_mode}")
+
+        self._start_pipeline_task(
+            dto=dto,
+            target_stage="load",
+            input_data=None,
+            title=title,
+            success_callback=on_complete,
+            error_title="Loading Error",
+            cancel_status="Loading cancelled.",
+        )
 
     # Backward compatibility for legacy caller App.run(...)
     def _load_data(self, folder_path: str, strategy: Optional[LoadStrategy] = None):
         self.load_dicom_path(folder_path, strategy=strategy)
 
     def load_dummy_data(self):
-        """Generate and load synthetic sample data."""
+        """Generate and load synthetic sample data through shared DAG."""
         if not self._ensure_idle():
             return
-        self._run_load_worker(mode="dummy", title="Generating synthetic sample...")
 
-    def _run_load_worker(
-        self,
-        mode: str,
-        title: str,
-        folder_path: Optional[str] = None,
-        strategy: Optional[LoadStrategy] = None,
-    ) -> None:
-        self._set_ui_busy(True)
-        self._progress_dialog = self.controller._create_progress_dialog(title)
-        self._load_worker = VolumeLoadWorker(mode=mode, folder_path=folder_path, strategy=strategy)
+        dto = VolumeProcessDTO(
+            input_path="128",
+            loader_type="dummy",
+            export_formats=tuple(),
+        )
 
-        def on_progress(percent: int, message: str):
-            self._progress_dialog.setValue(percent)
-            self._progress_dialog.setLabelText(message)
-            self.visualizer.update_status(message)
-
-        def on_finished(data):
-            self._progress_dialog.close()
-            self._set_ui_busy(False)
-            self._load_worker = None
+        def on_complete(results: dict) -> None:
+            data = results.get("load")
+            if data is None:
+                raise ValueError("Load stage did not return volume data.")
 
             self.data_manager.load_raw_data(data)
             self.visualizer.set_data(data)
-            if mode == "dummy":
-                self.panel.set_threshold(500)
-                self.controller._show_msg("Sample Loaded", "Synthetic sample ready.")
-            else:
-                self.panel.set_threshold(-300)
-                load_mode = data.metadata.get("LoadStrategy", "Auto")
-                self.controller._show_msg("Scan Loaded", f"Loaded successfully.\nMode: {load_mode}")
-            self.visualizer.update_status("Ready.")
+            self.panel.set_threshold(500)
+            self.controller._show_msg("Sample Loaded", "Synthetic sample ready.")
 
-        def on_cancelled():
-            self._progress_dialog.close()
-            self._set_ui_busy(False)
-            self._load_worker = None
-            self.visualizer.update_status("Loading cancelled.")
-
-        def on_error(message: str):
-            self._progress_dialog.close()
-            self._set_ui_busy(False)
-            self._load_worker = None
-            self.controller._show_err("Loading Error", Exception(message))
-
-        def on_cancel_requested():
-            if self._load_worker is not None:
-                self._load_worker.cancel()
-                self.visualizer.update_status("Cancelling...")
-
-        self._load_worker.progress.connect(on_progress)
-        self._load_worker.finished.connect(on_finished)
-        self._load_worker.cancelled.connect(on_cancelled)
-        self._load_worker.error.connect(on_error)
-        self._progress_dialog.canceled.connect(on_cancel_requested)
-        self._load_worker.start()
+        self._start_pipeline_task(
+            dto=dto,
+            target_stage="load",
+            input_data=None,
+            title="Generating synthetic sample...",
+            success_callback=on_complete,
+            error_title="Loading Error",
+            cancel_status="Loading cancelled.",
+        )
 
     def auto_detect_threshold(self):
-        """Run auto-threshold detection for active data."""
+        """Run auto-threshold detection through shared DAG threshold stage."""
         if not self._ensure_idle():
             return
 
-        current_data = self.data_manager.active_data
+        current_data = self._resolve_input_data()
         if not current_data or current_data.raw_data is None:
             QMessageBox.warning(self.visualizer, "No Data", "Please load a sample first.")
             return
 
         algorithm = self.panel.get_algorithm()
-        self._set_ui_busy(True)
-        self._progress_dialog = self.controller._create_progress_dialog("Detecting threshold...")
-        self._threshold_worker = ThresholdDetectWorker(current_data, algorithm)
+        dto = VolumeProcessDTO(
+            threshold=float(self.panel.get_threshold()),
+            auto_threshold=True,
+            threshold_algorithm=algorithm,
+            export_formats=tuple(),
+        )
 
-        def on_progress(percent: int, message: str):
-            self._progress_dialog.setValue(percent)
-            self._progress_dialog.setLabelText(message)
-            self.visualizer.update_status(message)
-
-        def on_finished(suggested: int):
-            self._progress_dialog.close()
-            self._set_ui_busy(False)
-            self._threshold_worker = None
-
+        def on_complete(results: dict) -> None:
+            suggested = int(results.get("threshold"))
             self.panel.set_threshold(suggested)
             algo_display = algorithm.capitalize() if algorithm != "auto" else "Auto"
             self.visualizer.update_status(f"Threshold set to {suggested} HU ({algo_display})")
@@ -298,35 +300,23 @@ class WorkflowHandler(QObject):
                 f"Threshold: {suggested} HU\nAlgorithm: {algo_display}",
             )
 
-        def on_cancelled():
-            self._progress_dialog.close()
-            self._set_ui_busy(False)
-            self._threshold_worker = None
-            self.visualizer.update_status("Threshold detection cancelled.")
-
-        def on_error(message: str):
-            self._progress_dialog.close()
-            self._set_ui_busy(False)
-            self._threshold_worker = None
-            self.controller._show_err("Threshold Detection Failed", Exception(message))
-
-        def on_cancel_requested():
-            if self._threshold_worker is not None:
-                self._threshold_worker.cancel()
-                self.visualizer.update_status("Cancelling...")
-
-        self._threshold_worker.progress.connect(on_progress)
-        self._threshold_worker.finished.connect(on_finished)
-        self._threshold_worker.cancelled.connect(on_cancelled)
-        self._threshold_worker.error.connect(on_error)
-        self._progress_dialog.canceled.connect(on_cancel_requested)
-        self._threshold_worker.start()
+        self._start_pipeline_task(
+            dto=dto,
+            target_stage="threshold",
+            input_data=current_data,
+            title="Detecting threshold...",
+            success_callback=on_complete,
+            error_title="Threshold Detection Failed",
+            cancel_status="Threshold detection cancelled.",
+            ready_status=None,
+        )
 
     def _build_runtime_dto(self) -> VolumeProcessDTO:
         """Create processing DTO from current GUI controls."""
         return VolumeProcessDTO(
             threshold=float(self.panel.get_threshold()),
             auto_threshold=False,
+            threshold_algorithm=str(self.panel.get_algorithm()),
             export_formats=tuple(),
         )
 
@@ -340,54 +330,20 @@ class WorkflowHandler(QObject):
         if not self._ensure_idle():
             return
 
-        current_data = self.data_manager.active_data
+        current_data = self._resolve_input_data()
         if not current_data or current_data.raw_data is None:
             QMessageBox.warning(self.visualizer, "No Data", "Please load a sample first.")
             return
 
-        self._set_ui_busy(True)
-        self._progress_dialog = self.controller._create_progress_dialog(title)
-        self._pipeline_worker = PipelineWorker(
+        self._start_pipeline_task(
             dto=self._build_runtime_dto(),
-            input_data=current_data,
             target_stage=target_stage,
+            input_data=current_data,
+            title=title,
+            success_callback=success_callback,
+            error_title="Processing Failed",
+            cancel_status="Processing cancelled.",
         )
-
-        def on_progress(percent: int, message: str):
-            self._progress_dialog.setValue(percent)
-            self._progress_dialog.setLabelText(message)
-            self.visualizer.update_status(message)
-
-        def on_finished(results: dict):
-            self._progress_dialog.close()
-            self._set_ui_busy(False)
-            self._pipeline_worker = None
-            self.visualizer.update_status("Ready.")
-            success_callback(results)
-
-        def on_cancelled():
-            self._progress_dialog.close()
-            self._set_ui_busy(False)
-            self._pipeline_worker = None
-            self.visualizer.update_status("Processing cancelled.")
-
-        def on_error(message: str):
-            self._progress_dialog.close()
-            self._set_ui_busy(False)
-            self._pipeline_worker = None
-            self.controller._show_err("Processing Failed", Exception(message))
-
-        def on_cancel_requested():
-            if self._pipeline_worker is not None:
-                self._pipeline_worker.cancel()
-                self.visualizer.update_status("Cancelling...")
-
-        self._pipeline_worker.progress.connect(on_progress)
-        self._pipeline_worker.finished.connect(on_finished)
-        self._pipeline_worker.cancelled.connect(on_cancelled)
-        self._pipeline_worker.error.connect(on_error)
-        self._progress_dialog.canceled.connect(on_cancel_requested)
-        self._pipeline_worker.start()
 
     def run_processor_async(self, processor, success_callback):
         """
@@ -409,3 +365,4 @@ class WorkflowHandler(QObject):
             success_callback(results.get(stage))
 
         self.run_pipeline_async(target_stage=stage, success_callback=adapt)
+

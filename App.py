@@ -30,6 +30,7 @@ class AppController:
 
         self.workflow_handler = WorkflowHandler(self)
         self.timeseries_handler = TimeseriesHandler(self)
+        self.visualizer.set_timeseries_handler(self.timeseries_handler)
         self._connect_signals()
 
     def _setup_workflow_ui(self):
@@ -88,6 +89,8 @@ class AppController:
                 raise ValueError("Segmentation result not found in pipeline output.")
 
             self.data_manager.set_segmented_data(segmented)
+            if self.timeseries_handler.has_volumes:
+                self.timeseries_handler.cache_segmented_for_current(segmented)
             self.visualizer.set_data(segmented)
 
             meta = segmented.metadata
@@ -187,3 +190,4 @@ class AppController:
 if __name__ == "__main__":
     app = AppController()
     app.run()
+

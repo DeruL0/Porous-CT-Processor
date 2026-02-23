@@ -276,11 +276,10 @@ def extract_shifted_overlap_region(
     current_regions: np.ndarray,
     local_reference_mask: np.ndarray,
     bbox_mins: np.ndarray,
-    reference_center: np.ndarray,
-    expected_center: np.ndarray,
+    shift_zyx: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Extract aligned local region by shifting reference bbox toward expected center.
+    Extract aligned local region by shifting the reference bbox in voxel-space.
 
     Returns:
       (shifted_ref_mask, shifted_current_region) with identical shape.
@@ -290,9 +289,7 @@ def extract_shifted_overlap_region(
         return np.zeros((0, 0, 0), dtype=bool), np.zeros((0, 0, 0), dtype=current_regions.dtype)
 
     mins = np.asarray(bbox_mins, dtype=np.int64)
-    ref_c = np.asarray(reference_center, dtype=np.float64)
-    exp_c = np.asarray(expected_center, dtype=np.float64)
-    shift_zyx = np.rint(exp_c - ref_c).astype(np.int64)
+    shift_zyx = np.asarray(np.rint(shift_zyx), dtype=np.int64)
 
     target_mins = mins + shift_zyx
     target_maxs = target_mins + shape

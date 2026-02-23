@@ -5,7 +5,7 @@ Delegates rendering logic to RenderEngine for separation of concerns.
 
 import math
 import weakref
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pyvista as pv
@@ -17,6 +17,7 @@ from PyQt5.QtCore import Qt, QTimer, QSignalBlocker
 from PyQt5.QtGui import QFont, QCloseEvent
 
 from core import VolumeData
+from core.coordinates import world_xyz_to_index_zyx
 from gui.panels import (
     VisualizationModePanel,
     RenderingParametersPanel,
@@ -45,6 +46,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self._data_manager = None
+        self._active_overlay_layers: List[Dict[str, Any]] = []
+        self._replaying_overlays = False
+        self._timeseries_handler = None
 
         self.setWindowTitle("Porous CT Analysis Suite")
         self.setGeometry(100, 100, 1400, 900)
@@ -161,6 +165,8 @@ class MainWindow(QMainWindow):
         self.mode_panel.iso_clicked.connect(self.render_isosurface_auto)
         self.mode_panel.clear_clicked.connect(self.clear_view)
         self.mode_panel.reset_camera_clicked.connect(self.reset_camera)
+        self.mode_panel.overlay_layer_requested.connect(self._on_add_overlay_layer)
+        self.mode_panel.overlays_cleared.connect(self._on_clear_overlays)
         layout.addWidget(self.mode_panel)
 
         # Parameters Panel
@@ -284,8 +290,10 @@ class MainWindow(QMainWindow):
     # BaseVisualizer Interface
     # ==========================================
 
-    def set_data(self, data: VolumeData, reset_camera: bool = False):
+    def set_data(self, data: VolumeData, reset_camera: bool = False, preserve_overlays: bool = False):
         """Set data and delegate to RenderEngine."""
+        if not preserve_overlays:
+            self._on_clear_overlays(silent=True)
         previous_mode = self.active_view_mode
         self.render_engine.set_data(data)
         
@@ -374,6 +382,10 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'roi_handler'):
             self.roi_handler._data_manager = data_manager
 
+    def set_timeseries_handler(self, handler) -> None:
+        """Inject 4D handler so main window can resolve per-timepoint sources."""
+        self._timeseries_handler = handler
+
     # ==========================================
     # Helper Methods for Data Operations
     # ==========================================
@@ -403,10 +415,131 @@ class MainWindow(QMainWindow):
             self.render_volume(reset_view=True)
 
     # ==========================================
+    # Overlay Helpers
+    # ==========================================
+
+    def _resolve_overlay_volume(self, source_name: str) -> Optional[VolumeData]:
+        """Resolve UI source selection to a volume object."""
+        if not self._data_manager:
+            return None
+
+        normalized = str(source_name or "").strip().lower()
+        if normalized == "raw ct":
+            ts = self._timeseries_handler
+            if ts is not None and getattr(ts, "has_volumes", False):
+                current = ts.get_current_raw_volume()
+                if current is not None:
+                    return current
+            return self._data_manager.raw_ct_data
+        if normalized == "segmented":
+            ts = self._timeseries_handler
+            if ts is not None and getattr(ts, "has_volumes", False):
+                ts_panel = getattr(ts, "panel", None)
+                threshold_getter = getattr(ts_panel, "get_threshold", None)
+                threshold = int(threshold_getter() if callable(threshold_getter) else 0)
+                return ts.get_or_request_segmented_overlay(
+                    threshold=threshold,
+                    on_ready=self._replay_overlays,
+                )
+            return self._data_manager.segmented_volume
+        return None
+
+    def _add_overlay_layer(
+        self,
+        layer_key: str,
+        source_name: str,
+        opacity: float,
+        *,
+        track_state: bool = True,
+        silent: bool = False,
+    ) -> bool:
+        layer = str(layer_key or "").strip().lower()
+        source = str(source_name or "").strip().lower()
+        alpha = float(max(0.0, min(1.0, opacity)))
+
+        # ROI is intentionally excluded from overlay sources.
+        if source == "roi":
+            if not silent:
+                self.update_status("Overlay skipped: ROI source is disabled.")
+            return False
+
+        if layer == "pnm_mesh":
+            pnm_data = self._data_manager.pnm_model if self._data_manager else None
+            if pnm_data is None or not pnm_data.has_mesh:
+                if not silent:
+                    self.update_status("Overlay skipped: PNM mesh is not available.")
+                return False
+            success = self.render_engine.add_overlay_layer(layer, opacity=alpha, mesh_data=pnm_data)
+        else:
+            overlay_volume = self._resolve_overlay_volume(source_name)
+            if overlay_volume is None or overlay_volume.raw_data is None:
+                if not silent:
+                    self.update_status(f"Overlay skipped: source '{source_name}' is not available.")
+                return False
+            if not self.render_engine.set_overlay_volume(overlay_volume):
+                if not silent:
+                    self.update_status("Overlay skipped: failed to prepare overlay volume.")
+                return False
+            success = self.render_engine.add_overlay_layer(layer, opacity=alpha)
+
+        if not success:
+            if not silent:
+                self.update_status(f"Overlay failed: {layer_key}.")
+            return False
+
+        if track_state:
+            descriptor = {"layer": layer, "source": source_name, "opacity": alpha}
+            if descriptor not in self._active_overlay_layers:
+                self._active_overlay_layers.append(descriptor)
+
+        if not silent:
+            self.update_status(f"Overlay added: {layer_key}")
+        return True
+
+    def _on_add_overlay_layer(self, layer_key: str, source_name: str, opacity: float):
+        layer = str(layer_key or "").strip().lower()
+        alpha = float(max(0.0, min(1.0, opacity)))
+        descriptor = {"layer": layer, "source": source_name, "opacity": alpha}
+        if descriptor not in self._active_overlay_layers:
+            self._active_overlay_layers.append(descriptor)
+        self._add_overlay_layer(layer_key, source_name, alpha, track_state=False, silent=False)
+
+    def _on_clear_overlays(self, silent: bool = False):
+        self._active_overlay_layers.clear()
+        if hasattr(self, "render_engine"):
+            self.render_engine.remove_overlay_layers()
+        if not silent:
+            self.update_status("Overlay layers cleared.")
+
+    def _replay_overlays(self):
+        if self._replaying_overlays or not self._active_overlay_layers:
+            return
+
+        self._replaying_overlays = True
+        try:
+            requested_layers = list(self._active_overlay_layers)
+            if hasattr(self, "render_engine"):
+                # Ensure idempotent replay even when base view used an in-place
+                # update path (for example volume property tweaks).
+                self.render_engine.remove_overlay_layers(render=False)
+
+            for item in requested_layers:
+                self._add_overlay_layer(
+                    layer_key=str(item.get("layer", "")),
+                    source_name=str(item.get("source", "Raw CT")),
+                    opacity=float(item.get("opacity", 0.35)),
+                    track_state=False,
+                    silent=True,
+                )
+        finally:
+            self._replaying_overlays = False
+
+    # ==========================================
     # Rendering Delegation
     # ==========================================
 
     def clear_view(self):
+        self._on_clear_overlays(silent=True)
         self.render_engine.clear_view()
 
     def reset_camera(self):
@@ -414,18 +547,23 @@ class MainWindow(QMainWindow):
 
     def render_mesh(self, reset_view=True):
         self.render_engine.render_mesh(reset_view=reset_view)
+        self._replay_overlays()
 
     def render_volume(self, reset_view=True):
         self.render_engine.render_volume(reset_view=reset_view)
+        self._replay_overlays()
 
     def render_slices(self, reset_view=True):
         self.render_engine.render_slices(reset_view=reset_view)
+        self._replay_overlays()
 
     def render_isosurface_auto(self, reset_view=True):
         self.render_engine.render_isosurface_auto(reset_view=reset_view)
+        self._replay_overlays()
 
     def render_isosurface(self, threshold=300, reset_view=True):
         self.render_engine.render_isosurface(threshold=threshold, reset_view=reset_view)
+        self._replay_overlays()
 
     def _sync_render_style_ui(self):
         """Sync render-style combo to engine state without emitting UI signals."""
@@ -479,6 +617,26 @@ class MainWindow(QMainWindow):
         import traceback
 
         min_val, max_val = float(clim[0]), float(clim[1])
+        ts = self._timeseries_handler
+        if ts is not None and getattr(ts, "has_volumes", False):
+            def on_transform_done(result: Dict[str, Any]) -> None:
+                current_min = int(result.get("current_data_min", min_val))
+                current_max = int(result.get("current_data_max", max_val))
+                self.params_panel.set_data_range(current_min, current_max)
+                self._update_histogram()
+                self._refresh_view()
+                if result.get("cancelled", False):
+                    self.update_status("4D clip cancelled (applied frames kept).")
+                else:
+                    self.update_status(f"Applied 4D clip: [{min_val:.0f}, {max_val:.0f}]")
+
+            ts.run_series_transform(
+                mode="clip",
+                min_val=min_val,
+                max_val=max_val,
+                completion_callback=on_transform_done,
+            )
+            return
 
         try:
             # Step 1: Clear render caches
@@ -531,6 +689,37 @@ class MainWindow(QMainWindow):
             return
 
         import traceback
+        current_clim = self.params_panel.get_current_values().get('clim', [0, 1000])
+        old_min_clim, old_max_clim = float(current_clim[0]), float(current_clim[1])
+        ts = self._timeseries_handler
+        if ts is not None and getattr(ts, "has_volumes", False):
+            def on_transform_done(result: Dict[str, Any]) -> None:
+                data_min = float(result.get("current_data_min", old_min_clim))
+                data_max = float(result.get("current_data_max", old_max_clim))
+                invert_offset = float(result.get("invert_offset", data_min + data_max))
+                new_min_clim = int(invert_offset - old_max_clim)
+                new_max_clim = int(invert_offset - old_min_clim)
+
+                self.params_panel.set_data_range(int(data_min), int(data_max))
+                self.params_panel.block_signals(True)
+                self.params_panel.slider_clim_min.setValue(new_min_clim)
+                self.params_panel.slider_clim_max.setValue(new_max_clim)
+                self.params_panel.spinbox_clim_min.setValue(new_min_clim)
+                self.params_panel.spinbox_clim_max.setValue(new_max_clim)
+                self.params_panel.block_signals(False)
+                self._update_histogram()
+                self._refresh_view()
+
+                if result.get("cancelled", False):
+                    self.update_status("4D invert cancelled (applied frames kept).")
+                else:
+                    self.update_status(f"4D volume inverted. Clim: [{new_min_clim}, {new_max_clim}]")
+
+            ts.run_series_transform(
+                mode="invert",
+                completion_callback=on_transform_done,
+            )
+            return
 
         try:
             # Step 1: Clear render caches
@@ -539,7 +728,6 @@ class MainWindow(QMainWindow):
 
             # Step 2: Get current clim before inversion (for UI update)
             data = self._data_manager.active_data
-            current_clim = self.params_panel.get_current_values().get('clim', [0, 1000])
             old_min_clim, old_max_clim = current_clim[0], current_clim[1]
 
             # Step 3: Delegate data inversion to DataManager.
@@ -636,19 +824,20 @@ class MainWindow(QMainWindow):
                 return
 
             world_pos = picker.GetPickPosition()
-            ox, oy, oz = self.data.origin
-            sx, sy, sz = self.data.spacing
-
-            raw_z = int(round((world_pos[0] - ox) / sx))
-            raw_y = int(round((world_pos[1] - oy) / sy))
-            raw_x = int(round((world_pos[2] - oz) / sz))
+            raw_z, raw_y, raw_x = world_xyz_to_index_zyx(
+                (float(world_pos[0]), float(world_pos[1]), float(world_pos[2])),
+                self.data.spacing,
+                self.data.origin,
+                rounding="round",
+            )
 
             shape = self.data.raw_data.shape
             if 0 <= raw_z < shape[0] and 0 <= raw_y < shape[1] and 0 <= raw_x < shape[2]:
                 val = self.data.raw_data[raw_z, raw_y, raw_x]
                 self.status_bar.showMessage(
-                    f"📍 Pos: ({world_pos[0]:.1f}, {world_pos[1]:.1f}, {world_pos[2]:.1f}) | "
-                    f"Indices: [{raw_z}, {raw_y}, {raw_x}] | 💡 HU: {val:.1f}"
+                    f"馃搷 Pos: ({world_pos[0]:.1f}, {world_pos[1]:.1f}, {world_pos[2]:.1f}) | "
+                    f"Indices: [{raw_z}, {raw_y}, {raw_x}] | 馃挕 HU: {val:.1f}"
                 )
         except Exception:
             pass
+

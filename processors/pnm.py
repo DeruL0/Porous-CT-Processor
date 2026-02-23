@@ -20,6 +20,7 @@ from typing import Optional, Callable
 import gc
 
 from core import BaseProcessor, VolumeData
+from core.coordinates import voxel_zyx_to_world_xyz
 from processors.utils import binary_fill_holes, distance_transform_edt, find_local_maxima
 from processors.pnm_adjacency import find_adjacency
 from processors.pnm_throat import create_throat_mesh
@@ -301,7 +302,6 @@ class PoreToSphereProcessor(BaseProcessor):
         """Extract pore centroids, radii, and volumes for mesh generation and tracking."""
         slices = ndimage.find_objects(regions)
         sx, sy, sz = spacing
-        ox, oy, oz = origin
         avg_spacing = (sx + sy + sz) / 3.0
 
         def process_single_pore(i):
@@ -319,10 +319,10 @@ class PoreToSphereProcessor(BaseProcessor):
             radius = r_vox * avg_spacing
 
             local_cent = ndimage.center_of_mass(local_mask)
-
-            cz = (slice_obj[0].start + local_cent[0]) * sz + oz
-            cy = (slice_obj[1].start + local_cent[1]) * sy + oy
-            cx = (slice_obj[2].start + local_cent[2]) * sx + ox
+            center_z = slice_obj[0].start + local_cent[0]
+            center_y = slice_obj[1].start + local_cent[1]
+            center_x = slice_obj[2].start + local_cent[2]
+            cx, cy, cz = voxel_zyx_to_world_xyz(center_z, center_y, center_x, spacing, origin)
 
             return (label_idx, [cx, cy, cz], radius, int(voxel_count))
 

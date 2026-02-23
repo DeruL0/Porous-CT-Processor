@@ -105,10 +105,12 @@ class VolumeProcessDTO:
     # Input
     input_path:       str                       = ""
     loader_type:      str                       = "dicom"    # "dicom" | "dummy"
+    load_strategy:    str                       = "auto"     # "auto" | "full" | "fast" | "mmap" | "chunked"
 
     # Segmentation
     threshold:        float                     = 300.0
     auto_threshold:   bool                      = False
+    threshold_algorithm: str                    = "auto"     # "auto" | "otsu" | "li" | "yen" | "triangle" | "minimum"
 
     # PNM
     min_pore_size:    int                       = 100
@@ -136,8 +138,10 @@ class VolumeProcessDTO:
         return VolumeProcessDTO(
             input_path      = str(d.get("input_path",      "")),
             loader_type     = str(d.get("loader_type",     "dicom")),
+            load_strategy   = str(d.get("load_strategy",   "auto")),
             threshold       = float(d.get("threshold",     300.0)),
             auto_threshold  = bool(d.get("auto_threshold", False)),
+            threshold_algorithm = str(d.get("threshold_algorithm", "auto")),
             min_pore_size   = int(d.get("min_pore_size",   100)),
             min_throat_dist = int(d.get("min_throat_dist", 3)),
             output_dir      = d.get("output_dir"),
@@ -167,8 +171,10 @@ class VolumeProcessDTO:
         return {
             "input_path":      self.input_path,
             "loader_type":     self.loader_type,
+            "load_strategy":   self.load_strategy,
             "threshold":       self.threshold,
             "auto_threshold":  self.auto_threshold,
+            "threshold_algorithm": self.threshold_algorithm,
             "min_pore_size":   self.min_pore_size,
             "min_throat_dist": self.min_throat_dist,
             "output_dir":      self.output_dir,

@@ -167,6 +167,7 @@ class TrackingAnalysisPanel(QWidget):
         self._time_series_pnm = None
         self._current_timepoint = 0
         self._eval_by_time_and_pore: Dict[int, Dict[int, Dict[str, Any]]] = {}
+        self._eval_reason_by_time: Dict[int, str] = {}
         self._has_eval = False
         self._setup_ui()
         self.setEnabled(False)
@@ -179,7 +180,7 @@ class TrackingAnalysisPanel(QWidget):
         summary_layout = QVBoxLayout(self._summary_group)
         apply_group_layout(summary_layout)
 
-        self._summary_table = QTableWidget(4, 2)
+        self._summary_table = QTableWidget(7, 2)
         self._summary_table.setHorizontalHeaderLabels(["Metric", "Value"])
         self._summary_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._summary_table.verticalHeader().setVisible(False)
@@ -191,6 +192,9 @@ class TrackingAnalysisPanel(QWidget):
         self._set_summary_row(1, "Active", "--")
         self._set_summary_row(2, "Compressed", "--")
         self._set_summary_row(3, "Avg. Retention", "--")
+        self._set_summary_row(4, "Ref->GT Cov.", "--")
+        self._set_summary_row(5, "Novel Seg./step", "--")
+        self._set_summary_row(6, "Pore Trk.Acc", "--")
         summary_layout.addWidget(self._summary_table)
         layout.addWidget(self._summary_group)
 
@@ -246,13 +250,14 @@ class TrackingAnalysisPanel(QWidget):
 
     def _index_evaluation(self) -> None:
         self._eval_by_time_and_pore = {}
+        self._eval_reason_by_time = {}
         self._has_eval = False
         if self._time_series_pnm is None:
             return
 
         tracking = getattr(self._time_series_pnm, "tracking", None)
         eval_report = getattr(tracking, "evaluation", {}) if tracking is not None else {}
-        if not isinstance(eval_report, dict) or not bool(eval_report.get("available", False)):
+        if not isinstance(eval_report, dict):
             return
 
         steps = eval_report.get("steps", [])
@@ -264,6 +269,11 @@ class TrackingAnalysisPanel(QWidget):
                 continue
             t = step.get("time_index")
             if not isinstance(t, int):
+                continue
+            if not bool(step.get("evaluated", False)):
+                reason = self._extract_na_reason(step)
+                if reason:
+                    self._eval_reason_by_time[t] = reason
                 continue
             tracking_eval = step.get("tracking", {})
             one_step: Dict[int, Dict[str, Any]] = {}
@@ -310,8 +320,31 @@ class TrackingAnalysisPanel(QWidget):
         self._has_eval = len(self._eval_by_time_and_pore) > 0
 
     @staticmethod
-    def _eval_label_and_color(eval_detail: Optional[Dict[str, Any]]) -> Tuple[str, Optional[QColor]]:
+    def _extract_na_reason(step: Dict[str, Any]) -> Optional[str]:
+        tracking = step.get("tracking")
+        if isinstance(tracking, dict):
+            reason = tracking.get("reason")
+            if isinstance(reason, str) and reason.strip():
+                return reason.strip()
+
+        errors = step.get("errors")
+        if isinstance(errors, list) and errors:
+            return str(errors[0]).strip()
+
+        warnings = step.get("warnings")
+        if isinstance(warnings, list) and warnings:
+            return str(warnings[0]).strip()
+        return None
+
+    @staticmethod
+    def _eval_label_and_color(
+        eval_detail: Optional[Dict[str, Any]],
+        na_reason: Optional[str] = None,
+    ) -> Tuple[str, Optional[QColor]]:
         if not isinstance(eval_detail, dict):
+            if na_reason:
+                compact = na_reason if len(na_reason) <= 32 else f"{na_reason[:29]}..."
+                return (f"n/a: {compact}", None)
             return ("n/a", None)
 
         outcome = str(eval_detail.get("outcome", "unknown"))
@@ -349,6 +382,22 @@ class TrackingAnalysisPanel(QWidget):
         self._set_summary_row(1, "Active", str(summary.get("active_pores", 0)))
         self._set_summary_row(2, "Compressed", str(summary.get("compressed_pores", 0)))
         self._set_summary_row(3, "Avg. Retention", f"{summary.get('avg_volume_retention', 0):.1%}")
+        eval_report = getattr(time_series_pnm.tracking, "evaluation", {})
+        if isinstance(eval_report, dict) and eval_report.get("available"):
+            overall = eval_report.get("overall", {})
+            ref_cov = float(overall.get("t0_reference_gt_coverage", 0.0))
+            novel_avg = float(overall.get("mean_untracked_novel_segments", 0.0))
+            pore_trk_acc = overall.get("mean_pore_level_tracking_accuracy")
+            self._set_summary_row(4, "Ref->GT Cov.", f"{ref_cov:.1%}")
+            self._set_summary_row(5, "Novel Seg./step", f"{novel_avg:.2f}")
+            if isinstance(pore_trk_acc, (int, float)):
+                self._set_summary_row(6, "Pore Trk.Acc", f"{float(pore_trk_acc):.1%}")
+            else:
+                self._set_summary_row(6, "Pore Trk.Acc", "--")
+        else:
+            self._set_summary_row(4, "Ref->GT Cov.", "--")
+            self._set_summary_row(5, "Novel Seg./step", "--")
+            self._set_summary_row(6, "Pore Trk.Acc", "--")
         self._adjust_table_height(self._summary_table, max_height=260)
 
         self.update_view()
@@ -373,6 +422,7 @@ class TrackingAnalysisPanel(QWidget):
             pore_ids = tracking.get_compressed_pore_ids(self._current_timepoint)
 
         eval_for_time = self._eval_by_time_and_pore.get(self._current_timepoint, {}) if self._has_eval else {}
+        eval_reason = self._eval_reason_by_time.get(self._current_timepoint)
 
         self._pore_table.setRowCount(len(pore_ids))
         for row, pore_id in enumerate(pore_ids):
@@ -390,7 +440,7 @@ class TrackingAnalysisPanel(QWidget):
             self._pore_table.setItem(row, 3, QTableWidgetItem(f"{vol_now:.0f}"))
 
             eval_detail = eval_for_time.get(int(pore_id)) if isinstance(eval_for_time, dict) else None
-            eval_label, eval_color = self._eval_label_and_color(eval_detail)
+            eval_label, eval_color = self._eval_label_and_color(eval_detail, na_reason=eval_reason)
             self._pore_table.setItem(row, 4, QTableWidgetItem(eval_label))
 
             if self._has_eval and eval_detail is not None:
@@ -427,11 +477,15 @@ class TrackingAnalysisPanel(QWidget):
         self._time_series_pnm = None
         self._current_timepoint = 0
         self._eval_by_time_and_pore = {}
+        self._eval_reason_by_time = {}
         self._has_eval = False
         self._pore_table.setRowCount(0)
         self._set_summary_row(0, "Total Pores", "--")
         self._set_summary_row(1, "Active", "--")
         self._set_summary_row(2, "Compressed", "--")
         self._set_summary_row(3, "Avg. Retention", "--")
+        self._set_summary_row(4, "Ref->GT Cov.", "--")
+        self._set_summary_row(5, "Novel Seg./step", "--")
+        self._set_summary_row(6, "Pore Trk.Acc", "--")
         self.setEnabled(False)
         self._export_btn.setEnabled(False)

@@ -6,6 +6,7 @@ import numpy as np
 import pyvista as pv
 
 from core import VolumeData
+from core.coordinates import raw_zyx_to_grid_xyz
 
 
 class VTKExporter:
@@ -51,12 +52,19 @@ class VTKExporter:
     @staticmethod
     def _export_volume(data: VolumeData, filepath: str) -> bool:
         """Export voxel data (.vti)."""
+        raw_xyz = raw_zyx_to_grid_xyz(data.raw_data)
+        if not raw_xyz.flags.f_contiguous:
+            raw_xyz = np.asfortranarray(raw_xyz)
+
         grid = pv.ImageData()
-        grid.dimensions = np.array(data.raw_data.shape) + 1
+        grid.dimensions = np.array(raw_xyz.shape) + 1
         grid.origin = data.origin
         grid.spacing = data.spacing
 
-        grid.cell_data["values"] = data.raw_data.flatten(order="F")
+        values = raw_xyz.ravel(order="F")
+        if not values.flags.c_contiguous:
+            values = np.ascontiguousarray(values)
+        grid.cell_data["values"] = values
 
         grid.save(filepath)
         print(f"[Exporter] Volume saved to {filepath}")

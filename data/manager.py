@@ -54,7 +54,7 @@ class ScientificDataManager(QObject):
         """Sets the raw input data. Clears previous data first."""
         # Clear all previous data to free memory.
         # Explicit reference drops trigger CPython's ref-count destructor
-        # immediately — no gc.collect() required.
+        # immediately 鈥?no gc.collect() required.
         self.raw_ct_data       = None
         self.segmented_volume  = None
         self.pnm_model         = None
@@ -90,6 +90,46 @@ class ScientificDataManager(QObject):
         self._clear_segmentation_cache()
 
     # ==========================================
+    # Atomic Volume Operations
+    # ==========================================
+
+    @staticmethod
+    def clip_volume_inplace(volume: VolumeData, min_val: float, max_val: float) -> None:
+        """
+        Clip a volume in-place to [min_val, max_val].
+
+        Shared by 3D and 4D flows to keep transform behavior identical.
+        """
+        if volume is None or volume.raw_data is None:
+            raise ValueError("No volume data to clip")
+
+        np.clip(volume.raw_data, min_val, max_val, out=volume.raw_data)
+        volume.metadata["ClipRange"] = f"[{min_val:.0f}, {max_val:.0f}]"
+        if "(Clipped)" not in volume.metadata.get("Type", ""):
+            volume.metadata["Type"] = volume.metadata.get("Type", "CT") + " (Clipped)"
+
+    @staticmethod
+    def invert_volume_inplace(volume: VolumeData) -> Tuple[float, float, float]:
+        """
+        Invert one volume in-place: ``new = (max + min) - old``.
+
+        Returns:
+            Tuple[data_min, data_max, invert_offset]
+        """
+        if volume is None or volume.raw_data is None:
+            raise ValueError("No volume data to invert")
+
+        raw = volume.raw_data
+        data_min = float(raw.min())
+        data_max = float(raw.max())
+        invert_offset = data_max + data_min
+        np.subtract(invert_offset, raw, out=raw)
+
+        if "(Inverted)" not in volume.metadata.get("Type", ""):
+            volume.metadata["Type"] = volume.metadata.get("Type", "CT") + " (Inverted)"
+        return data_min, data_max, invert_offset
+
+    # ==========================================
     # Data Manipulation Methods
     # ==========================================
     
@@ -118,16 +158,8 @@ class ScientificDataManager(QObject):
             raise ValueError("No active data to clip")
 
         if progress_callback:
-            progress_callback(0, "Clipping data...")
-
-        # In-place, single-pass, zero extra allocation
-        np.clip(data.raw_data, min_val, max_val, out=data.raw_data)
-
-        # Update metadata
-        data.metadata["ClipRange"] = f"[{min_val:.0f}, {max_val:.0f}]"
-        if "(Clipped)" not in data.metadata.get("Type", ""):
-            data.metadata["Type"] = data.metadata.get("Type", "CT") + " (Clipped)"
-
+            progress_callback(0, "Clipping data...")
+        self.clip_volume_inplace(data, min_val=min_val, max_val=max_val)
         # Clear related caches
         self._clear_segmentation_cache()
 
@@ -144,7 +176,7 @@ class ScientificDataManager(QObject):
 
         Uses a fully vectorised numpy operation (``np.subtract(offset, raw,
         out=raw)``) instead of a chunked loop with gc.collect().  This avoids
-        Stop-The-World pauses while being 2–10× faster than the chunked path.
+        Stop-The-World pauses while being 2鈥?0脳 faster than the chunked path.
 
         Args:
             chunk_size: Retained for backward-compatibility; ignored.
@@ -158,23 +190,11 @@ class ScientificDataManager(QObject):
         """
         data = self.active_data
         if data is None or data.raw_data is None:
-            raise ValueError("No active data to invert")
-
-        raw = data.raw_data
-        data_min      = float(raw.min())
-        data_max      = float(raw.max())
-        invert_offset = data_max + data_min
-
+            raise ValueError("No active data to invert")
         if progress_callback:
             progress_callback(0, "Inverting volume...")
 
-        # Single vectorised in-place pass — no temporary copy, no gc pauses
-        np.subtract(invert_offset, raw, out=raw)
-
-        # Update metadata
-        if "(Inverted)" not in data.metadata.get("Type", ""):
-            data.metadata["Type"] = data.metadata.get("Type", "CT") + " (Inverted)"
-
+        data_min, data_max, invert_offset = self.invert_volume_inplace(data)
         # Clear related caches
         self._clear_segmentation_cache()
 
@@ -183,9 +203,6 @@ class ScientificDataManager(QObject):
 
         # Emit data changed signal
         self.data_changed.emit()
-
-        return data_min, data_max, invert_offset
-        
         return data_min, data_max, invert_offset
     
     def calculate_histogram(self, bins: int = 100, 
@@ -243,22 +260,22 @@ class ScientificDataManager(QObject):
         """Returns a status string describing what data is available."""
         status = []
         if self.raw_ct_data:
-            status.append("✔ Raw CT Data")
+            status.append("鉁?Raw CT Data")
         else:
-            status.append("✘ Raw CT Data")
+            status.append("鉁?Raw CT Data")
             
         if self.roi_data:
-            status.append("✔ ROI Extracted")
+            status.append("鉁?ROI Extracted")
 
         if self.segmented_volume:
-            status.append("✔ Segmented Void Volume")
+            status.append("鉁?Segmented Void Volume")
         else:
-            status.append("✘ Segmented Void Volume")
+            status.append("鉁?Segmented Void Volume")
 
         if self.pnm_model:
-            status.append("✔ PNM Mesh (Pores & Throats)")
+            status.append("鉁?PNM Mesh (Pores & Throats)")
         else:
-            status.append("✘ PNM Mesh")
+            status.append("鉁?PNM Mesh")
 
         return " | ".join(status)
 
@@ -270,3 +287,4 @@ class ScientificDataManager(QObject):
 
     def has_segmented(self) -> bool:
         return self.segmented_volume is not None
+

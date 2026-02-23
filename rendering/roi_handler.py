@@ -7,6 +7,7 @@ from typing import Optional, Callable, Tuple
 import numpy as np
 import pyvista as pv
 from core import VolumeData
+from core.coordinates import bounds_xyz_to_slices_zyx
 from rendering.roi_extractor import extract_box, extract_ellipsoid, extract_cylinder
 
 
@@ -375,18 +376,12 @@ class ROIHandler:
 
     def _bounds_to_voxel_indices(self, bounds: tuple) -> tuple:
         """Convert world bounds to voxel indices."""
-        raw = self.data.raw_data
-        spacing = self.data.spacing
-        origin = self.data.origin
-        
-        i_start = max(0, int((bounds[0] - origin[0]) / spacing[0]))
-        i_end = min(raw.shape[0], int((bounds[1] - origin[0]) / spacing[0]))
-        j_start = max(0, int((bounds[2] - origin[1]) / spacing[1]))
-        j_end = min(raw.shape[1], int((bounds[3] - origin[1]) / spacing[1]))
-        k_start = max(0, int((bounds[4] - origin[2]) / spacing[2]))
-        k_end = min(raw.shape[2], int((bounds[5] - origin[2]) / spacing[2]))
-        
-        return i_start, i_end, j_start, j_end, k_start, k_end
+        return bounds_xyz_to_slices_zyx(
+            bounds,
+            self.data.raw_data.shape,
+            self.data.spacing,
+            self.data.origin,
+        )
 
     def _extract_box(self, bounds: tuple) -> Optional[VolumeData]:
         """Extract box-shaped sub-volume."""

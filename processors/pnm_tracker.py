@@ -4,12 +4,21 @@ Pore Network Model Tracker for 4D CT analysis.
 
 from __future__ import annotations
 
+import json
+import os
 import time
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
+from scipy import ndimage
 
+from core.annotation_alignment import align_pred_gt, infer_shape_alignment
+from core.coordinates import (
+    voxel_delta_zyx_to_world_delta_xyz,
+    world_delta_xyz_to_voxel_delta_zyx,
+    world_xyz_to_voxel_zyx,
+)
 from core.time_series import PNMSnapshot, PoreStatus, PoreTrackingResult, TimeSeriesPNM
 from config import (
     TRACKING_ASSIGN_SOLVER,
@@ -38,6 +47,11 @@ from config import (
     TRACKING_MACRO_REG_UPSAMPLE_FACTOR,
     TRACKING_MATCH_MODE,
     TRACKING_MAX_MISSES,
+    TRACKING_NOVEL_MIN_PERSISTENCE,
+    TRACKING_NOVEL_MIN_VOLUME_VOXELS,
+    TRACKING_SMALL_PORE_VOLUME_VOXELS,
+    TRACKING_SOFT_GATE_COST_PENALTY,
+    TRACKING_SOFT_GATE_MIN_INTERSECTION_VOXELS,
     TRACKING_USE_BATCH,
     TRACKING_USE_GPU,
     TRACKING_USE_HUNGARIAN,
@@ -128,7 +142,7 @@ def _compute_overlap_metrics(
     local_ref_mask: np.ndarray,
     current_region: np.ndarray,
     label_id: int,
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, int]:
     """Compute IoU, local Dice, and local candidate volume for a label in a cropped bbox."""
     candidate_mask = current_region == int(label_id)
     intersection = int(np.sum(local_ref_mask & candidate_mask))
@@ -138,7 +152,7 @@ def _compute_overlap_metrics(
 
     iou = (intersection / union) if union > 0 else 0.0
     dice = (2.0 * intersection / (ref_volume + cand_volume)) if (ref_volume + cand_volume) > 0 else 0.0
-    return float(iou), float(dice), float(cand_volume)
+    return float(iou), float(dice), float(cand_volume), int(intersection)
 
 
 def build_candidates(
@@ -146,6 +160,7 @@ def build_candidates(
     current_snapshot: PNMSnapshot,
     reference_masks: Dict[int, Dict],
     current_regions: np.ndarray,
+    spacing_xyz: Tuple[float, float, float],
     predicted_centers: Dict[int, np.ndarray],
     cost_weights: Tuple[float, float, float, float],
     gate_center_radius_factor: float,
@@ -153,6 +168,9 @@ def build_candidates(
     gate_volume_ratio_max: float,
     gate_iou_min: float = 0.02,
     gate_volume_ratio_min_floor: float = 1e-4,
+    small_pore_volume_voxels: float = 64.0,
+    soft_gate_min_intersection_voxels: int = 3,
+    soft_gate_cost_penalty: float = 0.08,
     volume_cost_mode: str = "symdiff",
     volume_cost_sigma: float = 1.0,
 ) -> Dict[str, object]:
@@ -233,12 +251,16 @@ def build_candidates(
 
         mins, _maxs = mask_data["bbox"]
         local_ref_mask = mask_data["mask"]
+        delta_world_xyz = predicted - ref_centers[ref_idx]
+        shift_zyx = world_delta_xyz_to_voxel_delta_zyx(
+            delta_xyz=(float(delta_world_xyz[0]), float(delta_world_xyz[1]), float(delta_world_xyz[2])),
+            spacing_xyz=spacing_xyz,
+        )
         shifted_ref_mask, shifted_current_region = extract_shifted_overlap_region(
             current_regions=current_regions,
             local_reference_mask=local_ref_mask,
             bbox_mins=np.asarray(mins, dtype=np.int64),
-            reference_center=ref_centers[ref_idx],
-            expected_center=predicted,
+            shift_zyx=shift_zyx,
         )
         if shifted_ref_mask.size == 0:
             continue
@@ -246,15 +268,21 @@ def build_candidates(
         gated_curr_indices = np.where(geometric_gate)[0]
         for curr_idx in gated_curr_indices:
             curr_id = int(curr_ids[curr_idx])
-            iou, dice_local, _local_volume = _compute_overlap_metrics(
+            iou, dice_local, _local_volume, intersection_voxels = _compute_overlap_metrics(
                 shifted_ref_mask,
                 shifted_current_region,
                 curr_id,
             )
             volume_ratio = float(volume_ratios[curr_idx])
             adaptive_iou_gate = min(float(gate_iou_min), max(1e-4, 0.5 * min(volume_ratio, 1.0)))
+            soft_gate_used = False
             if iou < adaptive_iou_gate:
-                continue
+                if ref_volume <= float(small_pore_volume_voxels) and intersection_voxels >= int(
+                    max(1, soft_gate_min_intersection_voxels)
+                ):
+                    soft_gate_used = True
+                else:
+                    continue
 
             row_valid_candidate[ref_idx] = True
             center_dist = float(dists[curr_idx])
@@ -270,6 +298,9 @@ def build_candidates(
                 volume_cost_mode=volume_cost_mode,
                 volume_cost_sigma=volume_cost_sigma,
             )
+            if soft_gate_used:
+                cost += float(max(0.0, soft_gate_cost_penalty))
+
             cost_matrix[ref_idx, curr_idx] = min(cost_matrix[ref_idx, curr_idx], cost)
             pair_metrics[(ref_idx, curr_idx)] = {
                 "iou": iou,
@@ -277,6 +308,8 @@ def build_candidates(
                 "center_dist": center_dist,
                 "norm_center_dist": center_dist / center_gate_radius,
                 "volume_ratio": volume_ratio,
+                "intersection_voxels": int(intersection_voxels),
+                "soft_gate_used": bool(soft_gate_used),
                 "volume_penalty": bounded_volume_penalty(
                     reference_volume=ref_volume,
                     current_volume=curr_volume,
@@ -285,6 +318,9 @@ def build_candidates(
                 ),
                 "cost": cost,
             }
+            if soft_gate_used:
+                # Keep the soft candidate but do not skip stronger candidates.
+                continue
 
     return {
         "cost_matrix": cost_matrix,
@@ -587,6 +623,21 @@ class PNMTracker:
         self.gate_volume_ratio_min_floor = float(
             gates.get("volume_ratio_min_floor", TRACKING_GATE_VOLUME_RATIO_MIN_FLOOR)
         )
+        self.small_pore_volume_voxels = float(
+            gates.get("small_pore_volume_voxels", TRACKING_SMALL_PORE_VOLUME_VOXELS)
+        )
+        self.soft_gate_min_intersection_voxels = int(
+            gates.get("soft_gate_min_intersection_voxels", TRACKING_SOFT_GATE_MIN_INTERSECTION_VOXELS)
+        )
+        self.soft_gate_cost_penalty = float(
+            gates.get("soft_gate_cost_penalty", TRACKING_SOFT_GATE_COST_PENALTY)
+        )
+        self.novel_min_volume_voxels = float(
+            gates.get("novel_min_volume_voxels", TRACKING_NOVEL_MIN_VOLUME_VOXELS)
+        )
+        self.novel_min_persistence = int(
+            gates.get("novel_min_persistence", TRACKING_NOVEL_MIN_PERSISTENCE)
+        )
 
         self.volume_cost_mode = str(gates.get("volume_cost_mode", TRACKING_VOLUME_COST_MODE))
         self.volume_cost_sigma = float(
@@ -643,6 +694,7 @@ class PNMTracker:
         self.time_series: TimeSeriesPNM = TimeSeriesPNM()
         self._reference_masks: Dict[int, Dict] = {}
         self._track_predictors: Dict[int, ConstantAccelerationKalman3D] = {}
+        self._novel_segment_streaks: Dict[int, int] = {}
 
         algo_parts = [self.match_mode, f"solver={self.assign_solver}"]
         if self.use_gpu and self.match_mode == "legacy_greedy":
@@ -658,6 +710,7 @@ class PNMTracker:
 
         self.time_series.tracking = PoreTrackingResult(reference_ids=snapshot.pore_ids.tolist())
         self._track_predictors.clear()
+        self._novel_segment_streaks.clear()
 
         for pore_id_raw, volume in zip(snapshot.pore_ids, snapshot.pore_volumes):
             pore_id = int(pore_id_raw)
@@ -687,17 +740,34 @@ class PNMTracker:
         regions = snapshot.segmented_regions
         if regions is None:
             return
+        if snapshot.pore_ids is None or len(snapshot.pore_ids) == 0:
+            return
 
-        for pore_id in snapshot.pore_ids:
-            mask = regions == pore_id
-            coords = np.argwhere(mask)
-            if len(coords) == 0:
+        max_label = int(np.max(snapshot.pore_ids))
+        if max_label <= 0:
+            return
+
+        # Single-pass bbox extraction avoids O(N_labels * volume) full-size masks.
+        slices_by_label = ndimage.find_objects(regions, max_label=max_label)
+        for pore_id_raw in snapshot.pore_ids:
+            pore_id = int(pore_id_raw)
+            if pore_id <= 0 or pore_id > len(slices_by_label):
                 continue
-            mins = coords.min(axis=0)
-            maxs = coords.max(axis=0) + 1
-            self._reference_masks[int(pore_id)] = {
+
+            bbox_slices = slices_by_label[pore_id - 1]
+            if bbox_slices is None:
+                continue
+
+            local_region = regions[bbox_slices]
+            local_mask = local_region == pore_id
+            if not np.any(local_mask):
+                continue
+
+            mins = np.asarray([sl.start for sl in bbox_slices], dtype=np.int32)
+            maxs = np.asarray([sl.stop for sl in bbox_slices], dtype=np.int32)
+            self._reference_masks[pore_id] = {
                 "bbox": (mins, maxs),
-                "mask": mask[mins[0]:maxs[0], mins[1]:maxs[1], mins[2]:maxs[2]],
+                "mask": local_mask,
             }
 
     def _predict_center(self, ref_id: int, fallback: np.ndarray) -> np.ndarray:
@@ -727,6 +797,58 @@ class PNMTracker:
             for i, pid in enumerate(snapshot.pore_ids):
                 current_volume_map[int(pid)] = float(snapshot.pore_volumes[i])
         return {"center_map": current_center_map, "volume_map": current_volume_map}
+
+    def _build_novel_segmentation_stats(
+        self,
+        snapshot: PNMSnapshot,
+        id_map: Dict[int, int],
+    ) -> Dict[str, Any]:
+        """
+        Compute diagnostics for current segments not consumed by fixed reference tracks.
+        """
+        current_ids = (
+            [int(pid) for pid in np.asarray(snapshot.pore_ids, dtype=np.int32).tolist()]
+            if snapshot.pore_ids is not None
+            else []
+        )
+        current_volumes = (
+            np.asarray(snapshot.pore_volumes, dtype=np.float64).tolist()
+            if snapshot.pore_volumes is not None
+            else [0.0] * len(current_ids)
+        )
+        volume_map: Dict[int, float] = {}
+        for idx, pid in enumerate(current_ids):
+            if pid > 0:
+                volume_map[pid] = float(current_volumes[idx]) if idx < len(current_volumes) else 0.0
+
+        matched_curr_ids = {int(cid) for cid in id_map.values() if int(cid) > 0}
+        unmatched_curr_ids = sorted(pid for pid in volume_map.keys() if pid not in matched_curr_ids)
+        above_volume = [
+            pid for pid in unmatched_curr_ids if float(volume_map.get(pid, 0.0)) >= float(self.novel_min_volume_voxels)
+        ]
+
+        active_now = set(above_volume)
+        for pid in list(self._novel_segment_streaks.keys()):
+            if pid not in active_now:
+                self._novel_segment_streaks.pop(pid, None)
+        for pid in above_volume:
+            self._novel_segment_streaks[pid] = int(self._novel_segment_streaks.get(pid, 0)) + 1
+
+        persistent_ids = sorted(
+            pid for pid in above_volume if int(self._novel_segment_streaks.get(pid, 0)) >= int(self.novel_min_persistence)
+        )
+
+        return {
+            "time_index": int(snapshot.time_index),
+            "num_current_segments": int(len(volume_map)),
+            "num_matched_current_segments": int(len(matched_curr_ids)),
+            "num_unmatched_current_segments": int(len(unmatched_curr_ids)),
+            "num_untracked_novel_segments": int(len(persistent_ids)),
+            "novel_candidate_ids": persistent_ids,
+            "min_volume_voxels": float(self.novel_min_volume_voxels),
+            "min_persistence": int(self.novel_min_persistence),
+            "reference_policy": "fixed_reference_set",
+        }
 
     def _estimate_macro_registration(
         self,
@@ -782,7 +904,17 @@ class PNMTracker:
         else:
             macro_weight = 1.00 * confidence
 
-        return base + macro_weight * np.asarray(macro_registration.displacement, dtype=np.float64)
+        ref_snapshot = self.time_series.reference_snapshot
+        spacing_xyz = getattr(ref_snapshot, "spacing", (1.0, 1.0, 1.0))
+        macro_delta_world = voxel_delta_zyx_to_world_delta_xyz(
+            delta_zyx=(
+                float(macro_registration.displacement[0]),
+                float(macro_registration.displacement[1]),
+                float(macro_registration.displacement[2]),
+            ),
+            spacing_xyz=spacing_xyz,
+        )
+        return base + macro_weight * np.asarray(macro_delta_world, dtype=np.float64)
 
     def _apply_closure_classification(
         self,
@@ -816,7 +948,15 @@ class PNMTracker:
                 predicted_centers.get(ref_id, ref_center_map.get(ref_id, np.zeros(3, dtype=np.float64))),
                 dtype=np.float64,
             )
-            local_compression = macro_registration.sample_compression(predicted_center, default=0.0)
+            predicted_center_zyx = world_xyz_to_voxel_zyx(
+                world_xyz=(float(predicted_center[0]), float(predicted_center[1]), float(predicted_center[2])),
+                spacing_xyz=reference_snapshot.spacing,
+                origin_xyz=reference_snapshot.origin,
+            )
+            local_compression = macro_registration.sample_compression(
+                np.asarray(predicted_center_zyx, dtype=np.float64),
+                default=0.0,
+            )
 
             if should_mark_closed_by_compression(
                 previous_volume=previous_volume,
@@ -857,6 +997,10 @@ class PNMTracker:
             id_map = self._track_snapshot_temporal_global(snapshot, callback)
             algo_desc = "temporal_global"
 
+        snapshot.metadata["novel_segmentation"] = self._build_novel_segmentation_stats(
+            snapshot=snapshot,
+            id_map=id_map,
+        )
         self.time_series.tracking.id_mapping[time_index] = id_map
         self.time_series.snapshots.append(snapshot)
 
@@ -912,6 +1056,7 @@ class PNMTracker:
             current_snapshot=snapshot,
             reference_masks=self._reference_masks,
             current_regions=snapshot.segmented_regions,
+            spacing_xyz=ref_snapshot.spacing,
             predicted_centers=predicted_centers,
             cost_weights=self.cost_weights,
             gate_center_radius_factor=self.gate_center_radius_factor,
@@ -919,6 +1064,9 @@ class PNMTracker:
             gate_volume_ratio_max=self.gate_volume_ratio_max,
             gate_iou_min=self.gate_iou_min,
             gate_volume_ratio_min_floor=self.gate_volume_ratio_min_floor,
+            small_pore_volume_voxels=self.small_pore_volume_voxels,
+            soft_gate_min_intersection_voxels=self.soft_gate_min_intersection_voxels,
+            soft_gate_cost_penalty=self.soft_gate_cost_penalty,
             volume_cost_mode=self.volume_cost_mode,
             volume_cost_sigma=self.volume_cost_sigma,
         )
@@ -968,6 +1116,36 @@ class PNMTracker:
                 "cost": float(cost),
                 "reason": f"matched_{solver_used}",
             }
+
+        gate_rejected = 0
+        iou_below_gate = 0
+        not_selected = 0
+        matched = 0
+        matched_curr_ids: set[int] = set()
+        for info in match_results.values():
+            reason = str(info.get("reason", ""))
+            if reason == "gate_rejected":
+                gate_rejected += 1
+            elif reason == "iou_below_gate":
+                iou_below_gate += 1
+            elif reason.startswith("matched_"):
+                matched += 1
+                curr_id = int(info.get("matched_id", -1))
+                if curr_id > 0:
+                    matched_curr_ids.add(curr_id)
+            else:
+                not_selected += 1
+        snapshot.metadata["tgga_debug"] = {
+            "time_index": int(snapshot.time_index),
+            "solver": str(solver_used),
+            "num_assignments": int(len(assignments)),
+            "gate_rejected": int(gate_rejected),
+            "iou_below_gate": int(iou_below_gate),
+            "not_selected": int(not_selected),
+            "matched": int(matched),
+            "num_current_segments": int(len(curr_ids)),
+            "num_unmatched_current_segments": int(max(0, len(curr_ids) - len(matched_curr_ids))),
+        }
 
         self._apply_closure_classification(
             reference_snapshot=ref_snapshot,
@@ -1036,7 +1214,7 @@ class PNMTracker:
                 curr_idx = curr_index_map.get(int(label))
                 if curr_idx is None:
                     continue
-                iou, _dice, _local_vol = _compute_overlap_metrics(local_mask, current_region, int(label))
+                iou, _dice, _local_vol, _intersection = _compute_overlap_metrics(local_mask, current_region, int(label))
                 iou_matrix[ref_idx, curr_idx] = max(iou_matrix[ref_idx, curr_idx], iou)
 
         return iou_matrix, curr_volume_map
@@ -1316,6 +1494,463 @@ class PNMTracker:
             return path
         return None
 
+    @staticmethod
+    def _resolve_annotations_payload(
+        volume: Any,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
+        metadata = getattr(volume, "metadata", None)
+        if not isinstance(metadata, dict):
+            return None, None, None
+        sim = metadata.get("sim_annotations")
+        if not isinstance(sim, dict):
+            return None, None, None
+
+        files = sim.get("files")
+        ann_path = None
+        if isinstance(files, dict):
+            raw_path = files.get("annotations_json")
+            if isinstance(raw_path, str) and raw_path:
+                ann_path = raw_path
+
+        in_memory = sim.get("annotations")
+        if isinstance(in_memory, dict):
+            return in_memory, ann_path, None
+
+        if not ann_path:
+            return None, None, None
+        if not os.path.isfile(ann_path):
+            return None, ann_path, None
+
+        try:
+            with open(ann_path, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                return loaded, ann_path, None
+            return None, ann_path, "annotations.json root is not an object"
+        except Exception as exc:
+            return None, ann_path, f"failed to parse annotations.json: {exc}"
+
+    @staticmethod
+    def _extract_annotation_voids(
+        annotations: Dict[str, Any],
+        default_spacing_xyz: Tuple[float, float, float],
+        default_origin_xyz: Tuple[float, float, float],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, int]]:
+        """
+        Parse per-step annotation void entries into dense numeric arrays.
+
+        Returns:
+            (ids, centers_world_xyz, radii_mm, volumes_mm3, parse_stats)
+        """
+        if not isinstance(annotations, dict):
+            return (
+                np.zeros((0,), dtype=np.int32),
+                np.zeros((0, 3), dtype=np.float64),
+                np.zeros((0,), dtype=np.float64),
+                np.zeros((0,), dtype=np.float64),
+                {"num_voids": 0, "num_invalid_voids": 0},
+            )
+
+        voxel_size = annotations.get("voxel_size")
+        if isinstance(voxel_size, (int, float)) and float(voxel_size) > 0:
+            spacing_xyz = (float(voxel_size), float(voxel_size), float(voxel_size))
+        else:
+            spacing_xyz = (
+                float(default_spacing_xyz[0]),
+                float(default_spacing_xyz[1]),
+                float(default_spacing_xyz[2]),
+            )
+
+        origin = annotations.get("origin")
+        if isinstance(origin, (list, tuple)) and len(origin) == 3:
+            origin_xyz = (float(origin[0]), float(origin[1]), float(origin[2]))
+        else:
+            origin_xyz = (
+                float(default_origin_xyz[0]),
+                float(default_origin_xyz[1]),
+                float(default_origin_xyz[2]),
+            )
+
+        voids = annotations.get("voids", [])
+        if not isinstance(voids, list):
+            voids = []
+
+        ids: List[int] = []
+        centers: List[Tuple[float, float, float]] = []
+        radii: List[float] = []
+        volumes: List[float] = []
+
+        invalid_count = 0
+        seen_ids: set[int] = set()
+        sx, sy, sz = spacing_xyz
+        ox, oy, oz = origin_xyz
+
+        for row in voids:
+            if not isinstance(row, dict):
+                invalid_count += 1
+                continue
+
+            raw_id = row.get("id")
+            if not isinstance(raw_id, (int, np.integer)):
+                invalid_count += 1
+                continue
+            gt_id = int(raw_id)
+            if gt_id <= 0 or gt_id in seen_ids:
+                invalid_count += 1
+                continue
+
+            center_world = row.get("center_mm")
+            if isinstance(center_world, (list, tuple)) and len(center_world) == 3:
+                cx = float(center_world[0])
+                cy = float(center_world[1])
+                cz = float(center_world[2])
+            else:
+                center_voxel = row.get("center_voxel")
+                if not (isinstance(center_voxel, (list, tuple)) and len(center_voxel) == 3):
+                    invalid_count += 1
+                    continue
+                vx = float(center_voxel[0])
+                vy = float(center_voxel[1])
+                vz = float(center_voxel[2])
+                cx = ox + vx * sx
+                cy = oy + vy * sy
+                cz = oz + vz * sz
+
+            radius_raw = row.get("radius_mm")
+            if isinstance(radius_raw, (int, float)) and float(radius_raw) > 0:
+                radius_mm = float(radius_raw)
+            else:
+                volume_raw = row.get("volume_mm3")
+                if isinstance(volume_raw, (int, float)) and float(volume_raw) > 0:
+                    radius_mm = float((3.0 * float(volume_raw) / (4.0 * np.pi)) ** (1.0 / 3.0))
+                else:
+                    radius_mm = 0.0
+
+            volume_raw = row.get("volume_mm3")
+            if isinstance(volume_raw, (int, float)) and float(volume_raw) >= 0:
+                volume_mm3 = float(volume_raw)
+            else:
+                volume_mm3 = float((4.0 / 3.0) * np.pi * max(radius_mm, 0.0) ** 3)
+
+            seen_ids.add(gt_id)
+            ids.append(gt_id)
+            centers.append((cx, cy, cz))
+            radii.append(float(radius_mm))
+            volumes.append(float(volume_mm3))
+
+        return (
+            np.asarray(ids, dtype=np.int32),
+            np.asarray(centers, dtype=np.float64).reshape((-1, 3)) if centers else np.zeros((0, 3), dtype=np.float64),
+            np.asarray(radii, dtype=np.float64),
+            np.asarray(volumes, dtype=np.float64),
+            {"num_voids": int(len(ids)), "num_invalid_voids": int(invalid_count)},
+        )
+
+    def _evaluate_step_against_annotations(
+        self,
+        snapshot: PNMSnapshot,
+        annotations: Dict[str, Any],
+        instance_iou_threshold: float,
+    ) -> Dict[str, Any]:
+        """
+        Evaluate one snapshot against annotation-defined pore entities.
+
+        Matching is solved as one-to-one assignment with center/radius/volume
+        costs under distance gates, producing pore-level detection metrics.
+        """
+        pred_ids = (
+            np.asarray(snapshot.pore_ids, dtype=np.int32)
+            if snapshot.pore_ids is not None
+            else np.zeros((0,), dtype=np.int32)
+        )
+        pred_centers = (
+            np.asarray(snapshot.pore_centers, dtype=np.float64)
+            if snapshot.pore_centers is not None
+            else np.zeros((0, 3), dtype=np.float64)
+        )
+        pred_radii = (
+            np.asarray(snapshot.pore_radii, dtype=np.float64)
+            if snapshot.pore_radii is not None
+            else np.zeros((len(pred_ids),), dtype=np.float64)
+        )
+        pred_volumes = (
+            np.asarray(snapshot.pore_volumes, dtype=np.float64)
+            if snapshot.pore_volumes is not None
+            else np.zeros((len(pred_ids),), dtype=np.float64)
+        )
+
+        if pred_centers.ndim != 2 or pred_centers.shape[1] != 3 or pred_centers.shape[0] != len(pred_ids):
+            pred_centers = np.zeros((len(pred_ids), 3), dtype=np.float64)
+        if pred_radii.shape[0] != len(pred_ids):
+            pred_radii = np.zeros((len(pred_ids),), dtype=np.float64)
+        if pred_volumes.shape[0] != len(pred_ids):
+            pred_volumes = np.zeros((len(pred_ids),), dtype=np.float64)
+
+        spacing_xyz = (
+            float(snapshot.spacing[0]) if snapshot.spacing else 1.0,
+            float(snapshot.spacing[1]) if snapshot.spacing else 1.0,
+            float(snapshot.spacing[2]) if snapshot.spacing else 1.0,
+        )
+        origin_xyz = (
+            float(snapshot.origin[0]) if snapshot.origin else 0.0,
+            float(snapshot.origin[1]) if snapshot.origin else 0.0,
+            float(snapshot.origin[2]) if snapshot.origin else 0.0,
+        )
+        voxel_volume_mm3 = max(abs(spacing_xyz[0] * spacing_xyz[1] * spacing_xyz[2]), 1e-12)
+        pred_volumes_mm3 = pred_volumes * voxel_volume_mm3
+
+        gt_ids, gt_centers, gt_radii, gt_volumes, parse_stats = self._extract_annotation_voids(
+            annotations=annotations,
+            default_spacing_xyz=spacing_xyz,
+            default_origin_xyz=origin_xyz,
+        )
+
+        n_pred = int(len(pred_ids))
+        n_gt = int(len(gt_ids))
+        if n_pred == 0 and n_gt == 0:
+            return {
+                "segmentation": {},
+                "instance": {
+                    "num_pred_instances": 0,
+                    "num_gt_instances": 0,
+                    "num_matches": 0,
+                    "precision": 1.0,
+                    "recall": 1.0,
+                    "f1": 1.0,
+                    "mean_matched_iou": 0.0,
+                    "iou_threshold": float(instance_iou_threshold),
+                    "assignment_solver": "none",
+                    "matching_mode": "annotations_center",
+                    "mean_center_distance_mm": 0.0,
+                },
+                "mapping": {"pred_to_gt": {}, "gt_to_pred": {}, "gt_ids": set()},
+                "annotation": parse_stats,
+            }
+
+        cost_matrix = np.full((n_pred, n_gt), INVALID_COST, dtype=np.float64)
+        center_dist_matrix = np.full((n_pred, n_gt), np.inf, dtype=np.float64)
+        center_score_matrix = np.zeros((n_pred, n_gt), dtype=np.float64)
+
+        avg_spacing = max(float(np.mean(np.asarray(spacing_xyz, dtype=np.float64))), 1e-6)
+        min_gate_mm = 2.0 * avg_spacing
+
+        for i in range(n_pred):
+            pred_center = pred_centers[i]
+            pred_radius = float(max(pred_radii[i], 0.0))
+            pred_volume_mm3 = float(max(pred_volumes_mm3[i], 0.0))
+            for j in range(n_gt):
+                gt_center = gt_centers[j]
+                gt_radius = float(max(gt_radii[j], 0.0))
+                gt_volume_mm3 = float(max(gt_volumes[j], 0.0))
+
+                dist_mm = float(np.linalg.norm(pred_center - gt_center))
+                gate_mm = float(
+                    max(
+                        min_gate_mm,
+                        pred_radius + gt_radius,
+                        2.5 * max(pred_radius, gt_radius),
+                    )
+                )
+                if dist_mm > gate_mm:
+                    continue
+
+                center_term = float(np.clip(dist_mm / max(gate_mm, 1e-6), 0.0, 1.0))
+
+                radius_scale = max(max(pred_radius, gt_radius), avg_spacing, 1e-6)
+                radius_term = float(np.clip(abs(pred_radius - gt_radius) / radius_scale, 0.0, 1.0))
+
+                if pred_volume_mm3 > 0.0 and gt_volume_mm3 > 0.0:
+                    vol_term = float(
+                        np.clip(abs(np.log(pred_volume_mm3 / gt_volume_mm3)) / np.log(4.0), 0.0, 1.0)
+                    )
+                elif pred_volume_mm3 == 0.0 and gt_volume_mm3 == 0.0:
+                    vol_term = 0.0
+                else:
+                    vol_term = 1.0
+
+                cost = 0.75 * center_term + 0.20 * radius_term + 0.05 * vol_term
+                cost_matrix[i, j] = float(cost)
+                center_dist_matrix[i, j] = dist_mm
+                center_score_matrix[i, j] = float(max(0.0, 1.0 - center_term))
+
+        try:
+            assignments, solver_used = solve_global_assignment(
+                cost_matrix=cost_matrix,
+                assign_solver=self.assign_solver,
+                invalid_cost=INVALID_COST,
+            )
+        except Exception:
+            solver_used = "greedy_fallback"
+            assignments = []
+            valid_pairs = np.argwhere(cost_matrix < INVALID_COST * 0.5)
+            scored_pairs = sorted(
+                ((float(cost_matrix[i, j]), int(i), int(j)) for i, j in valid_pairs),
+                key=lambda row: row[0],
+            )
+            used_rows = set()
+            used_cols = set()
+            for _cost, i, j in scored_pairs:
+                if i in used_rows or j in used_cols:
+                    continue
+                used_rows.add(i)
+                used_cols.add(j)
+                assignments.append((int(i), int(j), float(cost_matrix[i, j])))
+
+        thr = float(max(instance_iou_threshold, 0.0))
+        pred_to_gt: Dict[int, int] = {}
+        gt_to_pred: Dict[int, int] = {}
+        matched_scores: List[float] = []
+        matched_dists: List[float] = []
+        for pred_idx, gt_idx, _cost in assignments:
+            if pred_idx >= n_pred or gt_idx >= n_gt:
+                continue
+            if cost_matrix[pred_idx, gt_idx] >= INVALID_COST * 0.5:
+                continue
+            center_score = float(center_score_matrix[pred_idx, gt_idx])
+            if center_score < thr:
+                continue
+            pred_id = int(pred_ids[pred_idx])
+            gt_id = int(gt_ids[gt_idx])
+            pred_to_gt[pred_id] = gt_id
+            gt_to_pred[gt_id] = pred_id
+            matched_scores.append(center_score)
+            matched_dists.append(float(center_dist_matrix[pred_idx, gt_idx]))
+
+        num_matches = int(len(pred_to_gt))
+        if n_pred == 0 and n_gt == 0:
+            inst_precision = 1.0
+            inst_recall = 1.0
+            inst_f1 = 1.0
+        else:
+            inst_precision = self._safe_ratio(num_matches, n_pred, default=0.0)
+            inst_recall = self._safe_ratio(num_matches, n_gt, default=0.0)
+            inst_f1 = self._safe_ratio(
+                2.0 * inst_precision * inst_recall,
+                inst_precision + inst_recall,
+                default=0.0,
+            )
+
+        return {
+            "segmentation": {},
+            "instance": {
+                "num_pred_instances": int(n_pred),
+                "num_gt_instances": int(n_gt),
+                "num_matches": int(num_matches),
+                "precision": float(inst_precision),
+                "recall": float(inst_recall),
+                "f1": float(inst_f1),
+                # Keep legacy key name for compatibility with existing UI/tests.
+                "mean_matched_iou": float(np.mean(matched_scores)) if matched_scores else 0.0,
+                "iou_threshold": float(thr),
+                "assignment_solver": solver_used,
+                "matching_mode": "annotations_center",
+                "mean_center_distance_mm": float(np.mean(matched_dists)) if matched_dists else 0.0,
+            },
+            "mapping": {
+                "pred_to_gt": pred_to_gt,
+                "gt_to_pred": gt_to_pred,
+                "gt_ids": set(int(v) for v in gt_ids.tolist()),
+            },
+            "annotation": parse_stats,
+        }
+
+    @staticmethod
+    def _build_gt_to_pore_group_map(
+        predicted_labels_t0: np.ndarray,
+        gt_labels_t0: np.ndarray,
+    ) -> Dict[int, int]:
+        """
+        Build many-to-one GT-id -> pore-group mapping using t0 overlap.
+
+        Each GT instance is assigned to the predicted pore id with maximum voxel
+        overlap at t0. This collapses fine-grained GT instances into pore-level
+        groups while keeping deterministic tie-breaking.
+        """
+        pred = np.asarray(predicted_labels_t0)
+        gt = np.asarray(gt_labels_t0)
+        overlap_mask = (pred > 0) & (gt > 0)
+        if not np.any(overlap_mask):
+            return {}
+
+        pred_overlap = pred[overlap_mask].astype(np.uint64, copy=False)
+        gt_overlap = gt[overlap_mask].astype(np.uint64, copy=False)
+        pair_keys = (gt_overlap << np.uint64(32)) | pred_overlap
+        pair_unique, pair_counts = np.unique(pair_keys, return_counts=True)
+
+        best_by_gt: Dict[int, Tuple[int, int]] = {}
+        for pair_key, count_raw in zip(pair_unique, pair_counts):
+            key_int = int(pair_key)
+            gt_id = int(key_int >> 32)
+            pred_id = int(key_int & 0xFFFFFFFF)
+            count = int(count_raw)
+            prev = best_by_gt.get(gt_id)
+            if prev is None or count > prev[1] or (count == prev[1] and pred_id < prev[0]):
+                best_by_gt[gt_id] = (pred_id, count)
+
+        return {int(gt_id): int(pred_id) for gt_id, (pred_id, _cnt) in best_by_gt.items()}
+
+    @staticmethod
+    def _remap_gt_labels_with_group_map(
+        gt_labels: np.ndarray,
+        gt_to_group: Dict[int, int],
+    ) -> Tuple[np.ndarray, Dict[str, int]]:
+        """
+        Remap fine-grained GT labels into pore-level group labels.
+
+        Known GT ids use t0-derived group ids; unknown ids get deterministic
+        new ids after the known-group range so they remain diagnosable as novel.
+        """
+        gt = np.asarray(gt_labels)
+        if gt.size == 0:
+            return np.zeros_like(gt, dtype=np.int32), {
+                "known_gt_ids": 0,
+                "unknown_gt_ids": 0,
+                "num_group_ids": 0,
+            }
+
+        positive_mask = gt > 0
+        if not np.any(positive_mask):
+            return np.zeros_like(gt, dtype=np.int32), {
+                "known_gt_ids": 0,
+                "unknown_gt_ids": 0,
+                "num_group_ids": 0,
+            }
+
+        unique_gt_ids = np.unique(gt[positive_mask]).astype(np.int64, copy=False)
+        mapped_gt_ids = np.empty_like(unique_gt_ids, dtype=np.int32)
+
+        known_groups = set(int(v) for v in gt_to_group.values())
+        next_unknown_group = (max(known_groups) + 1) if known_groups else 1
+        known_count = 0
+        unknown_count = 0
+
+        for idx, gt_id_raw in enumerate(unique_gt_ids):
+            gt_id = int(gt_id_raw)
+            group_id = gt_to_group.get(gt_id)
+            if group_id is None:
+                group_id = int(next_unknown_group)
+                next_unknown_group += 1
+                unknown_count += 1
+            else:
+                known_count += 1
+            mapped_gt_ids[idx] = int(group_id)
+
+        gt_int = gt.astype(np.int64, copy=False)
+        flat_gt = gt_int.reshape(-1)
+        remapped_flat = np.zeros(flat_gt.shape, dtype=np.int32)
+
+        positive_idx = np.nonzero(flat_gt > 0)[0]
+        positive_vals = flat_gt[positive_idx]
+        sorted_pos = np.searchsorted(unique_gt_ids, positive_vals)
+        remapped_flat[positive_idx] = mapped_gt_ids[sorted_pos]
+
+        remapped = remapped_flat.reshape(gt.shape)
+        return remapped, {
+            "known_gt_ids": int(known_count),
+            "unknown_gt_ids": int(unknown_count),
+            "num_group_ids": int(len(set(mapped_gt_ids.tolist()))),
+        }
+
     def _match_instance_ids(
         self,
         iou_matrix: np.ndarray,
@@ -1474,6 +2109,7 @@ class PNMTracker:
         reference_pred_to_gt: Dict[int, int],
         current_pred_to_gt: Dict[int, int],
         current_gt_ids: set[int],
+        novel_segmentation: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         evaluable_refs = len(reference_pred_to_gt)
         if evaluable_refs == 0:
@@ -1540,10 +2176,17 @@ class PNMTracker:
             }
 
         correct_total = correct_active + correct_absent
+        total_gt_ids = int(len(current_gt_ids))
+        reference_scope_gt_coverage = self._safe_ratio(expected_present, total_gt_ids, default=1.0 if total_gt_ids == 0 else 0.0)
+        novel_stats = novel_segmentation if isinstance(novel_segmentation, dict) else {}
+        untracked_novel_segments = int(novel_stats.get("num_untracked_novel_segments", 0))
         return {
             "available": True,
             "time_index": int(time_index),
             "evaluable_reference_instances": int(evaluable_refs),
+            "reference_scope_total_gt_ids": int(total_gt_ids),
+            "reference_scope_expected_present": int(expected_present),
+            "reference_scope_gt_coverage": float(reference_scope_gt_coverage),
             "expected_present": int(expected_present),
             "expected_absent": int(expected_absent),
             "correct_active": int(correct_active),
@@ -1551,10 +2194,12 @@ class PNMTracker:
             "missed": int(missed),
             "id_switched": int(id_switched),
             "unmatched_to_gt": int(unmatched_to_gt),
+            "untracked_novel_segments": int(untracked_novel_segments),
             "false_positive_alive": int(false_positive_alive),
             "accuracy": self._safe_ratio(correct_total, evaluable_refs, default=0.0),
             "active_accuracy": self._safe_ratio(correct_active, expected_present, default=1.0 if expected_present == 0 else 0.0),
             "closure_accuracy": self._safe_ratio(correct_absent, expected_absent, default=1.0 if expected_absent == 0 else 0.0),
+            "novel_segmentation": novel_stats,
             "per_reference": per_reference,
         }
 
@@ -1564,10 +2209,11 @@ class PNMTracker:
         instance_iou_threshold: float = 0.1,
     ) -> Dict[str, Any]:
         """
-        Evaluate segmentation + tracking quality against per-step simulation labels.npy.
+        Evaluate segmentation + tracking quality against simulation annotations.
 
-        The method is non-destructive: missing annotation files produce warnings
-        instead of raising, and partial reports are still returned.
+        Primary evaluation uses `annotations.json` pore entities (`voids`) for
+        pore-level one-to-one detection/tracking. When `annotations.json` is
+        unavailable, the method falls back to legacy `labels.npy`-based logic.
         """
         report: Dict[str, Any] = {
             "available": False,
@@ -1601,13 +2247,17 @@ class PNMTracker:
                 f"snapshot count ({len(snapshots)}) != volume count ({len(volumes)}); evaluating first {steps_to_eval} steps"
             )
 
-        step_maps: Dict[int, Dict[str, Any]] = {}
+        step_maps_strict: Dict[int, Dict[str, Any]] = {}
+        step_maps_primary: Dict[int, Dict[str, Any]] = {}
+        step_maps_pore: Dict[int, Dict[str, Any]] = {}
+        gt_to_pore_group_map: Dict[int, int] = {}
         step_entries: List[Dict[str, Any]] = []
 
         for time_index in range(steps_to_eval):
             snapshot = snapshots[time_index]
             step_entry: Dict[str, Any] = {
                 "time_index": int(time_index),
+                "gt_annotations_path": None,
                 "gt_labels_path": None,
                 "evaluated": False,
                 "errors": [],
@@ -1616,108 +2266,388 @@ class PNMTracker:
                 "instance": {},
                 "tracking": {},
                 "mapping": {},
+                "strict_instance": {},
+                "strict_tracking": {},
+                "strict_mapping": {},
+                "alignment": {},
+                "pore_level": {
+                    "aggregation": {},
+                    "instance": {},
+                    "tracking": {},
+                    "mapping": {},
+                },
             }
 
-            predicted_labels = snapshot.segmented_regions
-            if predicted_labels is None:
-                step_entry["errors"].append("snapshot has no segmented_regions")
-                step_entries.append(step_entry)
-                continue
+            primary_eval: Optional[Dict[str, Any]] = None
+            strict_eval: Optional[Dict[str, Any]] = None
+            strict_pore_eval: Optional[Dict[str, Any]] = None
 
+            # Primary channel: annotations.json pore-level evaluation.
+            ann_payload, ann_path, ann_error = self._resolve_annotations_payload(volumes[time_index])
+            step_entry["gt_annotations_path"] = ann_path
+            if ann_error:
+                step_entry["warnings"].append(ann_error)
+
+            if isinstance(ann_payload, dict):
+                try:
+                    primary_eval = self._evaluate_step_against_annotations(
+                        snapshot=snapshot,
+                        annotations=ann_payload,
+                        instance_iou_threshold=instance_iou_threshold,
+                    )
+                except Exception as exc:
+                    step_entry["errors"].append(f"failed to evaluate annotations.json: {exc}")
+            else:
+                step_entry["warnings"].append(
+                    "annotations.json missing in volume metadata "
+                    "sim_annotations.annotations/files.annotations_json"
+                )
+
+            # Strict diagnostics channel: labels.npy voxel/instance evaluation.
+            predicted_labels = snapshot.segmented_regions
             labels_path = self._resolve_labels_path(volumes[time_index])
             step_entry["gt_labels_path"] = labels_path
-            if not labels_path:
-                step_entry["warnings"].append("labels.npy path missing in volume metadata sim_annotations.files.labels_npy")
-                step_entries.append(step_entry)
-                continue
+            if labels_path and predicted_labels is not None:
+                try:
+                    gt_labels = np.load(labels_path, mmap_mode="r")
+                except Exception as exc:
+                    step_entry["warnings"].append(f"failed to read labels.npy for strict diagnostics: {exc}")
+                else:
+                    alignment = infer_shape_alignment(
+                        pred_shape=predicted_labels.shape,
+                        gt_shape=gt_labels.shape,
+                        min_overlap_ratio=0.85,
+                    )
+                    if alignment is None:
+                        step_entry["warnings"].append(
+                            "strict diagnostics skipped: shape mismatch not alignable "
+                            f"(gt={tuple(gt_labels.shape)} vs pred={tuple(predicted_labels.shape)})"
+                        )
+                    else:
+                        step_entry["alignment"] = alignment.to_dict()
+                        if tuple(gt_labels.shape) != tuple(predicted_labels.shape):
+                            step_entry["warnings"].append(
+                                "shape mismatch resolved by axis/crop alignment "
+                                f"(overlap_ratio={alignment.overlap_ratio:.3f})"
+                            )
 
-            try:
-                gt_labels = np.load(labels_path, mmap_mode="r")
-            except Exception as exc:
-                step_entry["errors"].append(f"failed to read labels.npy: {exc}")
-                step_entries.append(step_entry)
-                continue
-
-            if tuple(gt_labels.shape) != tuple(predicted_labels.shape):
-                step_entry["errors"].append(
-                    f"shape mismatch: gt={tuple(gt_labels.shape)} vs pred={tuple(predicted_labels.shape)}"
+                        pred_eval, gt_eval = align_pred_gt(predicted_labels, gt_labels, alignment)
+                        strict_eval = self._evaluate_step_against_gt(
+                            predicted_labels=pred_eval,
+                            gt_labels=gt_eval,
+                            instance_iou_threshold=instance_iou_threshold,
+                        )
+                        if time_index == 0:
+                            gt_to_pore_group_map = self._build_gt_to_pore_group_map(
+                                predicted_labels_t0=pred_eval,
+                                gt_labels_t0=gt_eval,
+                            )
+                        if gt_to_pore_group_map:
+                            gt_pore_eval, agg_info = self._remap_gt_labels_with_group_map(
+                                gt_labels=gt_eval,
+                                gt_to_group=gt_to_pore_group_map,
+                            )
+                            strict_pore_eval = self._evaluate_step_against_gt(
+                                predicted_labels=pred_eval,
+                                gt_labels=gt_pore_eval,
+                                instance_iou_threshold=instance_iou_threshold,
+                            )
+                            step_entry["pore_level"]["aggregation"] = {
+                                **agg_info,
+                                "t0_group_map_size": int(len(gt_to_pore_group_map)),
+                            }
+                            step_entry["pore_level"]["instance"] = strict_pore_eval["instance"]
+                            step_entry["pore_level"]["mapping"] = strict_pore_eval["mapping"]
+                            step_maps_pore[time_index] = strict_pore_eval["mapping"]
+                        step_entry["segmentation"] = strict_eval["segmentation"]
+                        step_entry["strict_instance"] = strict_eval["instance"]
+                        step_entry["strict_mapping"] = strict_eval["mapping"]
+                        step_maps_strict[time_index] = strict_eval["mapping"]
+            elif labels_path and predicted_labels is None:
+                step_entry["warnings"].append(
+                    "snapshot has no segmented_regions; strict voxel-level diagnostics skipped"
                 )
-                step_entries.append(step_entry)
-                continue
 
-            eval_step = self._evaluate_step_against_gt(
-                predicted_labels=predicted_labels,
-                gt_labels=gt_labels,
-                instance_iou_threshold=instance_iou_threshold,
-            )
-            step_entry["evaluated"] = True
-            step_entry["segmentation"] = eval_step["segmentation"]
-            step_entry["instance"] = eval_step["instance"]
-            step_entry["mapping"] = eval_step["mapping"]
-            step_maps[time_index] = eval_step["mapping"]
+            # Fallback for legacy datasets without annotations.json.
+            if primary_eval is None and strict_eval is not None:
+                if strict_pore_eval is not None:
+                    primary_eval = {
+                        "segmentation": strict_eval.get("segmentation", {}),
+                        "instance": strict_pore_eval.get("instance", {}),
+                        "mapping": strict_pore_eval.get("mapping", {}),
+                        "annotation": step_entry["pore_level"].get("aggregation", {}),
+                    }
+                else:
+                    primary_eval = strict_eval
+                step_entry["warnings"].append(
+                    "primary evaluation fell back to labels.npy because annotations.json was unavailable"
+                )
+
+            if isinstance(primary_eval, dict):
+                step_entry["evaluated"] = True
+                if isinstance(primary_eval.get("segmentation"), dict) and primary_eval["segmentation"]:
+                    step_entry["segmentation"] = primary_eval["segmentation"]
+                step_entry["instance"] = primary_eval.get("instance", {})
+                step_entry["mapping"] = primary_eval.get("mapping", {})
+                step_maps_primary[time_index] = step_entry["mapping"]
+
+                annotation_info = primary_eval.get("annotation", {})
+                if isinstance(annotation_info, dict):
+                    step_entry["pore_level"]["aggregation"] = annotation_info
+                else:
+                    step_entry["pore_level"]["aggregation"] = step_entry["pore_level"].get("aggregation", {})
+                if not step_entry["pore_level"].get("instance"):
+                    step_entry["pore_level"]["instance"] = dict(step_entry["instance"])
+                if not step_entry["pore_level"].get("mapping"):
+                    step_entry["pore_level"]["mapping"] = step_entry["mapping"]
+                    step_maps_pore[time_index] = step_entry["mapping"]
+
             step_entries.append(step_entry)
 
-        reference_map = step_maps.get(0, {}).get("pred_to_gt", {})
+        reference_map_strict = step_maps_strict.get(0, {}).get("pred_to_gt", {})
+        reference_gt_ids_strict = set(reference_map_strict.values()) if isinstance(reference_map_strict, dict) else set()
+        t0_gt_ids_strict = set(step_maps_strict.get(0, {}).get("gt_ids", set()))
+        t0_reference_gt_coverage_strict = self._safe_ratio(
+            len(reference_gt_ids_strict),
+            len(t0_gt_ids_strict),
+            default=1.0 if len(t0_gt_ids_strict) == 0 else 0.0,
+        )
+
+        reference_map_pore = step_maps_pore.get(0, {}).get("pred_to_gt", {})
+        reference_gt_ids_pore = set(reference_map_pore.values()) if isinstance(reference_map_pore, dict) else set()
+        t0_gt_ids_pore = set(step_maps_pore.get(0, {}).get("gt_ids", set()))
+        t0_reference_gt_coverage_pore = self._safe_ratio(
+            len(reference_gt_ids_pore),
+            len(t0_gt_ids_pore),
+            default=1.0 if len(t0_gt_ids_pore) == 0 else 0.0,
+        )
+        reference_map = step_maps_primary.get(0, {}).get("pred_to_gt", {})
+        reference_gt_ids = set(reference_map.values()) if isinstance(reference_map, dict) else set()
+        t0_gt_ids = set(step_maps_primary.get(0, {}).get("gt_ids", set()))
+        t0_reference_gt_coverage = self._safe_ratio(
+            len(reference_gt_ids),
+            len(t0_gt_ids),
+            default=1.0 if len(t0_gt_ids) == 0 else 0.0,
+        )
+
         if not reference_map:
             report["warnings"].append(
-                "step 0 has no usable pred->GT mapping; tracking identity accuracy will be skipped"
+                "step 0 has no usable pred->GT mapping in primary (annotations pore-level) evaluation; "
+                "tracking identity accuracy will be skipped"
+            )
+        if not reference_map_pore and any(isinstance(row.get("pore_level"), dict) for row in step_entries):
+            report["warnings"].append(
+                "step 0 has no usable pred->GT mapping for pore-level evaluation; "
+                "pore-level tracking accuracy will be skipped"
             )
 
         for time_index in range(1, steps_to_eval):
             step_entry = step_entries[time_index]
             if not step_entry.get("evaluated", False):
                 continue
-            step_map = step_maps.get(time_index)
+            step_map = step_maps_primary.get(time_index)
             if not isinstance(step_map, dict):
                 continue
 
             id_map = self.time_series.tracking.id_mapping.get(time_index, {})
+            novel_stats = snapshots[time_index].metadata.get("novel_segmentation", {})
             tracking_eval = self._evaluate_tracking_step(
                 time_index=time_index,
                 id_map=id_map if isinstance(id_map, dict) else {},
                 reference_pred_to_gt=dict(reference_map) if isinstance(reference_map, dict) else {},
                 current_pred_to_gt=dict(step_map.get("pred_to_gt", {})),
                 current_gt_ids=set(step_map.get("gt_ids", set())),
+                novel_segmentation=novel_stats if isinstance(novel_stats, dict) else {},
             )
             step_entry["tracking"] = tracking_eval
 
+            step_map_strict = step_maps_strict.get(time_index)
+            if isinstance(step_map_strict, dict) and isinstance(reference_map_strict, dict) and reference_map_strict:
+                tracking_eval_strict = self._evaluate_tracking_step(
+                    time_index=time_index,
+                    id_map=id_map if isinstance(id_map, dict) else {},
+                    reference_pred_to_gt=dict(reference_map_strict),
+                    current_pred_to_gt=dict(step_map_strict.get("pred_to_gt", {})),
+                    current_gt_ids=set(step_map_strict.get("gt_ids", set())),
+                    novel_segmentation=novel_stats if isinstance(novel_stats, dict) else {},
+                )
+                step_entry["strict_tracking"] = tracking_eval_strict
+
+            step_map_pore = step_maps_pore.get(time_index)
+            if isinstance(step_map_pore, dict) and isinstance(reference_map_pore, dict) and reference_map_pore:
+                tracking_eval_pore = self._evaluate_tracking_step(
+                    time_index=time_index,
+                    id_map=id_map if isinstance(id_map, dict) else {},
+                    reference_pred_to_gt=dict(reference_map_pore),
+                    current_pred_to_gt=dict(step_map_pore.get("pred_to_gt", {})),
+                    current_gt_ids=set(step_map_pore.get("gt_ids", set())),
+                    novel_segmentation=novel_stats if isinstance(novel_stats, dict) else {},
+                )
+                step_entry["pore_level"]["tracking"] = tracking_eval_pore
+
         evaluated_steps = [row for row in step_entries if row.get("evaluated", False)]
         evaluated_detection = [row for row in evaluated_steps if isinstance(row.get("instance"), dict) and row["instance"]]
+        evaluated_detection_pore = [
+            row
+            for row in evaluated_steps
+            if isinstance(row.get("pore_level"), dict)
+            and isinstance(row["pore_level"].get("instance"), dict)
+            and row["pore_level"]["instance"]
+        ]
         evaluated_tracking = [
             row for row in step_entries[1:]
             if isinstance(row.get("tracking"), dict) and bool(row["tracking"].get("available", False))
+        ]
+        evaluated_tracking_strict = [
+            row for row in step_entries[1:]
+            if isinstance(row.get("strict_tracking"), dict) and bool(row["strict_tracking"].get("available", False))
+        ]
+        evaluated_tracking_pore = [
+            row
+            for row in step_entries[1:]
+            if isinstance(row.get("pore_level"), dict)
+            and isinstance(row["pore_level"].get("tracking"), dict)
+            and bool(row["pore_level"]["tracking"].get("available", False))
         ]
 
         overall: Dict[str, Any] = {
             "num_steps_total": len(step_entries),
             "num_steps_evaluated": len(evaluated_steps),
             "num_steps_with_tracking_eval": len(evaluated_tracking),
+            "num_steps_with_strict_tracking_eval": len(evaluated_tracking_strict),
+            "num_steps_with_pore_level_tracking_eval": len(evaluated_tracking_pore),
+            "t0_reference_gt_coverage": float(t0_reference_gt_coverage),
+            "t0_reference_pred_to_gt_size": int(len(reference_map)) if isinstance(reference_map, dict) else 0,
+            "t0_gt_instance_count": int(len(t0_gt_ids)),
+            "t0_reference_gt_coverage_strict": float(t0_reference_gt_coverage_strict),
+            "t0_reference_pred_to_gt_size_strict": int(len(reference_map_strict)) if isinstance(reference_map_strict, dict) else 0,
+            "t0_gt_instance_count_strict": int(len(t0_gt_ids_strict)),
+            "t0_pore_level_reference_gt_coverage": float(t0_reference_gt_coverage_pore),
+            "t0_pore_level_reference_map_size": int(len(reference_map_pore)) if isinstance(reference_map_pore, dict) else 0,
+            "t0_pore_level_gt_group_count": int(len(t0_gt_ids_pore)),
+            # Legacy key retained for backward-compatible consumers.
+            "t0_gt_to_pore_group_map_size": int(len(gt_to_pore_group_map)),
         }
 
         if evaluated_detection:
             mean_instance_precision = float(np.mean([row["instance"].get("precision", 0.0) for row in evaluated_detection]))
             mean_instance_recall = float(np.mean([row["instance"].get("recall", 0.0) for row in evaluated_detection]))
             mean_instance_f1 = float(np.mean([row["instance"].get("f1", 0.0) for row in evaluated_detection]))
-            mean_voxel_iou = float(np.mean([row["segmentation"].get("voxel_iou", 0.0) for row in evaluated_detection]))
             overall.update(
                 {
                     "mean_instance_precision": mean_instance_precision,
                     "mean_instance_recall": mean_instance_recall,
                     "mean_instance_f1": mean_instance_f1,
-                    "mean_voxel_iou": mean_voxel_iou,
                 }
             )
+            rows_with_voxel = [
+                row
+                for row in evaluated_detection
+                if isinstance(row.get("segmentation"), dict) and "voxel_iou" in row["segmentation"]
+            ]
+            if rows_with_voxel:
+                overall["mean_voxel_iou"] = float(
+                    np.mean([row["segmentation"].get("voxel_iou", 0.0) for row in rows_with_voxel])
+                )
+
+        if evaluated_detection_pore:
+            mean_pore_instance_precision = float(
+                np.mean([row["pore_level"]["instance"].get("precision", 0.0) for row in evaluated_detection_pore])
+            )
+            mean_pore_instance_recall = float(
+                np.mean([row["pore_level"]["instance"].get("recall", 0.0) for row in evaluated_detection_pore])
+            )
+            mean_pore_instance_f1 = float(
+                np.mean([row["pore_level"]["instance"].get("f1", 0.0) for row in evaluated_detection_pore])
+            )
+            overall.update(
+                {
+                    "mean_pore_level_instance_precision": mean_pore_instance_precision,
+                    "mean_pore_level_instance_recall": mean_pore_instance_recall,
+                    "mean_pore_level_instance_f1": mean_pore_instance_f1,
+                }
+            )
+        elif evaluated_detection:
+            overall["mean_pore_level_instance_precision"] = float(overall.get("mean_instance_precision", 0.0))
+            overall["mean_pore_level_instance_recall"] = float(overall.get("mean_instance_recall", 0.0))
+            overall["mean_pore_level_instance_f1"] = float(overall.get("mean_instance_f1", 0.0))
 
         if evaluated_tracking:
             mean_tracking_accuracy = float(np.mean([row["tracking"].get("accuracy", 0.0) for row in evaluated_tracking]))
             mean_active_accuracy = float(np.mean([row["tracking"].get("active_accuracy", 0.0) for row in evaluated_tracking]))
             mean_closure_accuracy = float(np.mean([row["tracking"].get("closure_accuracy", 0.0) for row in evaluated_tracking]))
+            mean_reference_scope_gt_coverage = float(
+                np.mean([row["tracking"].get("reference_scope_gt_coverage", 0.0) for row in evaluated_tracking])
+            )
+            mean_untracked_novel_segments = float(
+                np.mean([row["tracking"].get("untracked_novel_segments", 0.0) for row in evaluated_tracking])
+            )
             overall.update(
                 {
                     "mean_tracking_accuracy": mean_tracking_accuracy,
                     "mean_active_tracking_accuracy": mean_active_accuracy,
                     "mean_closure_accuracy": mean_closure_accuracy,
+                    "mean_reference_scope_gt_coverage": mean_reference_scope_gt_coverage,
+                    "mean_untracked_novel_segments": mean_untracked_novel_segments,
                 }
+            )
+
+        if evaluated_tracking_strict:
+            overall.update(
+                {
+                    "mean_tracking_accuracy_strict": float(
+                        np.mean([row["strict_tracking"].get("accuracy", 0.0) for row in evaluated_tracking_strict])
+                    ),
+                    "mean_active_tracking_accuracy_strict": float(
+                        np.mean([row["strict_tracking"].get("active_accuracy", 0.0) for row in evaluated_tracking_strict])
+                    ),
+                    "mean_closure_accuracy_strict": float(
+                        np.mean([row["strict_tracking"].get("closure_accuracy", 0.0) for row in evaluated_tracking_strict])
+                    ),
+                }
+            )
+
+        if evaluated_tracking_pore:
+            mean_tracking_accuracy_pore = float(
+                np.mean([row["pore_level"]["tracking"].get("accuracy", 0.0) for row in evaluated_tracking_pore])
+            )
+            mean_active_accuracy_pore = float(
+                np.mean([row["pore_level"]["tracking"].get("active_accuracy", 0.0) for row in evaluated_tracking_pore])
+            )
+            mean_closure_accuracy_pore = float(
+                np.mean([row["pore_level"]["tracking"].get("closure_accuracy", 0.0) for row in evaluated_tracking_pore])
+            )
+            mean_reference_scope_gt_coverage_pore = float(
+                np.mean(
+                    [
+                        row["pore_level"]["tracking"].get("reference_scope_gt_coverage", 0.0)
+                        for row in evaluated_tracking_pore
+                    ]
+                )
+            )
+            overall.update(
+                {
+                    "mean_pore_level_tracking_accuracy": mean_tracking_accuracy_pore,
+                    "mean_pore_level_active_tracking_accuracy": mean_active_accuracy_pore,
+                    "mean_pore_level_closure_accuracy": mean_closure_accuracy_pore,
+                    "mean_pore_level_reference_scope_gt_coverage": mean_reference_scope_gt_coverage_pore,
+                }
+            )
+            # Keep primary top-level tracking metrics aligned with pore-level policy.
+            overall["mean_tracking_accuracy"] = mean_tracking_accuracy_pore
+            overall["mean_active_tracking_accuracy"] = mean_active_accuracy_pore
+            overall["mean_closure_accuracy"] = mean_closure_accuracy_pore
+            overall["mean_reference_scope_gt_coverage"] = mean_reference_scope_gt_coverage_pore
+        elif evaluated_tracking:
+            overall["mean_pore_level_tracking_accuracy"] = float(overall.get("mean_tracking_accuracy", 0.0))
+            overall["mean_pore_level_active_tracking_accuracy"] = float(
+                overall.get("mean_active_tracking_accuracy", 0.0)
+            )
+            overall["mean_pore_level_closure_accuracy"] = float(
+                overall.get("mean_closure_accuracy", 0.0)
+            )
+            overall["mean_pore_level_reference_scope_gt_coverage"] = float(
+                overall.get("mean_reference_scope_gt_coverage", 0.0)
             )
 
         for step_entry in step_entries:

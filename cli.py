@@ -78,9 +78,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--input", metavar="PATH", default="", help="Input path (DICOM dir or file).")
     parser.add_argument("--loader", metavar="TYPE", default="dicom", help="Loader type: dicom | dummy.")
+    parser.add_argument(
+        "--load-strategy",
+        metavar="MODE",
+        default="auto",
+        help="DICOM load strategy: auto | full | fast | mmap | chunked.",
+    )
     parser.add_argument("--output", metavar="DIR", default=None, help="Output directory.")
     parser.add_argument("--threshold", metavar="VALUE", type=float, default=300.0, help="Segmentation threshold.")
     parser.add_argument("--auto-threshold", action="store_true", help="Auto-detect threshold.")
+    parser.add_argument(
+        "--threshold-algorithm",
+        metavar="ALG",
+        default="auto",
+        help="Threshold algorithm when --auto-threshold is set: auto | otsu | li | yen | triangle | minimum.",
+    )
     parser.add_argument(
         "--formats",
         metavar="FMT",
@@ -114,9 +126,11 @@ def _resolve_dto(args: argparse.Namespace, parser: argparse.ArgumentParser) -> V
     return VolumeProcessDTO(
         input_path=args.input,
         loader_type=args.loader,
+        load_strategy=args.load_strategy,
         output_dir=args.output,
         threshold=args.threshold,
         auto_threshold=args.auto_threshold,
+        threshold_algorithm=args.threshold_algorithm,
         export_formats=tuple(args.formats),
         chunk_shape=(c, c, c),
         halo_voxels=args.halo,

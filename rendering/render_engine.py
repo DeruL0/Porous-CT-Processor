@@ -4,11 +4,12 @@ Provides reusable rendering methods independent of GUI framework.
 Includes LOD (Level of Detail) support for large volume handling.
 """
 
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 import numpy as np
 import pyvista as pv
 from core import VolumeData
 from core.dto import RenderParamsDTO
+from core.coordinates import raw_zyx_to_grid_xyz
 from rendering.lod_manager import LODPyramid, LODRenderManager, check_gpu_volume_rendering
 from config import (
     RENDER_MAX_VOXELS_VOLUME,
@@ -56,6 +57,9 @@ class RenderEngine:
         self._cached_vol_grid: Optional[pv.PolyData] = None
         self._cached_vol_grid_source: Optional[int] = None
         self._lod_pyramid: Optional[LODPyramid] = None
+        self._overlay_grid: Optional[pv.ImageData] = None
+        self._overlay_source_token: Optional[Tuple[int, Tuple[float, float, float], Tuple[float, float, float]]] = None
+        self._overlay_actors: List[Any] = []
         
         # PNM color range cache (for consistent colors across timepoints)
         self._pnm_radius_clim: Optional[Tuple[float, float]] = None
@@ -204,6 +208,8 @@ class RenderEngine:
         """
         Explicitly tear down VTK/PyVista resources in reverse dependency order.
         """
+        self.remove_overlay_layers(render=False)
+
         # 1) Detach actors from renderer and disconnect mapper inputs first.
         for actor_attr in ("volume_actor", "iso_actor"):
             actor = getattr(self, actor_attr, None)
@@ -242,6 +248,8 @@ class RenderEngine:
             self._cached_vol_grid = None
             self._cached_vol_grid_source = None
             self._lod_pyramid = None
+            self._overlay_grid = None
+            self._overlay_source_token = None
 
         # 4) Release core data references after graph disconnect.
         if clear_data:
@@ -310,15 +318,167 @@ class RenderEngine:
         if not self.data or self.data.raw_data is None:
             return
         prepared = self._prepare_vtk_volume_array(self.data.raw_data)
+        grid = self._build_grid_from_volume_data(prepared, self.data.spacing, self.data.origin)
+        self.grid = grid
+
+    def _build_grid_from_volume_data(
+        self,
+        raw_data: np.ndarray,
+        spacing: Tuple[float, float, float],
+        origin: Tuple[float, float, float],
+    ) -> pv.ImageData:
+        """
+        Create a PyVista ImageData object from raw volume data.
+
+        Input raw_data is expected in project storage order (z, y, x) and is
+        converted to VTK axis order (x, y, z).
+        """
+        raw_xyz = raw_zyx_to_grid_xyz(raw_data)
+        if not raw_xyz.flags.f_contiguous:
+            raw_xyz = np.asfortranarray(raw_xyz)
+
         grid = pv.ImageData()
-        grid.dimensions = np.array(prepared.shape) + 1
-        grid.origin = self.data.origin
-        grid.spacing = self.data.spacing
-        cell_values = prepared.ravel(order="F")
+        grid.dimensions = np.array(raw_xyz.shape) + 1
+        grid.origin = origin
+        grid.spacing = spacing
+        cell_values = raw_xyz.ravel(order="F")
         if not cell_values.flags.c_contiguous:
             cell_values = np.ascontiguousarray(cell_values)
         grid.cell_data["values"] = cell_values
-        self.grid = grid
+        return grid
+
+    def set_overlay_volume(self, volume_data: Optional[VolumeData]) -> bool:
+        """
+        Convert selected overlay source volume into cached ImageData.
+
+        Returns True when an overlay grid is available and ready.
+        """
+        if volume_data is None or volume_data.raw_data is None:
+            self._overlay_grid = None
+            self._overlay_source_token = None
+            return False
+
+        source_token = (
+            id(volume_data.raw_data),
+            tuple(float(v) for v in volume_data.spacing),
+            tuple(float(v) for v in volume_data.origin),
+        )
+        if self._overlay_grid is not None and self._overlay_source_token == source_token:
+            return True
+
+        prepared = self._prepare_vtk_volume_array(volume_data.raw_data)
+        self._overlay_grid = self._build_grid_from_volume_data(
+            prepared,
+            spacing=volume_data.spacing,
+            origin=volume_data.origin,
+        )
+        self._overlay_source_token = source_token
+        return True
+
+    def add_overlay_layer(
+        self,
+        layer_type: str,
+        *,
+        opacity: float = 0.35,
+        mesh_data: Optional[VolumeData] = None,
+    ) -> bool:
+        """
+        Add one overlay actor on top of the active base view without clearing scene.
+        """
+        overlay_type = str(layer_type or "").strip().lower()
+        alpha = float(max(0.0, min(1.0, opacity)))
+        params = self._get_render_params()
+        actor = None
+
+        if overlay_type == "pnm_mesh":
+            mesh_obj = None
+            if mesh_data is not None and mesh_data.has_mesh:
+                mesh_obj = mesh_data.mesh
+            elif self.mesh is not None:
+                mesh_obj = self.mesh
+            if mesh_obj is None:
+                return False
+
+            actor = self.plotter.add_mesh(
+                mesh_obj,
+                color=params.get("solid_color", "gold"),
+                opacity=alpha,
+                smooth_shading=True,
+                show_scalar_bar=False,
+                render=False,
+            )
+        else:
+            if self._overlay_grid is None:
+                return False
+
+            if overlay_type == "slices":
+                ox, oy, oz = self._overlay_grid.origin
+                dx, dy, dz = self._overlay_grid.spacing
+                x = ox + params.get("slice_x", 0) * dx
+                y = oy + params.get("slice_y", 0) * dy
+                z = oz + params.get("slice_z", 0) * dz
+                slices = self._overlay_grid.slice_orthogonal(x=x, y=y, z=z)
+                actor = self.plotter.add_mesh(
+                    slices,
+                    cmap=params.get("colormap", "bone"),
+                    clim=params.get("clim", [0, 1000]),
+                    opacity=alpha,
+                    show_scalar_bar=False,
+                    render=False,
+                )
+            elif overlay_type == "iso":
+                threshold = params.get("threshold", 300)
+                contours = self._overlay_grid.cell_data_to_point_data().contour(isosurfaces=[threshold])
+                if contours.n_points == 0:
+                    return False
+                iso_style = self.get_iso_mesh_kwargs(params=params, sync_mode=False)
+                actor = self.plotter.add_mesh(
+                    contours,
+                    color=params.get("solid_color", "ivory"),
+                    opacity=alpha,
+                    show_scalar_bar=False,
+                    render=False,
+                    **iso_style,
+                )
+            elif overlay_type == "volume":
+                vol_grid = self._overlay_grid.cell_data_to_point_data()
+                opacity_tf = np.linspace(0.0, alpha, 8).tolist()
+                actor = self.plotter.add_volume(
+                    vol_grid,
+                    cmap=params.get("colormap", "bone"),
+                    clim=params.get("clim", [0, 1000]),
+                    opacity=opacity_tf,
+                    shade=False,
+                    render=False,
+                )
+            else:
+                return False
+
+        if actor is None:
+            return False
+
+        self._overlay_actors.append(actor)
+        self.plotter.render()
+        return True
+
+    def remove_overlay_layers(self, *, render: bool = True) -> None:
+        """Remove all overlay actors from the scene and detach references."""
+        if not self._overlay_actors:
+            return
+
+        for actor in self._overlay_actors:
+            try:
+                self.plotter.remove_actor(actor, render=False)
+            except Exception:
+                pass
+            self._detach_actor(actor)
+        self._overlay_actors.clear()
+
+        if render:
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
 
     def clear_view(self):
         """Clear rendered actors but keep loaded data and caches."""

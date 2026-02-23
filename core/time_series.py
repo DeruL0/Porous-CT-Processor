@@ -89,7 +89,9 @@ class PoreTrackingResult:
         match_confidence: {pore_id: [c0, c1, ...]} assignment confidence in [0, 1]
         miss_count: {pore_id: count} consecutive unmatched count
         unmatched_reason: {pore_id: [reason0, reason1, ...]} reason when unmatched
-        evaluation: Optional structured quality report against simulation GT labels
+        evaluation: Optional structured quality report against simulation GT labels.
+            Includes scope diagnostics for fixed-reference tracking such as
+            t0 reference coverage and untracked novel segmentation counts.
     """
     reference_ids: List[int] = field(default_factory=list)
     volume_history: Dict[int, List[float]] = field(default_factory=dict)

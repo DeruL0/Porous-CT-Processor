@@ -22,6 +22,17 @@ from core.pipeline import (
     build_volume_pipeline,
     run_volume_pipeline,
 )
+from core.coordinates import (
+    raw_zyx_to_grid_xyz,
+    world_xyz_to_voxel_zyx,
+    world_xyz_to_index_zyx,
+    world_delta_xyz_to_voxel_delta_zyx,
+    voxel_delta_zyx_to_world_delta_xyz,
+    bounds_xyz_to_slices_zyx,
+    origin_xyz_for_subvolume_zyx,
+    voxel_grid_zyx_to_world_xyz,
+    voxel_zyx_to_world_xyz,
+)
 
 __all__ = [
     'VolumeData', 'BaseLoader', 'BaseProcessor', 'BaseVisualizer',
@@ -33,4 +44,8 @@ __all__ = [
     'CancelFlagObserver', 'TerminalProgressObserver',
     'PipelineStage', 'PIPELINE_STAGE_ORDER', 'resolve_pipeline_stages',
     'build_volume_pipeline', 'run_volume_pipeline',
+    'raw_zyx_to_grid_xyz', 'world_xyz_to_voxel_zyx', 'world_xyz_to_index_zyx',
+    'world_delta_xyz_to_voxel_delta_zyx', 'voxel_delta_zyx_to_world_delta_xyz',
+    'bounds_xyz_to_slices_zyx', 'origin_xyz_for_subvolume_zyx',
+    'voxel_grid_zyx_to_world_xyz', 'voxel_zyx_to_world_xyz',
 ]

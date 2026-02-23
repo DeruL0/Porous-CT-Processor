@@ -1,5 +1,4 @@
-"""
-"""GPU Pipeline for unified segmentation (EDT -> local_maxima -> watershed)."""
+"""GPU pipeline for unified segmentation (EDT -> local_maxima -> watershed)."""
 
 import numpy as np
 import time

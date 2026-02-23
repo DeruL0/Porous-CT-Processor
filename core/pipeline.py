@@ -86,6 +86,25 @@ def _resolve_dummy_size(input_path: str) -> int:
     return 128
 
 
+def _resolve_load_strategy(strategy_raw: Optional[str]):
+    """Resolve SmartDicomLoader strategy enum from DTO value."""
+    from loaders import LoadStrategy
+
+    raw = str(strategy_raw or "auto").strip().lower()
+    mapping = {
+        "auto": LoadStrategy.AUTO,
+        "full": LoadStrategy.FULL,
+        "fast": LoadStrategy.FAST,
+        "mmap": LoadStrategy.MEMORY_MAPPED,
+        "memory_mapped": LoadStrategy.MEMORY_MAPPED,
+        "chunked": LoadStrategy.CHUNKED,
+    }
+    if raw not in mapping:
+        allowed = ", ".join(sorted(mapping))
+        raise ValueError(f"Unknown load_strategy '{strategy_raw}'. Expected one of: {allowed}.")
+    return mapping[raw]
+
+
 def _stage_load(dto: VolumeProcessDTO, progress: Callable[[int, str], None]) -> VolumeData:
     """Load raw data from input path."""
     progress(0, f"Loading input via {dto.loader_type}...")
@@ -102,7 +121,8 @@ def _stage_load(dto: VolumeProcessDTO, progress: Callable[[int, str], None]) -> 
 
         if not dto.input_path:
             raise ValueError("input_path is required when loader_type='dicom'.")
-        return SmartDicomLoader().load(dto.input_path, callback=progress)
+        strategy = _resolve_load_strategy(dto.load_strategy)
+        return SmartDicomLoader(strategy=strategy).load(dto.input_path, callback=progress)
 
     raise ValueError(f"Unknown loader_type: {dto.loader_type!r}. Supported: 'dicom', 'dummy'.")
 
@@ -113,11 +133,12 @@ def _stage_threshold(data: VolumeData, dto: VolumeProcessDTO, progress: Callable
         raise ValueError("Threshold stage requires voxel data (raw_data).")
 
     if dto.auto_threshold:
-        progress(0, "Detecting threshold (auto)...")
+        algorithm = str(dto.threshold_algorithm or "auto").lower()
+        progress(0, f"Detecting threshold ({algorithm})...")
         from processors import PoreExtractionProcessor
 
-        threshold = float(PoreExtractionProcessor.suggest_threshold(data, algorithm="auto"))
-        progress(100, f"Auto threshold: {threshold:.1f}")
+        threshold = float(PoreExtractionProcessor.suggest_threshold(data, algorithm=algorithm))
+        progress(100, f"Detected threshold ({algorithm}): {threshold:.1f}")
         return threshold
 
     threshold = float(dto.threshold)

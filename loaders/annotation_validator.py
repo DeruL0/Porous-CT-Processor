@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from core import VolumeData
+from core.annotation_alignment import infer_shape_alignment
 
 
 class AnnotationValidator:
@@ -276,7 +277,23 @@ class AnnotationValidator:
                 ann_shape_i = [int(v) for v in ann_shape]
                 checks["volume_shape_match"] = ann_shape_i == volume_shape
                 if ann_shape_i != volume_shape:
-                    errors.append(f"annotations volume_shape={ann_shape_i} != CT shape={volume_shape}")
+                    alignment = infer_shape_alignment(volume_shape, ann_shape_i)
+                    if alignment is None:
+                        checks["volume_shape_alignable"] = False
+                        errors.append(f"annotations volume_shape={ann_shape_i} != CT shape={volume_shape}")
+                    else:
+                        checks["volume_shape_alignable"] = True
+                        checks["volume_shape_alignment"] = alignment.to_dict()
+                        if alignment.overlap_ratio < 1.0:
+                            warnings.append(
+                                "annotations volume_shape differs from CT; "
+                                "evaluation will center-crop to overlap region"
+                            )
+                        else:
+                            warnings.append(
+                                "annotations volume_shape differs from CT axis order; "
+                                "evaluation will apply axis alignment"
+                            )
             else:
                 warnings.append("annotations volume_shape missing or invalid")
 
@@ -319,9 +336,26 @@ class AnnotationValidator:
         if label_stats is not None:
             label_shape = label_stats.get("shape")
             if isinstance(label_shape, list) and len(label_shape) == 3:
-                checks["labels_shape_match"] = [int(v) for v in label_shape] == [int(v) for v in volume_shape]
+                label_shape_i = [int(v) for v in label_shape]
+                checks["labels_shape_match"] = label_shape_i == [int(v) for v in volume_shape]
                 if not checks["labels_shape_match"]:
-                    errors.append(f"labels.npy shape={label_shape} != CT shape={volume_shape}")
+                    alignment = infer_shape_alignment(volume_shape, label_shape_i)
+                    if alignment is None:
+                        checks["labels_shape_alignable"] = False
+                        errors.append(f"labels.npy shape={label_shape} != CT shape={volume_shape}")
+                    else:
+                        checks["labels_shape_alignable"] = True
+                        checks["labels_shape_alignment"] = alignment.to_dict()
+                        if alignment.overlap_ratio < 1.0:
+                            warnings.append(
+                                "labels.npy shape differs from CT; "
+                                "evaluation will center-crop to overlap region"
+                            )
+                        else:
+                            warnings.append(
+                                "labels.npy shape differs from CT axis order; "
+                                "evaluation will apply axis alignment"
+                            )
             else:
                 errors.append("labels.npy shape metadata missing")
 
