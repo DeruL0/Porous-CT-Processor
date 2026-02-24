@@ -10,6 +10,10 @@ from typing import Optional, Callable, Tuple
 import gc
 
 from core import BaseProcessor, VolumeData
+from processors.pore_segmentation import (
+    PoreSegmentationConfig,
+    segment_pores_from_raw,
+)
 from processors.utils import (
     binary_fill_holes, 
     compute_histogram_gpu, 
@@ -19,7 +23,9 @@ from processors.utils import (
 from config import (
     PROCESS_CHUNK_THRESHOLD,
     PROCESS_CHUNK_SIZE,
-    PROCESS_OTSU_SAMPLE_THRESHOLD
+    PROCESS_OTSU_SAMPLE_THRESHOLD,
+    SEGMENTATION_PROFILE_DEFAULT,
+    SEGMENTATION_SPLIT_MODE_DEFAULT,
 )
 
 # Try to import cc3d for faster 3D labeling (10-50x speedup)
@@ -234,8 +240,14 @@ class PoreExtractionProcessor(BaseProcessor):
             gc.collect()
             return int(median_val)
 
-    def process(self, data: VolumeData, callback: Optional[Callable[[int, str], None]] = None,
-                threshold: int = -300) -> VolumeData:
+    def process(
+        self,
+        data: VolumeData,
+        callback: Optional[Callable[[int, str], None]] = None,
+        threshold: int = -300,
+        segmentation_profile: str = SEGMENTATION_PROFILE_DEFAULT,
+        split_mode: str = SEGMENTATION_SPLIT_MODE_DEFAULT,
+    ) -> VolumeData:
         """
         Extract pores from volume data.
         
@@ -252,7 +264,7 @@ class PoreExtractionProcessor(BaseProcessor):
             if callback: callback(p, msg)
 
         cache = get_segmentation_cache()
-        volume_id = f"{id(data.raw_data)}_{threshold}"
+        volume_id = f"{id(data.raw_data)}_{threshold}_{segmentation_profile}_{split_mode}"
         
         # Check if we already have cached segmentation
         cached_mask = cache.get_pores_mask(volume_id)
@@ -271,6 +283,10 @@ class PoreExtractionProcessor(BaseProcessor):
             processed_volume[pores_mask] = 1000
             
             porosity = cached_meta.get('porosity', 0)
+            segmentation_debug = cached_meta.get("segmentation_debug") or {
+                "profile": segmentation_profile,
+                "split_mode": split_mode,
+            }
             
             return VolumeData(
                 raw_data=processed_volume,
@@ -280,37 +296,58 @@ class PoreExtractionProcessor(BaseProcessor):
                     "Type": "Processed - Void Volume",
                     "Porosity": f"{porosity:.2f}%",
                     "PoreCount": int(num_features),
-                    "CacheHit": True
+                    "CacheHit": True,
+                    "SegmentationDebug": segmentation_debug,
                 }
             )
 
-        report(0, f"Starting pore detection (Threshold < {threshold})...")
+        report(0, f"Starting pore detection (Threshold < {threshold}, profile={segmentation_profile}, split={split_mode})...")
 
         raw = data.raw_data
         volume_bytes = raw.nbytes
         
         # Check if we need chunked processing
         if volume_bytes > CHUNK_THRESHOLD:
-            return self._process_chunked(data, threshold, report, cache, volume_id)
+            return self._process_chunked(
+                data,
+                threshold,
+                report,
+                cache,
+                volume_id,
+                segmentation_profile=segmentation_profile,
+                split_mode=split_mode,
+            )
         else:
-            return self._process_standard(data, threshold, report, cache, volume_id)
+            return self._process_standard(
+                data,
+                threshold,
+                report,
+                cache,
+                volume_id,
+                segmentation_profile=segmentation_profile,
+                split_mode=split_mode,
+            )
 
-    def _process_standard(self, data: VolumeData, threshold: int, report, 
-                          cache=None, volume_id=None) -> VolumeData:
+    def _process_standard(
+        self,
+        data: VolumeData,
+        threshold: int,
+        report,
+        cache=None,
+        volume_id=None,
+        segmentation_profile: str = SEGMENTATION_PROFILE_DEFAULT,
+        split_mode: str = SEGMENTATION_SPLIT_MODE_DEFAULT,
+    ) -> VolumeData:
         """Standard processing for smaller volumes."""
         raw = data.raw_data
-        
-        # 1. Binarization (Air vs Solid)
-        solid_mask = raw > threshold
-        report(20, "Binarization complete. Filling holes...")
 
-        # 2. Morphology
-        filled_volume = binary_fill_holes(solid_mask)
-        pores_mask = filled_volume ^ solid_mask
-        
-        # Free intermediate arrays
-        del solid_mask, filled_volume
-        gc.collect()
+        report(20, "Running shared pore segmentation...")
+        seg_cfg = PoreSegmentationConfig(
+            profile=str(segmentation_profile),
+            split_mode=str(split_mode),
+        )
+        seg_result = segment_pores_from_raw(raw=raw, threshold=threshold, spacing=data.spacing, config=seg_cfg)
+        pores_mask = seg_result.pores_mask
         
         report(50, "Morphology operations complete. Calculating stats...")
 
@@ -329,7 +366,14 @@ class PoreExtractionProcessor(BaseProcessor):
 
         # Store in shared cache for PNM to reuse
         if cache is not None and volume_id is not None:
-            cache.store_pores_mask(volume_id, pores_mask, metadata={'porosity': porosity_pct})
+            cache.store_pores_mask(
+                volume_id,
+                pores_mask,
+                metadata={
+                    "porosity": porosity_pct,
+                    "segmentation_debug": seg_result.debug,
+                },
+            )
 
         # Create Output Volume
         processed_volume = np.zeros_like(raw)
@@ -346,12 +390,21 @@ class PoreExtractionProcessor(BaseProcessor):
             metadata={
                 "Type": "Processed - Void Volume",
                 "Porosity": f"{porosity_pct:.2f}%",
-                "PoreCount": int(num_features)
+                "PoreCount": int(num_features),
+                "SegmentationDebug": seg_result.debug,
             }
         )
 
-    def _process_chunked(self, data: VolumeData, threshold: int, report,
-                          cache=None, volume_id=None) -> VolumeData:
+    def _process_chunked(
+        self,
+        data: VolumeData,
+        threshold: int,
+        report,
+        cache=None,
+        volume_id=None,
+        segmentation_profile: str = SEGMENTATION_PROFILE_DEFAULT,
+        split_mode: str = SEGMENTATION_SPLIT_MODE_DEFAULT,
+    ) -> VolumeData:
         """Chunked processing for large volumes to avoid OOM."""
         raw = data.raw_data
         n_slices = raw.shape[0]
@@ -410,6 +463,14 @@ class PoreExtractionProcessor(BaseProcessor):
 
         report(100, "Chunked processing complete.")
 
+        segmentation_debug = {
+            "profile": "legacy",
+            "split_mode": "conservative",
+            "chunked": True,
+            "requested_profile": str(segmentation_profile),
+            "requested_split_mode": str(split_mode),
+        }
+
         return VolumeData(
             raw_data=processed_volume,
             spacing=data.spacing,
@@ -417,7 +478,8 @@ class PoreExtractionProcessor(BaseProcessor):
             metadata={
                 "Type": "Processed - Void Volume (Chunked)",
                 "Porosity": f"{porosity_pct:.2f}%",
-                "PoreCount": f"~{estimated_total} (estimated)"
+                "PoreCount": f"~{estimated_total} (estimated)",
+                "SegmentationDebug": segmentation_debug,
             }
         )
 

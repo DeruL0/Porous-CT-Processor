@@ -294,10 +294,10 @@ class WorkflowHandler(QObject):
             suggested = int(results.get("threshold"))
             self.panel.set_threshold(suggested)
             algo_display = algorithm.capitalize() if algorithm != "auto" else "Auto"
-            self.visualizer.update_status(f"Threshold set to {suggested} HU ({algo_display})")
+            self.visualizer.update_status(f"Threshold set to {suggested} ({algo_display})")
             self.controller._show_msg(
                 "Threshold Results",
-                f"Threshold: {suggested} HU\nAlgorithm: {algo_display}",
+                f"Threshold: {suggested}\nAlgorithm: {algo_display}",
             )
 
         self._start_pipeline_task(

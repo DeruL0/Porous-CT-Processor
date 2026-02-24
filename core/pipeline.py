@@ -162,6 +162,8 @@ def _stage_segment(
         progress=progress,
         threshold=int(threshold),
         min_pore_size=dto.min_pore_size,
+        segmentation_profile=str(dto.segmentation_profile),
+        split_mode=str(dto.split_mode),
     )
 
 
@@ -181,6 +183,8 @@ def _stage_pnm(
         progress=progress,
         threshold=int(threshold),
         min_throat_dist=dto.min_throat_dist,
+        segmentation_profile=str(dto.segmentation_profile),
+        split_mode=str(dto.split_mode),
     )
 
 

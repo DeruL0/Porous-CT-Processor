@@ -20,6 +20,7 @@ from PyQt5.QtWidgets import (
 
 from gui.styles import PANEL_TITLE_STYLE
 from gui.ui_constants import apply_group_layout, make_description_label, set_primary_button_policy
+from config import THRESHOLD_RANGE_MIN, THRESHOLD_RANGE_MAX
 
 
 class StructureProcessingPanel(QGroupBox):
@@ -86,10 +87,10 @@ class StructureProcessingPanel(QGroupBox):
         form.setVerticalSpacing(8)
 
         self.threshold_spin = QSpinBox()
-        self.threshold_spin.setRange(-10000, 30000)
+        self.threshold_spin.setRange(int(THRESHOLD_RANGE_MIN), int(THRESHOLD_RANGE_MAX))
         self.threshold_spin.setValue(-300)
         self.threshold_spin.setSingleStep(50)
-        form.addRow("Threshold (HU):", self.threshold_spin)
+        form.addRow("Threshold (Intensity):", self.threshold_spin)
 
         algo_row_widget = QWidget()
         algo_row_layout = QHBoxLayout(algo_row_widget)

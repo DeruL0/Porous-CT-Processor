@@ -836,7 +836,7 @@ class MainWindow(QMainWindow):
                 val = self.data.raw_data[raw_z, raw_y, raw_x]
                 self.status_bar.showMessage(
                     f"馃搷 Pos: ({world_pos[0]:.1f}, {world_pos[1]:.1f}, {world_pos[2]:.1f}) | "
-                    f"Indices: [{raw_z}, {raw_y}, {raw_x}] | 馃挕 HU: {val:.1f}"
+                    f"Indices: [{raw_z}, {raw_y}, {raw_x}] | 馃挕 Intensity: {val:.1f}"
                 )
         except Exception:
             pass

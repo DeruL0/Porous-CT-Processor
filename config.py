@@ -93,10 +93,26 @@ COLORING_MODES = ['Solid Color', 'Depth (Z-Axis)', 'Radial (Center Dist)']
 DEFAULT_THRESHOLD = 300
 DEFAULT_THRESHOLD_PORE = -300
 
+# Threshold UI/input ranges
+THRESHOLD_RANGE_MIN = -200_000
+THRESHOLD_RANGE_MAX = 200_000
+ISO_THRESHOLD_RANGE_MIN = -50_000
+ISO_THRESHOLD_RANGE_MAX = 50_000
+
 # ==========================================
 # PNM Processing
 # ==========================================
 MIN_PEAK_DISTANCE = 6
+
+# Shared pore segmentation defaults
+SEGMENTATION_PROFILE_DEFAULT = "dual_adaptive"
+SEGMENTATION_SPLIT_MODE_DEFAULT = "balanced"
+SEGMENTATION_SUPPLEMENT_QUANTILE = 40.0
+SEGMENTATION_SUPPLEMENT_MARGIN = 500.0
+SEGMENTATION_SMALL_COMPONENT_VOXELS = 64
+SEGMENTATION_MAX_SEEDS_PER_COMPONENT = 12
+SEGMENTATION_FORCE_SEED_PER_COMPONENT = True
+SEGMENTATION_NECK_EROSION_ITERS = 1
 
 # ==========================================
 # Timer Intervals (ms)

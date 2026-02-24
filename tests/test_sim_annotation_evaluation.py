@@ -1,4 +1,5 @@
 import numpy as np
+import numpy as np
 import pytest
 
 from core import VolumeData
@@ -34,34 +35,6 @@ def _make_snapshot(regions: np.ndarray, time_index: int) -> PNMSnapshot:
     )
 
 
-def _annotations_from_labels(labels: np.ndarray, step_index: int) -> dict:
-    ids = np.unique(labels)
-    ids = ids[ids > 0]
-    voids = []
-    for gt_id in ids:
-        coords = np.argwhere(labels == gt_id)
-        center_zyx = coords.mean(axis=0)
-        voxels = float(len(coords))
-        radius = float((3.0 * voxels / (4.0 * np.pi)) ** (1.0 / 3.0))
-        voids.append(
-            {
-                "id": int(gt_id),
-                "center_mm": [float(center_zyx[2]), float(center_zyx[1]), float(center_zyx[0])],
-                "center_voxel": [float(center_zyx[2]), float(center_zyx[1]), float(center_zyx[0])],
-                "radius_mm": radius,
-                "volume_mm3": voxels,
-            }
-        )
-    return {
-        "step_index": int(step_index),
-        "voxel_size": 1.0,
-        "origin": [0.0, 0.0, 0.0],
-        "volume_shape": [int(labels.shape[0]), int(labels.shape[1]), int(labels.shape[2])],
-        "num_voids": int(len(voids)),
-        "voids": voids,
-    }
-
-
 def test_sim_annotation_evaluation_reports_tracking_accuracy(tmp_path):
     shape = (20, 20, 20)
 
@@ -81,22 +54,19 @@ def test_sim_annotation_evaluation_reports_tracking_accuracy(tmp_path):
     gt_t1[2:6, 2:6, 2:6] = 101
     gt_t1[10:14, 10:14, 10:14] = 202
 
+    gt_path_t0 = tmp_path / "Step_00_labels.npy"
+    gt_path_t1 = tmp_path / "Step_01_labels.npy"
+    np.save(gt_path_t0, gt_t0)
+    np.save(gt_path_t1, gt_t1)
+
     volumes = [
         VolumeData(
             raw_data=np.zeros(shape, dtype=np.int16),
-            metadata={
-                "sim_annotations": {
-                    "annotations": _annotations_from_labels(gt_t0, step_index=0),
-                }
-            },
+            metadata={"sim_annotations": {"files": {"labels_npy": str(gt_path_t0)}}},
         ),
         VolumeData(
             raw_data=np.zeros(shape, dtype=np.int16),
-            metadata={
-                "sim_annotations": {
-                    "annotations": _annotations_from_labels(gt_t1, step_index=1),
-                }
-            },
+            metadata={"sim_annotations": {"files": {"labels_npy": str(gt_path_t1)}}},
         ),
     ]
 
@@ -141,73 +111,4 @@ def test_sim_annotation_evaluation_handles_missing_label_path_gracefully():
 
     assert report["available"] is False
     assert report["status"] == "unavailable"
-    assert any("annotations.json missing" in msg for msg in report["warnings"])
-
-
-def test_sim_annotation_primary_uses_annotations_not_labels(tmp_path):
-    shape = (18, 18, 18)
-
-    pred_t0 = np.zeros(shape, dtype=np.int32)
-    pred_t0[2:6, 2:6, 2:6] = 1
-    pred_t0[10:14, 10:14, 10:14] = 2
-
-    pred_t1 = np.zeros(shape, dtype=np.int32)
-    pred_t1[3:7, 2:6, 2:6] = 11
-    pred_t1[10:14, 9:13, 10:14] = 22
-
-    ann_t0_labels = np.zeros(shape, dtype=np.int32)
-    ann_t0_labels[2:6, 2:6, 2:6] = 101
-    ann_t0_labels[10:14, 10:14, 10:14] = 202
-    ann_t1_labels = np.zeros(shape, dtype=np.int32)
-    ann_t1_labels[3:7, 2:6, 2:6] = 101
-    ann_t1_labels[10:14, 9:13, 10:14] = 202
-
-    wrong_gt_t0 = np.zeros(shape, dtype=np.int32)
-    wrong_gt_t0[2:6, 2:6, 2:6] = 900
-    wrong_gt_t0[10:14, 10:14, 10:14] = 901
-    wrong_gt_t1 = np.zeros(shape, dtype=np.int32)
-    wrong_gt_t1[3:7, 2:6, 2:6] = 900
-    wrong_gt_t1[10:14, 9:13, 10:14] = 901
-
-    gt_path_t0 = tmp_path / "wrong_labels_t0.npy"
-    gt_path_t1 = tmp_path / "wrong_labels_t1.npy"
-    np.save(gt_path_t0, wrong_gt_t0)
-    np.save(gt_path_t1, wrong_gt_t1)
-
-    volumes = [
-        VolumeData(
-            raw_data=np.zeros(shape, dtype=np.int16),
-            metadata={
-                "sim_annotations": {
-                    "annotations": _annotations_from_labels(ann_t0_labels, step_index=0),
-                    "files": {"labels_npy": str(gt_path_t0)},
-                }
-            },
-        ),
-        VolumeData(
-            raw_data=np.zeros(shape, dtype=np.int16),
-            metadata={
-                "sim_annotations": {
-                    "annotations": _annotations_from_labels(ann_t1_labels, step_index=1),
-                    "files": {"labels_npy": str(gt_path_t1)},
-                }
-            },
-        ),
-    ]
-
-    tracker = PNMTracker(
-        match_mode="temporal_global",
-        assign_solver="scipy",
-        use_gpu=False,
-        use_batch=False,
-        max_misses=0,
-    )
-    tracker.set_reference(_make_snapshot(pred_t0, time_index=0))
-    tracker.track_snapshot(_make_snapshot(pred_t1, time_index=1))
-
-    report = tracker.evaluate_against_sim_annotations(volumes, instance_iou_threshold=0.1)
-    primary_map_t0 = report["steps"][0]["mapping"]["pred_to_gt"]
-    strict_map_t0 = report["steps"][0]["strict_mapping"]["pred_to_gt"]
-
-    assert set(primary_map_t0.values()) == {101, 202}
-    assert set(strict_map_t0.values()) == {900, 901}
+    assert any("labels.npy path missing" in msg for msg in report["warnings"])

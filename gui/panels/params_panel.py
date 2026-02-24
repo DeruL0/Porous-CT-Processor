@@ -18,7 +18,9 @@ from config import (
     SOLID_COLORS, 
     OPACITY_PRESETS, 
     RENDER_STYLES, 
-    COLORING_MODES
+    COLORING_MODES,
+    ISO_THRESHOLD_RANGE_MIN,
+    ISO_THRESHOLD_RANGE_MAX,
 )
 
 
@@ -57,7 +59,12 @@ class RenderingParametersPanel(QGroupBox):
 
         # 1. Threshold (Iso)
         self.lbl_threshold, self.threshold_slider, self.threshold_value_label = self._create_slider_group(
-            layout, "Iso-Threshold (Intensity):", -1000, 2000, 300, self._on_threshold_change
+            layout,
+            "Iso-Threshold (Intensity):",
+            int(ISO_THRESHOLD_RANGE_MIN),
+            int(ISO_THRESHOLD_RANGE_MAX),
+            300,
+            self._on_threshold_change,
         )
 
         # 2. Coloring Mode (Iso)

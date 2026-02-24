@@ -924,25 +924,15 @@ class TimeseriesHandler(QObject):
         eval_report = getattr(self._pnm_result.tracking, "evaluation", {})
         if isinstance(eval_report, dict) and eval_report.get("available"):
             overall = eval_report.get("overall", {})
-            mean_voxel_iou_raw = overall.get("mean_voxel_iou")
-            mean_voxel_iou_text = (
-                f"{float(mean_voxel_iou_raw):.1%}"
-                if isinstance(mean_voxel_iou_raw, (int, float))
-                else "n/a"
-            )
-            mean_instance_f1 = float(
-                overall.get(
-                    "mean_pore_level_instance_f1",
-                    overall.get("mean_instance_f1", 0.0),
-                )
-            )
+            mean_voxel_iou = float(overall.get("mean_voxel_iou", 0.0))
+            mean_instance_f1 = float(overall.get("mean_instance_f1", 0.0))
             mean_tracking_acc = float(overall.get("mean_tracking_accuracy", 0.0))
             ref_cov = float(overall.get("t0_reference_gt_coverage", 0.0))
             novel_avg = float(overall.get("mean_untracked_novel_segments", 0.0))
             eval_msg = (
-                f"\n\nSimulation-annotation pore-level evaluation:\n"
-                f"- Mean voxel IoU (strict labels): {mean_voxel_iou_text}\n"
-                f"- Mean pore instance F1: {mean_instance_f1:.1%}\n"
+                f"\n\nSimulation-label evaluation:\n"
+                f"- Mean voxel IoU: {mean_voxel_iou:.1%}\n"
+                f"- Mean instance F1: {mean_instance_f1:.1%}\n"
                 f"- Mean tracking accuracy: {mean_tracking_acc:.1%}\n"
                 f"- t0 reference->GT coverage: {ref_cov:.1%}\n"
                 f"- Untracked novel segments/step: {novel_avg:.2f}\n"

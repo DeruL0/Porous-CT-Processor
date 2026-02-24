@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Tuple, Optional, Dict, Any, List
+from config import SEGMENTATION_PROFILE_DEFAULT, SEGMENTATION_SPLIT_MODE_DEFAULT
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +112,8 @@ class VolumeProcessDTO:
     threshold:        float                     = 300.0
     auto_threshold:   bool                      = False
     threshold_algorithm: str                    = "auto"     # "auto" | "otsu" | "li" | "yen" | "triangle" | "minimum"
+    segmentation_profile: str                   = SEGMENTATION_PROFILE_DEFAULT  # "legacy" | "dual_adaptive"
+    split_mode:       str                       = SEGMENTATION_SPLIT_MODE_DEFAULT  # "conservative" | "balanced" | "aggressive"
 
     # PNM
     min_pore_size:    int                       = 100
@@ -142,6 +145,8 @@ class VolumeProcessDTO:
             threshold       = float(d.get("threshold",     300.0)),
             auto_threshold  = bool(d.get("auto_threshold", False)),
             threshold_algorithm = str(d.get("threshold_algorithm", "auto")),
+            segmentation_profile = str(d.get("segmentation_profile", SEGMENTATION_PROFILE_DEFAULT)),
+            split_mode      = str(d.get("split_mode", SEGMENTATION_SPLIT_MODE_DEFAULT)),
             min_pore_size   = int(d.get("min_pore_size",   100)),
             min_throat_dist = int(d.get("min_throat_dist", 3)),
             output_dir      = d.get("output_dir"),
@@ -175,6 +180,8 @@ class VolumeProcessDTO:
             "threshold":       self.threshold,
             "auto_threshold":  self.auto_threshold,
             "threshold_algorithm": self.threshold_algorithm,
+            "segmentation_profile": self.segmentation_profile,
+            "split_mode":      self.split_mode,
             "min_pore_size":   self.min_pore_size,
             "min_throat_dist": self.min_throat_dist,
             "output_dir":      self.output_dir,

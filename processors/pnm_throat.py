@@ -153,14 +153,14 @@ def _generate_tubes_batch_gpu(connections: List[Tuple], n_sides: int = 6):
         # Generate tube vertices
         # Bottom ring
         bottom_ring = np.column_stack([
-            circle_x * radius * 0.5,
-            circle_y * radius * 0.5,
+            circle_x * radius,
+            circle_y * radius,
             np.zeros(n_sides)
         ])
         # Top ring
         top_ring = np.column_stack([
-            circle_x * radius * 0.5,
-            circle_y * radius * 0.5,
+            circle_x * radius,
+            circle_y * radius,
             np.ones(n_sides) * length
         ])
         
@@ -199,7 +199,7 @@ def _generate_tubes_batch_cpu(connections: List[Tuple]) -> pv.PolyData:
     for p1, p2, r_throat in connections:
         try:
             line = pv.Line(p1, p2)
-            tube = line.tube(radius=max(r_throat * 0.5, 0.1), n_sides=6)
+            tube = line.tube(radius=max(r_throat, 0.1), n_sides=6)
             tubes_list.append(tube)
         except Exception:
             continue
